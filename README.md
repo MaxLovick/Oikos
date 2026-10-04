@@ -2,11 +2,11 @@
 
 
 
-A self-contained simulation of a living planet, from plate tectonics and weather down to the redox chemistry of individual microbial metabolisms, with animals whose behaviour is learned by recurrent neural networks. It is written in plain C99 with no dependencies. Every exponential, logarithm, trigonometric function, random number generator, tensor operation and gradient is implemented in the source.
+An ecosystem simulator, from plate tectonics and weather down to the redox chemistry of individual microbial metabolisms, with animals whose behaviour is learned by recurrent neural networks. It is written in plain C99 with no dependencies. Every exponential, logarithm, trigonometric function, random number generator, tensor operation and gradient is implemented in the source.
 
 ## How the Earth works
 
-The Earth absorbs sunlight as photons. These photons can move electrons from one molecule to another, storing potential energy in chemical bonds. Plants take advantage of this by making sugar through photosynthesis. Organisms get that energy back by passing electrons from sugar to oxygen. Moving turns the energy into heat almost right away. Growing stores it in their bodies until they're eaten or decompose, and then it becomes heat too, which eventually radiates out into space. This leaves behind low-energy molecules, carbon dioxide and water, which plants can use to store energy from sunlight again, and the cycle repeats.
+The Earth absorbs sunlight as photons. These photons can move electrons from one molecule to another, storing potential energy in chemical bonds. Plants take advantage of this by making sugar through photosynthesis. Organisms get energy back from sugar by passing electrons from sugar to oxygen. Moving turns the energy into heat almost right away. Growing stores it in their bodies until they're eaten or decompose, and then it becomes heat too, which all eventually radiates out into space. This leaves behind low-energy molecules, carbon dioxide and water, which plants can use to store energy from sunlight again, and the cycle repeats.
 
 ---
 
