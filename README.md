@@ -22,7 +22,7 @@ Existing ecosystem models tend to excel at one scale and simplify the others.
 | Agent-based teaching models | NetLogo Wolf-Sheep, many game simulators | Visual predator-prey dynamics | Energy is created from nothing; no element cycles; populations persist only by tuning |
 | Reinforcement learning environments | Neural MMO, grid-world foraging | Learned behaviour in multi-agent settings | The world has no ecology: resources respawn rather than cycle |
 
-There are three recurring gaps in these models. Matter is not strictly conserved, so a model can quietly create or destroy carbon and still look healthy. Metabolism is not tied to thermodynamics, so organisms grow on reactions that would yield no energy. And evolution, behaviour and biogeochemistry live in separate codebases, so none can feed back on the others.
+There are three recurring gaps in these models. Matter is not strictly conserved, so a model can quietly create or destroy carbon and still look healthy. Metabolism is not tied to thermodynamics, so organisms grow on reactions that would yield no energy. And evolution, behavior and the physical environment live in separate codebases, meaning none affects the others.
 
 ---
 
