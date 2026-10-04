@@ -9378,24 +9378,55 @@ void optimize_weights(AutomaticDifferentiationEngine* engine) {
     engine->total_training_steps++;
 }
 
-void initialize_parameters(AutomaticDifferentiationEngine* engine, PCG* pcg, const size_t total_input_nodes, const size_t* input_node_indices, const size_t total_time_steps, const Tensor* inputs, const float target_standard_deviation, const uint8_t maximum_iterations, const float tolerance, const float epsilon) {
+void initialize_parameters(AutomaticDifferentiationEngine* engine, PCG* pcg, const size_t total_input_nodes, const size_t* input_node_indices, const size_t total_time_steps, const Tensor* inputs, const uint8_t* node_roles, const uint8_t* node_calibrations, const float* node_scales_override, const float* node_values, const float target_standard_deviation, const uint8_t maximum_iterations, const float tolerance, const float epsilon) {
+    const uint8_t ROLE_INFER = 0;
+    const uint8_t ROLE_SKIP = 1;
+    const uint8_t ROLE_WEIGHT = 2;
+    const uint8_t ROLE_RECURRENT_WEIGHT = 3;
+    const uint8_t ROLE_KERNEL = 4;
+    const uint8_t ROLE_GAIN = 5;
+    const uint8_t ROLE_SHIFT = 6;
+    const uint8_t ROLE_BIAS = 7;
+    const uint8_t ROLE_CONSTANT = 8;
+    const uint8_t CALIBRATION_ON = 1;
+    const uint8_t CALIBRATION_OFF = 2;
     const double NATURAL_LOGARITHM_OF_TWO = 0.6931471805599453;
     const double MAXIMUM_LOGARITHMIC_STEP = 2.772588722239781;
     const double MINIMUM_ELASTICITY = 0.1;
     const double KNEE_FRACTION = 0.5;
     const double SQUARE_ROOT_EXPONENT = 0.5;
+    const double RECIPROCAL_SQUARE_ROOT_EXPONENT = -0.5;
     const double MINIMUM_SCALE_DIFFERENCE = 1e-12;
     const uint8_t MINIMUM_ITERATIONS = 2;
     const uint8_t PHASE_BASELINE = 0;
     const uint8_t PHASE_PROBE = 1;
     const uint8_t PHASE_NEWTON = 2;
 
-    if((engine == NULL) || (pcg == NULL) || (engine->total_nodes == 0) || (input_node_indices == NULL) || (inputs == NULL) || (total_input_nodes == 0) || (total_time_steps == 0) || (target_standard_deviation <= 0.0f)) {
+    if((engine == NULL) || (pcg == NULL) || (engine->total_nodes == 0) || (target_standard_deviation <= 0.0f)) {
         return;
     }
 
     size_t total_nodes = engine->total_nodes;
+    uint8_t* is_trainable = malloc(total_nodes * sizeof(uint8_t));
+    uint8_t* should_calibrate = malloc(total_nodes * sizeof(uint8_t));
+    float* node_scales = malloc(total_nodes * sizeof(float));
+    for(size_t node_index = 0; node_index < total_nodes; node_index++) {
+        is_trainable[node_index] = 0;
+        should_calibrate[node_index] = 0;
+        node_scales[node_index] = 1.0f;
+    }
 
+    for(size_t optimizer_configuration_index = 0; optimizer_configuration_index < engine->total_optimizer_configurations; optimizer_configuration_index++) {
+        OptimizerConfiguration* optimizer_configuration = &engine->optimizer_configurations[optimizer_configuration_index];
+        for(size_t i = 0; i < optimizer_configuration->total_nodes_using_optimizer_configuration; i++) {
+            size_t node_index = optimizer_configuration->node_indices[i];
+            if(node_index < total_nodes) {
+                is_trainable[node_index] = 1;
+            }
+        }
+    }
+
+    size_t total_calibrated_parameters = 0;
     for(size_t node_index = 0; node_index < total_nodes; node_index++) {
         Node* node = &engine->nodes[node_index];
         if(node->operation_type != AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_PARAMETER) { continue; }
@@ -9403,35 +9434,189 @@ void initialize_parameters(AutomaticDifferentiationEngine* engine, PCG* pcg, con
         Tensor* parameter = &engine->tape_entries[node->tape_entry_indices[0]].output_tensor;
         if((parameter->data == NULL) || (parameter->total_dimensions == 0)) { continue; }
 
+        uint8_t requested_role = (node_roles != NULL) ? node_roles[node_index] : ROLE_INFER;
+        uint8_t requested_calibration = (node_calibrations != NULL) ? node_calibrations[node_index] : 0;
+        uint8_t has_explicit_role = (uint8_t)(requested_role != ROLE_INFER);
+        if((is_trainable[node_index] == 0) && (has_explicit_role == 0)) { continue; }
+
+        size_t rank = parameter->total_dimensions;
         size_t total_elements = 1;
-        for(size_t i = 0; i < parameter->total_dimensions; i++) {
+        for(size_t i = 0; i < rank; i++) {
             total_elements *= parameter->dimensions[i];
         }
-        size_t rows = parameter->dimensions[0];
-        size_t columns = total_elements / rows;
-        if((rows > 1) && (columns > 1)) {
-            for(size_t i = 0; i < total_elements; i++) {
-                parameter->data[i] = gaussian_float_generator(pcg, 0.0f, 1.0f);
+
+        double fan_in = 0.0;
+        double fan_out = 0.0;
+        uint8_t role = ROLE_SKIP;
+        if(is_trainable[node_index] == 1) {
+            uint8_t found = 0;
+            uint8_t ambiguous = 0;
+            for(size_t consumer_index = 0; (consumer_index < total_nodes) && (ambiguous == 0); consumer_index++) {
+                Node* consumer = &engine->nodes[consumer_index];
+                for(size_t slot = 0; (slot < consumer->total_upstream_nodes) && (ambiguous == 0); slot++) {
+                    if(consumer->upstream_node_indices[slot] != node_index) { continue; }
+
+                    uint8_t delay = consumer->upstream_edge_delay[slot];
+                    uint8_t operation_type = consumer->operation_type;
+                    uint8_t slot_role = ROLE_SKIP;
+                    double slot_fan_in = 0.0;
+                    double slot_fan_out = 0.0;
+
+                    if((operation_type == AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_MATRIX_MULTIPLICATION) && (rank >= 2) && (slot < 2)) {
+                        slot_role = (delay > 0) ? ROLE_RECURRENT_WEIGHT : ROLE_WEIGHT;
+                        if(slot == 1) {
+                            slot_fan_in = (double)parameter->dimensions[rank - 2];
+                            slot_fan_out = (double)parameter->dimensions[rank - 1];
+                        }
+                        else {
+                            slot_fan_in = (double)parameter->dimensions[rank - 1];
+                            slot_fan_out = (double)parameter->dimensions[rank - 2];
+                        }
+                    }
+                    else if(delay == 0) {
+                        if((operation_type == AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_CONVOLUTION) && (slot == 1)) {
+                            size_t total_kernels = consumer->configuration.convolution_configuration.total_kernels;
+                            if((total_kernels > 0) && (total_elements >= total_kernels) && ((total_elements % total_kernels) == 0)) {
+                                slot_role = ROLE_KERNEL;
+                                slot_fan_in = (double)(total_elements / total_kernels);
+                                slot_fan_out = (double)total_kernels;
+                            }
+                        }
+                        else if(((operation_type == AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_LAYER_NORMALIZATION) || (operation_type == AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_RMS_NORMALIZATION)) && (slot == 1)) {
+                            slot_role = ROLE_GAIN;
+                        }
+                        else if((operation_type == AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_LAYER_NORMALIZATION) && (slot == 2)) {
+                            slot_role = ROLE_SHIFT;
+                        }
+                        else if((operation_type == AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_ADDITION) && (consumer->total_upstream_nodes == 2)) {
+                            size_t other_node_index = consumer->upstream_node_indices[1 - slot];
+                            uint8_t other_operation_type = engine->nodes[other_node_index].operation_type;
+                            uint8_t other_is_weighted_product = (uint8_t)((other_operation_type == AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_MATRIX_MULTIPLICATION) || (other_operation_type == AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_CONVOLUTION));
+                            if((other_node_index != node_index) && (other_is_weighted_product == 1)) {
+                                slot_role = ROLE_BIAS;
+                            }
+                        }
+                    }
+
+                    if(slot_role == ROLE_SKIP) {
+                        ambiguous = 1;
+                        continue;
+                    }
+                    if(found == 0) {
+                        role = slot_role;
+                        fan_in = slot_fan_in;
+                        fan_out = slot_fan_out;
+                        found = 1;
+                        continue;
+                    }
+
+                    uint8_t role_is_matrix = (uint8_t)((role == ROLE_WEIGHT) || (role == ROLE_RECURRENT_WEIGHT));
+                    uint8_t slot_role_is_matrix = (uint8_t)((slot_role == ROLE_WEIGHT) || (slot_role == ROLE_RECURRENT_WEIGHT));
+                    if((role_is_matrix == 1) && (slot_role_is_matrix == 1)) {
+                        if(slot_role == ROLE_RECURRENT_WEIGHT) {
+                            role = ROLE_RECURRENT_WEIGHT;
+                        }
+                        if((slot_fan_in != fan_in) || (slot_fan_out != fan_out)) {
+                            fan_in = 1.0;
+                            fan_out = 1.0;
+                        }
+                    }
+                    else if(slot_role != role) {
+                        ambiguous = 1;
+                    }
+                    else if((role == ROLE_KERNEL) && (slot_fan_in != fan_in)) {
+                        ambiguous = 1;
+                    }
+                }
             }
-            size_t matrix_dimensions[2] = {rows, columns};
-            Tensor matrix_view;
-            matrix_view.total_dimensions = 2;
-            matrix_view.dimensions = matrix_dimensions;
-            matrix_view.data = parameter->data;
-            householder_orthonormal(&matrix_view, epsilon);
+            if(ambiguous == 1) {
+                role = ROLE_SKIP;
+            }
+        }
+        if((has_explicit_role == 1) && (requested_role != role)) {
+            role = requested_role;
+            fan_in = 0.0;
+            fan_out = 0.0;
+        }
+        if((role == ROLE_SKIP) || (role > ROLE_CONSTANT)) { continue; }
+
+        if(((role == ROLE_WEIGHT) || (role == ROLE_RECURRENT_WEIGHT)) && ((fan_in <= 0.0) || (fan_out <= 0.0))) {
+            fan_in = (rank >= 2) ? (double)parameter->dimensions[rank - 2] : 1.0;
+            fan_out = (double)parameter->dimensions[rank - 1];
+        }
+        if((role == ROLE_KERNEL) && (fan_in <= 0.0)) {
+            fan_in = (double)(total_elements / parameter->dimensions[0]);
+            fan_out = (double)parameter->dimensions[0];
+        }
+
+        float scale = 1.0f;
+        if((node_scales_override != NULL) && (node_scales_override[node_index] > 0.0f)) {
+            scale = node_scales_override[node_index];
+        }
+        uint8_t is_weight_role = (uint8_t)((role == ROLE_WEIGHT) || (role == ROLE_RECURRENT_WEIGHT) || (role == ROLE_KERNEL));
+        uint8_t calibrate = (uint8_t)((role == ROLE_WEIGHT) || (role == ROLE_KERNEL));
+        if(requested_calibration == CALIBRATION_ON) {
+            calibrate = is_weight_role;
+        }
+        if(requested_calibration == CALIBRATION_OFF) {
+            calibrate = 0;
+        }
+
+        node_scales[node_index] = scale;
+        should_calibrate[node_index] = calibrate;
+        total_calibrated_parameters += (size_t)calibrate;
+
+        if((role == ROLE_WEIGHT) || (role == ROLE_RECURRENT_WEIGHT)) {
+            for(size_t i = 0; i < total_elements; i++) {
+                parameter->data[i] = (float)gaussian_double_generator(pcg, 0.0, 1.0);
+            }
+            householder_orthonormal(parameter, epsilon);
+            double gain = 1.0;
+            if(fan_out > fan_in) {
+                gain = power_double(fan_out / fan_in, SQUARE_ROOT_EXPONENT);
+            }
+            if(calibrate == 0) {
+                gain *= (double)scale;
+            }
+            for(size_t i = 0; i < total_elements; i++) {
+                parameter->data[i] = (float)(((double)parameter->data[i]) * gain);
+            }
+        }
+        else if(role == ROLE_KERNEL) {
+            double standard_deviation = power_double(fan_in, RECIPROCAL_SQUARE_ROOT_EXPONENT);
+            if(calibrate == 0) {
+                standard_deviation *= (double)scale;
+            }
+            for(size_t i = 0; i < total_elements; i++) {
+                parameter->data[i] = (float)gaussian_double_generator(pcg, 0.0, standard_deviation);
+            }
         }
         else {
+            float fill_value = 0.0f;
+            if(role == ROLE_GAIN) {
+                fill_value = 1.0f;
+            }
+            if((role == ROLE_CONSTANT) && (node_values != NULL)) {
+                fill_value = node_values[node_index];
+            }
             for(size_t i = 0; i < total_elements; i++) {
-                parameter->data[i] = 1.0f;
+                parameter->data[i] = fill_value;
             }
         }
+    }
+
+    uint8_t has_calibration_inputs = (uint8_t)((input_node_indices != NULL) && (inputs != NULL) && (total_input_nodes > 0) && (total_time_steps > 0));
+    if((total_calibrated_parameters == 0) || (has_calibration_inputs == 0)) {
+        free(is_trainable);
+        free(should_calibrate);
+        free(node_scales);
+        return;
     }
 
     uint8_t iteration_limit = maximum_iterations;
     if(iteration_limit < MINIMUM_ITERATIONS) {
         iteration_limit = MINIMUM_ITERATIONS;
     }
-    double logarithmic_target = natural_logarithm_double((double)target_standard_deviation);
     double logarithmic_tolerance = natural_logarithm_double(1.0 + (double)tolerance);
 
     size_t saved_total_tape_entries = engine->total_tape_entries;
@@ -9492,12 +9677,8 @@ void initialize_parameters(AutomaticDifferentiationEngine* engine, PCG* pcg, con
                 is_executed[node_index] = 1;
                 for(size_t i = 0; i < node->total_upstream_nodes; i++) {
                     size_t upstream_node_index = node->upstream_node_indices[i];
-                    Node* upstream_node = &engine->nodes[upstream_node_index];
-                    if(node->upstream_edge_delay[i] != 0) { continue; }
-                    if(upstream_node->operation_type != AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_PARAMETER) { continue; }
+                    if(should_calibrate[upstream_node_index] == 0) { continue; }
                     if(is_ordered[upstream_node_index] == 1) { continue; }
-                    if(upstream_node->total_tape_entries == 0) { continue; }
-                    if(engine->tape_entries[upstream_node->tape_entry_indices[0]].output_tensor.data == NULL) { continue; }
                     is_ordered[upstream_node_index] = 1;
                     parameter_order[total_ordered_parameters] = upstream_node_index;
                     measurement_node_indices[upstream_node_index] = node_index;
@@ -9511,10 +9692,27 @@ void initialize_parameters(AutomaticDifferentiationEngine* engine, PCG* pcg, con
                     Node* measured_node = &engine->nodes[measured_node_index];
                     if(measured_node->total_downstream_nodes != 1) { break; }
                     size_t downstream_node_index = measured_node->downstream_node_indices[0];
-                    Node* downstream_node = &engine->nodes[downstream_node_index];
-                    if(downstream_node->total_upstream_nodes != 1) { break; }
-                    if(downstream_node->upstream_edge_delay[0] != 0) { break; }
                     if(is_executed[downstream_node_index] == 0) { break; }
+
+                    Node* downstream_node = &engine->nodes[downstream_node_index];
+                    uint8_t downstream_operation_type = downstream_node->operation_type;
+                    uint8_t is_transparent = 0;
+                    if((downstream_operation_type == AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_DROPOUT) || (downstream_operation_type == AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_DROPPATH)) {
+                        is_transparent = (uint8_t)((downstream_node->total_upstream_nodes == 1) && (downstream_node->upstream_edge_delay[0] == 0));
+                    }
+                    if((downstream_operation_type == AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_ADDITION) && (downstream_node->total_upstream_nodes == 2)) {
+                        for(size_t slot = 0; slot < 2; slot++) {
+                            size_t other_slot = 1 - slot;
+                            size_t other_node_index = downstream_node->upstream_node_indices[other_slot];
+                            if(downstream_node->upstream_node_indices[slot] != measured_node_index) { continue; }
+                            if((downstream_node->upstream_edge_delay[slot] != 0) || (downstream_node->upstream_edge_delay[other_slot] != 0)) { continue; }
+                            if(other_node_index == measured_node_index) { continue; }
+                            if(engine->nodes[other_node_index].operation_type == AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_PARAMETER) {
+                                is_transparent = 1;
+                            }
+                        }
+                    }
+                    if(is_transparent == 0) { break; }
                     measured_node_index = downstream_node_index;
                 }
                 measurement_node_indices[parameter_node_index] = measured_node_index;
@@ -9523,6 +9721,7 @@ void initialize_parameters(AutomaticDifferentiationEngine* engine, PCG* pcg, con
         else {
             size_t parameter_node_index = parameter_order[order_position];
             size_t measured_node_index = measurement_node_indices[parameter_node_index];
+            double logarithmic_target = natural_logarithm_double((double)target_standard_deviation * (double)node_scales[parameter_node_index]);
 
             double sum = 0.0;
             double count = 0.0;
@@ -9568,7 +9767,6 @@ void initialize_parameters(AutomaticDifferentiationEngine* engine, PCG* pcg, con
             }
 
             double desired_logarithmic_scale = current_logarithmic_scale;
-            uint8_t zero_parameter = 0;
             if(phase == PHASE_BASELINE) {
                 if(is_non_finite == 1) {
                     desired_logarithmic_scale = current_logarithmic_scale - NATURAL_LOGARITHM_OF_TWO;
@@ -9597,7 +9795,7 @@ void initialize_parameters(AutomaticDifferentiationEngine* engine, PCG* pcg, con
                         double measured_elasticity = (logarithmic_standard_deviation - previous_logarithmic_standard_deviation) / scale_difference;
                         if(phase == PHASE_PROBE) {
                             if(absolute_value_double(measured_elasticity) < MINIMUM_ELASTICITY) {
-                                zero_parameter = 1;
+                                desired_logarithmic_scale = previous_logarithmic_scale;
                                 finished = 1;
                             }
                             else {
@@ -9640,17 +9838,12 @@ void initialize_parameters(AutomaticDifferentiationEngine* engine, PCG* pcg, con
                 }
             }
 
-            Tensor* parameter = &engine->tape_entries[engine->nodes[parameter_node_index].tape_entry_indices[0]].output_tensor;
-            size_t total_parameter_elements = 1;
-            for(size_t i = 0; i < parameter->total_dimensions; i++) {
-                total_parameter_elements *= parameter->dimensions[i];
-            }
-            if(zero_parameter == 1) {
-                for(size_t i = 0; i < total_parameter_elements; i++) {
-                    parameter->data[i] = 0.0f;
+            if(desired_logarithmic_scale != current_logarithmic_scale) {
+                Tensor* parameter = &engine->tape_entries[engine->nodes[parameter_node_index].tape_entry_indices[0]].output_tensor;
+                size_t total_parameter_elements = 1;
+                for(size_t i = 0; i < parameter->total_dimensions; i++) {
+                    total_parameter_elements *= parameter->dimensions[i];
                 }
-            }
-            else if(desired_logarithmic_scale != current_logarithmic_scale) {
                 double factor = exponential_double(desired_logarithmic_scale - current_logarithmic_scale);
                 for(size_t i = 0; i < total_parameter_elements; i++) {
                     parameter->data[i] = (float)(((double)parameter->data[i]) * factor);
@@ -9706,6 +9899,9 @@ void initialize_parameters(AutomaticDifferentiationEngine* engine, PCG* pcg, con
         }
     }
 
+    free(is_trainable);
+    free(should_calibrate);
+    free(node_scales);
     free(saved_node_tape_entry_counts);
     free(saved_probabilities);
     free(is_executed);
@@ -9713,6 +9909,862 @@ void initialize_parameters(AutomaticDifferentiationEngine* engine, PCG* pcg, con
     free(parameter_order);
     free(measurement_node_indices);
 }
+
+/*
+ * TABLE OF CONTENTS (everything after the automatic differentiation engine)
+ *
+ * Each module is tagged ToC followed by five digits; search for the tag to jump to the module.
+ * API marks a struct or function that is used outside its own module.
+ *
+ * ToC00100 Bits                 Byte-level clearing and copying, and bitwise logic written with arithmetic, so that the rest ...
+ *     bytes_clear                                  function API
+ *     bytes_copy                                   function API
+ *     bytes_duplicate                              function API
+ *     bits_or                                      function API
+ *     bits_exclusive_or                            function API
+ * ToC00200 WorldEntities        Fixed chemistry tables (conserved components, dissolved, gas and mineral species, Henry ...
+ *     MicrobialGenome                              struct   API
+ *     Cohort_Leg                                   struct   API
+ *     Cohort                                       struct   API
+ *     AnimalCohort                                 struct   API
+ *     PlantCohort                                  struct   API
+ *     plant_tissue_composition                     function API
+ *     plant_organ                                  function API
+ *     plant_biomass                                function API
+ *     Pathogen                                     struct   API
+ *     Planet_Vertex                                struct   API
+ * ToC00300 Geology              Tectonic plate state, hotspot positions and the settings for earthquake and eruption rates
+ *     Tectonics                                    struct   API
+ *     TectonicSample                               struct   API
+ *     GeologySettings                              struct   API
+ *     Geology                                      struct   API
+ *     GeologySite                                  struct   API
+ *     Earthquake                                   struct   API
+ *     Eruption                                     struct   API
+ *     geology_mix                                  function
+ *     geology_hash                                 function API
+ *     geology_uniform                              function API
+ *     geology_log10                                function API
+ *     geology_power_of_ten                         function API
+ *     geology_settings_create                      function API
+ *     geology_configure                            function API
+ * ToC00400 ClimateTypes         Data types of the weather and surface hydrology model
+ *     WeatherSettings                              struct   API
+ *     WeatherCell                                  struct   API
+ *     Climate                                      struct   API
+ * ToC00500 Planet               The Planet aggregate (vertices, atmosphere, organism arrays, geology, climate) ...
+ *     Planet                                       struct   API
+ *     microbial_genome_create                      function
+ *     microbial_genome_copy                        function API
+ *     cohort_leg_create                            function
+ *     cohort_leg_copy                              function
+ *     cohort_reset_location_and_ledger             function
+ *     cohort_reset_physiology                      function
+ *     cohort_reset_quotas_and_diagnostics          function
+ *     cohort_reset_regulation                      function
+ *     cohort_create                                function API
+ *     cohort_copy_location_and_ledger              function
+ *     cohort_copy_physiology                       function
+ *     cohort_copy_quotas_and_diagnostics           function
+ *     cohort_copy                                  function API
+ *     animal_cohort_create                         function API
+ *     animal_cohort_copy                           function API
+ *     planet_vertex_reset_terrain                  function
+ *     planet_vertex_reset_water                    function API
+ *     planet_vertex_create                         function API
+ *     planet_fill_species_tables                   function
+ *     planet_reset_ledger                          function
+ *     planet_create                                function API
+ *     planet_destroy                               function API
+ *     planet_water_layer_volume_litres             function API
+ *     planet_terrain_porosity                      function API
+ *     planet_terrain_porewater_litres              function API
+ *     planet_gas_temperature_kelvin                function
+ *     planet_gas_amount_for_partial_pressure       function API
+ * ToC00600 RandomStreams        Named PCG streams per world and purpose, and the uniform, normal, gamma and Poisson draws ...
+ *     stream_create                                function API
+ *     square_root_double                           function API
+ *     stream_uniform                               function API
+ *     stream_uniform_open                          function
+ *     stream_normal                                function API
+ *     log_factorial                                function
+ *     stream_poisson_small                         function
+ *     stream_gamma                                 function API
+ *     stream_poisson                               function API
+ *     power_of_ten                                 function API
+ * ToC00700 PoolTransfers        Addresses every material pool of the planet, applies element-balanced multi-term transfers ...
+ *     Location                                     struct   API
+ *     PoolAddress                                  struct
+ *     TransferTerm                                 struct   API
+ *     Transfer                                     struct   API
+ *     CandidateList                                struct   API
+ *     LimiterStatistics                            struct   API
+ *     PoolDemandTable                              struct
+ *     PlanetState                                  struct   API
+ *     location_set                                 function API
+ *     location_equals                              function API
+ *     planet_location_is_valid                     function API
+ *     planet_location_volume_litres                function API
+ *     planet_location_temperature                  function API
+ *     planet_location_ph                           function API
+ *     pool_address_create                          function
+ *     pool_address_code                            function
+ *     compensated_add                              function
+ *     location_pool_kind                           function API
+ *     planet_pool_access                           function
+ *     planet_pool_amount                           function
+ *     transfer_create                              function API
+ *     transfer_copy                                function
+ *     transfer_add_term                            function API
+ *     transfer_add_dissolved                       function API
+ *     transfer_add_mineral                         function API
+ *     transfer_add_organic                         function API
+ *     transfer_add_gas                             function API
+ *     transfer_add_cohort                          function API
+ *     transfer_add_carrier                         function API
+ *     transfer_add_animal                          function API
+ *     transfer_add_pathogen                        function API
+ *     transfer_add_plant                           function API
+ *     transfer_add_lithosphere                     function API
+ *     transfer_scale                               function
+ *     transfer_term_tally                          function
+ *     transfer_term_apply                          function
+ *     planet_apply_transfer                        function API
+ *     inventory_add                                function
+ *     planet_inventory_vertex                      function
+ *     planet_inventory                             function API
+ *     candidate_list_create                        function API
+ *     candidate_list_destroy                       function API
+ *     candidate_list_clear                         function API
+ *     candidate_list_append                        function API
+ *     limiter_statistics_create                    function API
+ *     limiter_statistics_count_processes           function API
+ *     pool_demand_table_create                     function
+ *     pool_demand_table_destroy                    function
+ *     pool_demand_table_slot                       function
+ *     planet_limit_demands                         function
+ *     planet_apply_candidate_lists                 function API
+ *     planet_state_create                          function API
+ *     planet_state_destroy                         function API
+ *     planet_state_reserve                         function
+ *     vertex_copy_bytes                            function
+ *     planet_state_save                            function API
+ *     planet_state_restore                         function API
+ * ToC00800 Topology             Builds the planet mesh
+ *     planet_allocate_vertices                     function API
+ *     icosphere_midpoint                           function
+ *     icosphere_subdivide                          function API
+ *     planet_link_neighbours                       function API
+ * ToC00900 Terrain              Terrain settings, simplex noise and shaping, tectonic plates and their boundary sampling ...
+ *     TerrainSettings                              struct   API
+ *     terrain_settings_create                      function API
+ *     Terrain                                      struct   API
+ *     terrain_clamp                                function API
+ *     terrain_floor                                function API
+ *     terrain_sign                                 function API
+ *     terrain_create                               function API
+ *     terrain_destroy                              function API
+ *     terrain_permutation_create                   function
+ *     terrain_corner                               function
+ *     terrain_simplex                              function API
+ *     terrain_fbm                                  function API
+ *     terrain_shape                                function API
+ *     terrain_angle                                function API
+ *     terrain_random_unit                          function
+ *     tectonics_create                             function API
+ *     tectonics_plate_is_oceanic                   function API
+ *     tectonics_sample                             function API
+ *     geology_site_evaluate                        function
+ *     planet_geology_build_sites                   function API
+ *     planet_set_geology                           function API
+ *     terrain_heap_push                            function API
+ *     terrain_heap_pop                             function API
+ *     terrain_quantile                             function
+ * ToC01000 Hydrosphere          Fills depressions of a height field with a given water volume per vertex, using union-find ...
+ *     HydrosphereSolver                            struct
+ *     hydrosphere_is_below                         function
+ *     hydrosphere_find                             function
+ *     hydrosphere_heap_push                        function
+ *     hydrosphere_heap_pop                         function
+ *     hydrosphere_merge                            function
+ *     hydrosphere_absorb                           function
+ *     hydrosphere_solver_destroy                   function
+ *     hydrosphere_fill                             function API
+ *     hydrosphere_largest_body                     function API
+ * ToC01100 TerrainGeneration    Builds the planet surface
+ *     terrain_sea_level                            function
+ *     terrain_flood                                function
+ *     terrain_route                                function
+ *     terrain_build_controls                       function
+ *     terrain_shape_detail                         function
+ *     terrain_erode                                function
+ *     terrain_generate                             function
+ *     terrain_soil_type                            function
+ *     planet_layer_water_column                    function API
+ *     planet_make_patch                            function
+ *     planet_build_icosphere                       function API
+ * ToC01200 GeologyEvents        Deterministic earthquakes and eruptions
+ *     planet_geology_site                          function
+ *     planet_geology_epoch                         function
+ *     geology_poisson                              function
+ *     geology_event_uniform                        function
+ *     planet_earthquake_count                      function
+ *     planet_earthquake_get                        function
+ *     geology_site_eruptions_per_day               function
+ *     planet_eruption_count                        function
+ *     planet_eruption_get                          function
+ *     geology_compare_earthquakes                  function
+ *     geology_compare_eruptions                    function
+ *     geology_sort_earthquakes                     function
+ *     geology_sort_eruptions                       function
+ *     planet_earthquakes_between                   function API
+ *     planet_eruptions_between                     function API
+ * ToC01300 PlanetPools          Small helpers over the planet's matter pools
+ *     planet_fill_outside_air                      function API
+ *     boundary_flush                               function API
+ *     planet_list_locations                        function API
+ * ToC01400 Chemistry            Abiotic water chemistry
+ *     AcidBaseConstants                            struct   API
+ *     AcidBaseTotals                               struct   API
+ *     ChemistrySettings                            struct   API
+ *     pair_standard_gibbs_joules                   function
+ *     acid_base_pk_25                              function
+ *     acid_base_constants_at                       function API
+ *     acid_base_totals_create                      function
+ *     carbonate_fractions                          function API
+ *     acid_base_residual                           function
+ *     acid_base_solve_ph                           function
+ *     acid_base_free_carbon_dioxide                function
+ *     planet_location_concentration                function API
+ *     planet_location_mineral                      function API
+ *     planet_location_organic                      function API
+ *     planet_location_totals                       function API
+ *     langmuir_sorbed                              function
+ *     planet_equilibrate_phosphate                 function
+ *     planet_update_equilibria                     function API
+ *     transfer_add_organic_breakdown               function API
+ *     transfer_add_exudate                         function API
+ *     transfer_add_fermentation                    function API
+ *     temperature_factor                           function API
+ *     one_minus_exponential                        function
+ *     pair_redox_log_ratio                         function
+ *     planet_pair_state                            function
+ *     pair_affinity_factor                         function
+ *     chemistry_add_redox_candidates               function
+ *     chemistry_add_mineral_candidates             function
+ *     chemistry_add_organic_candidates             function
+ *     planet_add_abiotic_candidates                function API
+ *     planet_bury_vertex                           function
+ *     planet_return_vertex                         function
+ *     planet_apply_burial_and_return               function API
+ *     chemistry_settings_create                    function API
+ * ToC01500 MicrobialMutation    Layout of the microbial genome loci, the mutation classes with their draw and their effect on ...
+ *     MutationParameters                           struct   API
+ *     Mutation                                     struct   API
+ *     mutation_parameters_create                   function API
+ *     mutation_create                              function
+ *     genome_performance_multiplier                function API
+ *     genome_innovation_capacity                   function API
+ *     microbial_mutation_draw                      function API
+ *     genome_apply_mutation                        function API
+ *     supply_extinction_probability                function
+ *     supply_establishment                         function API
+ *     supply_seed_cells                            function API
+ * ToC01600 MicrobialMetabolism  Functional-type tables and the thermodynamic growth model of microbial cohorts
+ *     MetabolismSettings                           struct   API
+ *     GrowthProblem                                struct
+ *     GrowthSolution                               struct   API
+ *     CohortPlan                                   struct   API
+ *     metabolism_settings_create                   function API
+ *     growth_problem_create                        function
+ *     growth_solution_create                       function
+ *     metabolism_pathway_gap                       function
+ *     metabolism_leg_flux                          function
+ *     metabolism_balance_at                        function
+ *     metabolism_carrier_solve                     function
+ *     metabolism_supported_growth                  function
+ *     metabolism_throttle                          function
+ *     metabolism_growth_is_feasible                function
+ *     metabolism_solve_growth                      function API
+ *     heijnen_synthesis_energy                     function
+ *     carbon_source_heijnen                        function
+ *     functional_type_composition                  function
+ *     logistic_shift                               function API
+ *     functional_type_total_legs                   function
+ *     clamp_double                                 function API
+ *     thermal_performance                          function
+ *     cohort_uptake_scale                          function
+ *     cohort_diffusion_penalty                     function
+ *     droop_factor                                 function
+ *     cohort_set_quotas                            function
+ *     cohort_apply_legs                            function
+ *     cohort_resistance                            function API
+ *     cohort_apply_genome                          function API
+ *     cohort_initialise                            function API
+ *     cohort_is_at                                 function API
+ *     planet_invalidate_cohort_location_index      function API
+ *     planet_cohort_location_slot                  function
+ *     planet_reserve_cohort_location_index         function
+ *     planet_build_cohort_location_index           function API
+ *     planet_cohort_location_index_is_usable       function
+ *     planet_cohort_at_next                        function API
+ *     planet_cohort_at_first                       function API
+ *     planet_add_cohort                            function API
+ *     cohort_location                              function API
+ *     cohort_biomass                               function API
+ *     cohort_grazeable_biomass                     function API
+ *     planet_location_substrate                    function
+ *     gibbs_gaseous_counterpart                    function
+ *     couple_standard_gibbs_joules                 function
+ *     couple_dissolved_activity                    function
+ *     couple_species_activity                      function
+ *     couple_potential                             function
+ *     monod                                        function
+ *     performance_parabola                         function
+ *     leg_substrate_saturation                     function
+ *     cohort_choose_carbon                         function
+ *     cohort_choose_nutrients                      function
+ *     cohort_plan_build                            function API
+ *     transfer_accumulate                          function
+ *     transfer_accumulate_species                  function API
+ *     cohort_build_metabolism_transfer             function
+ *     cohort_build_loss_transfers                  function
+ *     cohort_effective_mortality                   function API
+ *     cohort_build_dormant_loss_transfer           function
+ *     cohort_build_hydrolysis_transfers            function
+ *     cohort_record_leg_returns                    function
+ *     cohort_allocation_targets                    function
+ *     cohort_regulate_allocation                   function
+ *     planet_regulate_allocations                  function API
+ *     planet_add_metabolism_candidates             function API
+ * ToC01700 CohortDemography     Changes to the list of microbial cohorts
+ *     planet_remove_cohort                         function
+ *     planet_apply_demography                      function API
+ *     cohort_genome_equals                         function
+ *     cohort_genome_distance                       function
+ *     planet_merge_cohorts                         function
+ *     cohort_genotype_key                          function
+ *     planet_find_identical_pair                   function
+ *     planet_sort_by_biomass                       function
+ *     planet_find_rare_pair                        function
+ *     planet_enforce_genotype_cap                  function API
+ *     planet_instantiate_mutant                    function API
+ *     cohort_trial_growth                          function API
+ *     planet_apply_funnel                          function API
+ * ToC01800 PhysicsRadiation     Physical settings and the radiation balance
+ *     PhysicsSettings                              struct   API
+ *     physics_settings_create                      function API
+ *     weather_declination                          function API
+ *     weather_cos_zenith                           function API
+ *     weather_daily_mean_cos_zenith                function API
+ *     planet_incident_shortwave                    function
+ *     cohort_cover_albedo                          function
+ *     planet_light_layer                           function
+ *     planet_update_cover                          function
+ *     plant_leaf_area_index                        function
+ *     planet_water_depth                           function
+ *     plant_can_grow_at                            function API
+ *     planet_canopy_light_types                    function
+ *     planet_canopy_light                          function
+ *     planet_update_plant_cover                    function API
+ *     planet_update_light                          function API
+ *     planet_patch_albedo                          function API
+ *     planet_set_vertex_temperature                function
+ *     planet_update_temperature                    function API
+ * ToC01900 WaterTransport       Movement of matter between neighbouring pools
+ *     water_density                                function API
+ *     planet_exchange_pair                         function API
+ *     planet_apply_mixing                          function API
+ *     planet_sink_layer                            function
+ *     planet_apply_sinking                         function API
+ *     gas_neutral_fraction                         function
+ *     planet_apply_gas_exchange                    function API
+ *     planet_apply_lateral_exchange                function API
+ * ToC02000 Weather              Energy-balance weather and surface hydrology on the planet mesh
+ *     weather_settings_create                      function API
+ *     climate_destroy                              function API
+ *     weather_saturation_pressure                  function
+ *     weather_saturation_column                    function
+ *     weather_saturation_humidity                  function
+ *     weather_zonal_wind                           function
+ *     climate_eddies                               function
+ *     climate_is_lake                              function
+ *     climate_elevation                            function
+ *     climate_soil_capacity_kilograms              function
+ *     climate_move_solutes                         function API
+ *     climate_receiving_location                   function
+ *     climate_add_surface_water                    function
+ *     climate_deliver_water                        function
+ *     climate_take_evaporation                     function
+ *     climate_apply_temperatures                   function
+ *     climate_heap_push                            function
+ *     climate_heap_pop                             function
+ *     climate_build_hydrology                      function
+ *     climate_rebalance_water                      function
+ *     climate_initialise_state                     function
+ *     climate_hydrology_step                       function
+ *     climate_step                                 function
+ *     planet_climate_create                        function API
+ *     planet_climate_advance                       function API
+ *     planet_water_inventory_kilograms             function
+ *     planet_climate_report                        function
+ * ToC02100 AnimalsAndPlants     Animal cohorts of eleven aquatic and terrestrial types and the plant cohorts
+ *     AnimalSettings                               struct   API
+ *     animal_settings_create                       function API
+ *     animal_biomass                               function API
+ *     planet_add_animal_cohort                     function API
+ *     animal_space                                 function API
+ *     animal_temperature_kelvin                    function
+ *     animal_rate_factor                           function
+ *     animal_thermoregulation_factor               function
+ *     animal_condition                             function API
+ *     animal_is_adult                              function API
+ *     animal_hazard                                function API
+ *     transfer_add_body_oxidation                  function API
+ *     transfer_add_air_oxidation                   function API
+ *     transfer_add_animal_oxidation                function API
+ *     animal_add_eating                            function
+ *     animal_add_body_losses                       function
+ *     animal_can_reach_plant                       function
+ *     animal_prey_kernel                           function
+ *     animal_type_density                          function
+ *     animal_is_prey                               function
+ *     animal_food_weight                           function
+ *     animal_food_items                            function
+ *     planet_add_animal_candidates                 function API
+ *     plant_location_value                         function
+ *     plant_take_nutrients                         function
+ *     plant_add_oxidation                          function
+ *     plant_locations                              function API
+ *     planet_add_plant_candidates                  function API
+ *     planet_remove_animal                         function API
+ *     animal_net_change_mol_carbon_per_day         function API
+ *     planet_apply_animal_demography               function API
+ * ToC02200 WaterBodies          Removes, merges, drains and floods the stacked water layers of a vertex, moving their ...
+ *     vertex_copy_water_layer                      function
+ *     planet_move_location_matter                  function API
+ *     planet_remove_water_layer                    function
+ *     planet_merge_top_water_layers                function API
+ *     planet_dry_vertex                            function API
+ *     planet_flood_vertex                          function API
+ *     planet_mix_water_body                        function API
+ * ToC02300 WaterColumn          Water density and stability between layers, heat mixing down each water column, the initial ...
+ *     water_layer_density                          function
+ *     water_layer_stability_factor                 function API
+ *     planet_update_water_column_temperatures      function API
+ *     planet_initialise_water_column_temperatures  function API
+ *     planet_move_water_between                    function
+ *     planet_apply_ocean_currents                  function API
+ * ToC02400 GeologicalEvents     Applies eruptions and earthquakes to the planet
+ *     planet_kill_fraction                         function
+ *     planet_apply_eruption                        function
+ *     planet_apply_earthquake                      function
+ *     planet_apply_geology                         function API
+ *     planet_fill_lithosphere                      function API
+ *     planet_surface_location                      function API
+ * ToC02500 Pathogens            Viruses of microbial cohorts and spore-forming parasites of animal cohorts, kept as free ...
+ *     PathogenSettings                             struct   API
+ *     pathogen_settings_create                     function API
+ *     pathogen_burst_size                          function
+ *     pathogen_virulence                           function
+ *     pathogen_lysogeny_tendency                   function
+ *     pathogen_latent_days                         function
+ *     pathogen_free_decay_per_day                  function
+ *     pathogen_host_match                          function
+ *     pathogen_free_amount                         function
+ *     pathogen_infected_amount                     function
+ *     pathogen_internal_amount                     function
+ *     pathogen_is_at                               function API
+ *     pathogen_location                            function
+ *     pathogen_create                              function API
+ *     planet_find_pathogen                         function
+ *     planet_add_pathogen                          function API
+ *     pathogen_host_density                        function
+ *     pathogen_add_microbial_infection             function
+ *     pathogen_add_animal_infection                function
+ *     pathogen_add_release                         function
+ *     pathogen_add_induction                       function
+ *     pathogen_add_decay                           function
+ *     planet_add_pathogen_candidates               function API
+ *     planet_apply_pathogen_faecal_route           function API
+ *     planet_apply_pathogen_vertical_route         function API
+ *     planet_apply_pathogen_sinking                function API
+ *     planet_apply_pathogen_funnel                 function API
+ *     planet_apply_pathogen_host_death             function
+ *     planet_apply_pathogen_demography             function API
+ * ToC02600 Microbiome           Per-step microbial population processes
+ *     MicrobiomeDiagnostics                        struct   API
+ *     CohortIndex                                  struct
+ *     DispersalRoute                               struct
+ *     hash_mix                                     function
+ *     float_bits                                   function
+ *     cohort_identity_hash                         function
+ *     cohort_identity_matches                      function
+ *     cohort_index_place                           function
+ *     cohort_index_build                           function
+ *     cohort_index_destroy                         function
+ *     cohort_index_insert                          function
+ *     cohort_index_find                            function
+ *     planet_find_or_create_like                   function
+ *     planet_move_cohort_biomass                   function
+ *     stochastic_cell_amount                       function
+ *     planet_update_attachment                     function API
+ *     planet_apply_dormancy                        function API
+ *     planet_top_location                          function
+ *     dispersal_add_aerial                         function
+ *     dispersal_routes                             function
+ *     planet_apply_dispersal                       function API
+ *     LocatedCohort                                struct
+ *     located_cohort_is_before                     function
+ *     located_cohort_sort                          function
+ *     cohort_cells                                 function
+ *     weighted_pick                                function
+ *     planet_try_recombinant                       function
+ *     planet_apply_gene_transfer                   function API
+ * ToC02700 Simulation           Builds a world from WorldSettings (planet, chemistry, microbes, animals, plants, pathogens) ...
+ *     WorldSettings                                struct   API
+ *     world_settings_create                        function API
+ *     planet_parameter_draw                        function
+ *     world_settings_sample_planet                 function API
+ *     Simulation                                   struct   API
+ *     world_fill_location                          function
+ *     simulation_build_planet                      function
+ *     simulation_place_cohort                      function
+ *     simulation_place_microbes                    function
+ *     planet_is_land                               function API
+ *     simulation_place_animals                     function
+ *     planet_add_plant                             function API
+ *     planet_find_plant                            function API
+ *     planet_remove_plant                          function
+ *     planet_plants_lose_water                     function API
+ *     planet_move_seeds                            function
+ *     planet_apply_plant_dispersal                 function
+ *     simulation_place_plants                      function
+ *     simulation_place_pathogens                   function
+ *     simulation_build_world                       function
+ *     simulation_create                            function API
+ *     simulation_destroy                           function API
+ *     climate_copy                                 function
+ *     planet_copy                                  function
+ *     simulation_copy                              function API
+ *     simulation_build_candidates                  function
+ *     simulation_transport                         function
+ *     step_error_term                              function
+ *     simulation_step_error                        function
+ *     simulation_react                             function
+ *     hatching_cue                                 function
+ *     planet_hatch_location                        function
+ *     planet_hatch_resting_eggs                    function
+ *     simulation_attempt                           function
+ *     simulation_step                              function API
+ * ToC02800 AnimalBrain          Agent settings and the recurrent actor-critic network that animal cohorts use to choose diet ...
+ *     AgentSettings                                struct   API
+ *     agent_settings_create                        function API
+ *     BrainTower                                   struct
+ *     AnimalBrain                                  struct   API
+ *     brain_tensor                                 function API
+ *     brain_operation                              function
+ *     brain_input                                  function
+ *     brain_parameter                              function
+ *     brain_constant                               function
+ *     brain_filled_constant                        function
+ *     brain_dense                                  function
+ *     brain_swiglu                                 function
+ *     brain_concatenate                            function
+ *     brain_candidate_activation                   function
+ *     brain_gru                                    function
+ *     brain_pointer_logits                         function
+ *     brain_tower                                  function
+ *     brain_head                                   function
+ *     brain_create                                 function API
+ *     brain_destroy                                function API
+ *     brain_output                                 function API
+ *     brain_weights                                function API
+ *     brain_weight_count                           function API
+ *     BrainBatch                                   struct   API
+ *     brain_batch_create                           function API
+ *     brain_batch_destroy                          function API
+ *     brain_set_states                             function API
+ *     brain_step                                   function API
+ * ToC02900 AnimalWorld          Agent bookkeeping for one planet
+ *     AnimalBody                                   struct   API
+ *     AgentStep                                    struct   API
+ *     AgentChunk                                   struct   API
+ *     AgentExperience                              struct   API
+ *     AnimalMinds                                  struct   API
+ *     AnimalWorld                                  struct   API
+ *     agent_clamp                                  function API
+ *     agent_log10                                  function API
+ *     agent_log_scale                              function API
+ *     world_add_body                               function API
+ *     agent_experience_clear                       function API
+ *     agent_experience_destroy                     function
+ *     agent_experience_add_step                    function API
+ *     agent_experience_add_chunk                   function API
+ *     minds_create                                 function API
+ *     minds_destroy                                function API
+ *     animal_world_create                          function API
+ *     animal_world_destroy                         function API
+ * ToC03000 AgentEnvironment     Summarises every water layer and land surface into a PlaceSummary, turns it into the grid ...
+ *     PlaceSummary                                 struct
+ *     PlaceTable                                   struct   API
+ *     agent_size_bin                               function
+ *     agent_bin_centre_decade                      function
+ *     agent_kernel                                 function
+ *     place_find                                   function
+ *     place_fill                                   function
+ *     place_table_build                            function API
+ *     place_table_destroy                          function API
+ *     place_food                                   function
+ *     place_predators                              function
+ *     agent_slots                                  function
+ *     agent_clock                                  function
+ *     agent_observe                                function API
+ *     agent_lay_eggs                               function
+ *     agent_place_individuals                      function
+ *     agent_apply_actions                          function API
+ * ToC03100 AgentActing          Samples actions for every live body from its type's brain, records steps into chunks ...
+ *     agent_sample                                 function
+ *     animal_world_evaluate                        function API
+ *     agent_finish_step                            function
+ *     animal_world_settle                          function API
+ *     animal_world_advance                         function
+ *     animal_world_tick                            function API
+ * ToC03200 AgentTraining        Computes generalised advantages along each body's chunk chain, runs shuffled minibatch ...
+ *     planet_resting_eggs                          function
+ *     agent_advantages                             function
+ *     AgentReport                                  struct   API
+ *     agent_report_create                          function API
+ *     ChunkReference                               struct
+ *     agent_minibatch                              function
+ *     agent_update_group                           function
+ *     animal_world_housekeeping                    function
+ *     agents_finish_iteration                      function API
+ *     minds_save                                   function API
+ *     minds_load                                   function API
+ * ToC03300 AgentRunner          Prints the daily planet summary and per-iteration training reports, and runs one animal world ...
+ *     agents_print_iteration                       function
+ *     simulation_print_day                         function
+ *     simulation_print_header                      function
+ *     agents_run                                   function
+ * ToC03400 Main                 Program entry point (runs the ecosystem for a number of days)
+ *     main                                         function
+ */
+
+/*
+ * DESIGN DOCUMENT (for everything after the automatic differentiation engine)
+ *
+ * Problem
+ *   Simulate a planet whose ecosystem (chemistry, microbes, plants, animals, pathogens, weather, geology) stays
+ *   stable for years of simulated time and runs fast enough to be useful.
+ *
+ * Approach
+ *   - The planet is an icosphere. Every vertex holds stacked water and terrain layers. All matter moves through
+ *     element-balanced transfers, limited so no pool is overdrawn, and integrated with adaptive Heun steps.
+ *   - Per-location cohort lists (planet_build_cohort_location_index) replace scans over every cohort in light,
+ *     candidate building, hatching and pathogen demography. Lists are built from the last cohort down, so sums
+ *     over a list run in ascending cohort order and results are bit-identical to the full scan.
+ *
+ * Hypotheses (from the RL World Tuning Report, Oct 3 2026) and their status
+ *   H1 The "halve dt when more than 2 processes are limited" rule only costs time. Confirmed by the report
+ *      (7.3x faster, populations within 0.2%). The rule is now WorldSettings.is_limiter_halving_on, default 0.
+ *   H2 Parasites capped at PATHOGEN_MAXIMUM_INFECTED_SHARE = 0.5 drain every animal about 6% a day. Confirmed
+ *      (large herbivores -5%/day -> -0.2%/day at 0.05). Set to 0.05.
+ *   H3 Upside-down food pyramids: copepods outweighed algae, small fish outweighed copepods, large fish outweighed
+ *      small fish. Confirmed. Densities are now copepods 1/L, small fish 1e-5/L, large fish 1e-8/L.
+ *   H4 98% of phototrophs were seeded in the dark. Confirmed. Phototrophs now get the full amount in the lit
+ *      surface location of each vertex and phototroph_seed_bank_fraction (1e-3) elsewhere.
+ *   H5 The microbial loop starved for lack of bacteria and dissolved organic carbon. Partly confirmed (the crash
+ *      stopped, the decline did not). Heterotroph seed 1e-7 mol C/L, sugar, organic acid and amino compound
+ *      5e-6 mol/L each, ciliate and nanoflagellate respiration 0.15 / 0.3, clearance 2e-4 / 1e-5, background
+ *      mortality 0.05 / 0.05; copepod respiration 0.08 and clearance 0.15.
+ *   H6 The hazard jump from 0 to hazard_h0 at a threshold forces the minimum step. The tested set T6 used
+ *      hazard_h0 = 0.05 with the jump. This revision uses hazard_h0 = 0.05 AND the smooth onset
+ *      h0 * (exp(k * excess) - 1) (AnimalSettings.is_hazard_onset_smooth = 1), which matches T6 within about 10%
+ *      once an excess is above about 0.5 and removes the jump. UNTESTED: compare against T6 (smooth onset off).
+ *   H7 Small zooplankton (a1) never existed because its density was 0. It is now seeded at 1 /L. UNTESTED: it adds
+ *      a second algal grazer to the tuned T6 web; set animal_densities[1] back to 0 if the algae decline.
+ *   H8 maximum_cohorts = 4096 starves larger planets of microbes. The cap is now raised to cohorts_per_vertex
+ *      (100) times the vertex count when that is larger (4200 at level 1, 16200 at level 2).
+ *   H10 Reproduction is blocked by invalid mating targets (about 85% of attempts) and by having no reward. This
+ *      revision makes every per-verb HEAD_TARGET mask reachable (they were shadowed by the generic HEAD_TARGET
+ *      branch), adds birth_reward (+5 to each parent) and adult_child_reward (+1 when a child reaches adulthood),
+ *      and sets mate_proposal_ticks to 300. UNTESTED together.
+ *   H11 Fauna learned to eat at full hunger because each graze paid +40. The reward is now the hunger actually
+ *      gained divided by graze_hunger (at most 1 per graze), with the birth reward above, and grazers (deer, boar)
+ *      cannot choose ATTACK (species.is_grazer_attack_masked). Wolves start at 0 per land patch for early training.
+ *   H12 Return normalisation was reset every rollout and never decayed. The discounted return now lives on each
+ *      body (Body.discounted_return) across iterations, and Mind.return_variance is an exponential moving
+ *      variance (rate max(1/n, RETURN_STATISTICS_RATE = 1e-4)). Weight files saved by the old build store a sum of
+ *      squares in that slot; it decays away after a few iterations.
+ *   H13 A death could be erased by a birth reusing the slot in the same tick. world_free_body_slot now skips bodies
+ *      that died this tick, and trainer_bootstrap only bootstraps from the same body (birth_tick == row->stamp).
+ *
+ * Changes from the report that were NOT made, because the style guide forbids them
+ *   - libm exp/log/pow/sin/cos (math.h is not an allowed header; those functions are also before this section).
+ *     square_root_double now uses Newton's method instead of power_double (max relative error 2.2e-16).
+ *   - __attribute__ optimisation flags on the dense layers, BLAS batching and OpenMP (compiler extensions and
+ *     external libraries). Never build this file with -ffast-math or -fassociative-math: it breaks the
+ *     compensated arithmetic in the math functions (tanh returns 0 for 0.5).
+ *   - Saving the spun-up planet to disk. The spin-up is cached in memory once per run instead.
+ *
+ * Resources consulted
+ *   RL World Tuning Report (Oct 3 2026); Style Guide from Claude (Sep 23 2026).
+ *
+ * Open questions
+ *   - Microzooplankton still declined 15-23% a day in T6. Next experiments: more DOC leakage from algae, or let
+ *     ciliates eat small algae. Starting nitrate (125 uM) and phosphate (10 uM) are hypereutrophic.
+ *   - A 365-day spin-up is still slow without libm and parallelism: at level 1 expect tens of CPU-minutes per
+ *     simulated day. Consider planet_levels = 1 and a shorter spin_up_days while iterating.
+ *   - Validate 90 days at level 1 on 3 seeds, then level 2 for weeks.
+ *   - The animal-brain trainer (agents_run and its helpers) is not PPO; main uses it only to run days. Never-called
+ *     functions also include terrain_quantile, planet_gas_temperature_kelvin, planet_water_inventory_kilograms
+ *     and planet_climate_report. Delete them or call them.
+ *   - Recursion (any remaining recursive helpers), function length, nesting depth, per-function comments and test functions were outside
+ *     this revision's scope.
+ *
+ * Build (zero warnings with gcc 13 and clang 18 for everything after the autograd engine)
+ *   cc -std=c99 -pedantic -Wall -Wextra -Wconversion -Wshadow -Wstrict-prototypes -O2 ReinforcementLearningWorld.c -o world
+ */
+
+
+/*
+ * ToC00100 Bits
+ *
+ * Purpose:    Byte-level clearing and copying, and bitwise logic written with arithmetic, so that
+ *             the rest of the file needs neither string.h functions nor bitwise operators.
+ * Depends:    nothing
+ * API:        bytes_clear, bytes_copy, bytes_duplicate, bits_or, bits_exclusive_or, and the BITS_POWERS_OF_TWO table
+ *             (division by an entry is a right shift, multiplication a left shift, and % a mask)
+ * Ownership:  Only bytes_duplicate allocates; its caller frees the result. Callers own every buffer passed in.
+ * Invariants: bits_or and bits_exclusive_or return exactly what | and ^ return on uint64_t operands.
+ * Errors:     None.
+ */
+
+#define BITS_TOTAL_WORD_BITS 64
+
+const uint64_t BITS_POWERS_OF_TWO[BITS_TOTAL_WORD_BITS] = {
+    UINT64_C(1), UINT64_C(2), UINT64_C(4), UINT64_C(8), UINT64_C(16), UINT64_C(32), UINT64_C(64), UINT64_C(128),
+    UINT64_C(256), UINT64_C(512), UINT64_C(1024), UINT64_C(2048), UINT64_C(4096), UINT64_C(8192), UINT64_C(16384),
+    UINT64_C(32768), UINT64_C(65536), UINT64_C(131072), UINT64_C(262144), UINT64_C(524288), UINT64_C(1048576),
+    UINT64_C(2097152), UINT64_C(4194304), UINT64_C(8388608), UINT64_C(16777216), UINT64_C(33554432), UINT64_C(67108864),
+    UINT64_C(134217728), UINT64_C(268435456), UINT64_C(536870912), UINT64_C(1073741824), UINT64_C(2147483648),
+    UINT64_C(4294967296), UINT64_C(8589934592), UINT64_C(17179869184), UINT64_C(34359738368), UINT64_C(68719476736),
+    UINT64_C(137438953472), UINT64_C(274877906944), UINT64_C(549755813888), UINT64_C(1099511627776), UINT64_C(2199023255552),
+    UINT64_C(4398046511104), UINT64_C(8796093022208), UINT64_C(17592186044416), UINT64_C(35184372088832),
+    UINT64_C(70368744177664), UINT64_C(140737488355328), UINT64_C(281474976710656), UINT64_C(562949953421312),
+    UINT64_C(1125899906842624), UINT64_C(2251799813685248), UINT64_C(4503599627370496), UINT64_C(9007199254740992),
+    UINT64_C(18014398509481984), UINT64_C(36028797018963968), UINT64_C(72057594037927936), UINT64_C(144115188075855872),
+    UINT64_C(288230376151711744), UINT64_C(576460752303423488), UINT64_C(1152921504606846976), UINT64_C(2305843009213693952),
+    UINT64_C(4611686018427387904), UINT64_C(9223372036854775808)
+};
+
+/*
+ * bytes_clear
+ * Sets every byte of a buffer to zero.
+ * Inputs: bytes        modified, total_bytes writable bytes
+ *         total_bytes  any value, 0 does nothing
+ * Output: none
+ * Memory: none allocated or freed
+ */
+void bytes_clear(uint8_t *bytes, size_t total_bytes) {
+    for(size_t i = 0; i < total_bytes; i++) {
+        bytes[i] = 0;
+    }
+}
+
+/*
+ * bytes_copy
+ * Copies total_bytes bytes from source to destination. The buffers must not overlap.
+ * Inputs: destination  modified, total_bytes writable bytes
+ *         source       not modified, total_bytes readable bytes
+ *         total_bytes  any value, 0 does nothing
+ * Output: none
+ * Memory: none allocated or freed
+ */
+void bytes_copy(uint8_t *destination, const uint8_t *source, size_t total_bytes) {
+    for(size_t i = 0; i < total_bytes; i++) {
+        destination[i] = source[i];
+    }
+}
+
+/*
+ * bytes_duplicate
+ * Allocates a new buffer holding a copy of source.
+ * Inputs: source       not modified, total_bytes readable bytes, may be NULL
+ *         total_bytes  any value
+ * Output: the new buffer, or NULL when source is NULL, total_bytes is 0 or the allocation failed
+ * Memory: allocates total_bytes bytes; the caller frees them
+ */
+uint8_t *bytes_duplicate(const uint8_t *source, size_t total_bytes) {
+    uint8_t *duplicate = NULL;
+    if((source != NULL) && (total_bytes != 0)) {
+        duplicate = (uint8_t *)malloc(total_bytes);
+        if(duplicate != NULL) {
+            bytes_copy(duplicate, source, total_bytes);
+        }
+    }
+    return duplicate;
+}
+
+/*
+ * bits_or
+ * Returns left | right.
+ * Inputs: left   any value
+ *         right  any value
+ * Output: the bits set in either operand
+ * Memory: none allocated or freed
+ */
+uint64_t bits_or(uint64_t left, uint64_t right) {
+    uint64_t remaining_left = left;
+    uint64_t remaining_right = right;
+    uint64_t output = 0;
+    for(uint8_t bit_index = 0; bit_index < BITS_TOTAL_WORD_BITS; bit_index++) {
+        if(((remaining_left % 2) == 1) || ((remaining_right % 2) == 1)) {
+            output = output + BITS_POWERS_OF_TWO[bit_index];
+        }
+        remaining_left = remaining_left / 2;
+        remaining_right = remaining_right / 2;
+    }
+    return output;
+}
+
+/*
+ * bits_exclusive_or
+ * Returns left ^ right.
+ * Inputs: left   any value
+ *         right  any value
+ * Output: the bits set in exactly one operand
+ * Memory: none allocated or freed
+ */
+uint64_t bits_exclusive_or(uint64_t left, uint64_t right) {
+    uint64_t remaining_left = left;
+    uint64_t remaining_right = right;
+    uint64_t output = 0;
+    for(uint8_t bit_index = 0; bit_index < BITS_TOTAL_WORD_BITS; bit_index++) {
+        if((remaining_left % 2) != (remaining_right % 2)) {
+            output = output + BITS_POWERS_OF_TWO[bit_index];
+        }
+        remaining_left = remaining_left / 2;
+        remaining_right = remaining_right / 2;
+    }
+    return output;
+}
+
+
+/*
+ * ToC00200 WorldEntities
+ *
+ * Purpose:    Fixed chemistry tables (conserved components, dissolved, gas and mineral species, Henry constants),
+ *             the icosahedron seed geometry, plant trait tables, and the record structs for microbial cohorts,
+ *             animal cohorts, plant cohorts, pathogens and planet vertices.
+ * Depends:    nothing
+ * API:        plant_tissue_composition, plant_organ, plant_biomass, and the tables and structs listed above
+ * Ownership:  No function allocates or frees memory. The records are plain values stored in Planet arrays.
+ * Invariants: Composition rows are per mol of carbon or of species, indexed by component (COMPONENT_ELECTRON = 10).
+ *             Every pool is the sum of an amount and its compensation term; plant_organ clamps that sum at 0.
+ * Errors:     None. No function can fail.
+ */
 
 #define TOTAL_ICOSAHEDRON_VERTICES 12
 #define TOTAL_ICOSAHEDRON_FACES 20
@@ -10060,7 +11112,13 @@ void plant_tissue_composition(size_t type, size_t organ, double *composition) {
 
 double plant_organ(const PlantCohort *plant, size_t organ) {
     double amount = plant->organ_mol_carbon[organ] + plant->organ_compensation_mol_carbon[organ];
-    return (amount > 0.0) ? amount : 0.0;
+    double clamped_amount = 0.0;
+    if(amount > 0.0) {
+        clamped_amount = amount;
+    } else {
+        clamped_amount = 0.0;
+    }
+    return clamped_amount;
 }
 
 double plant_biomass(const PlantCohort *plant) {
@@ -10138,12 +11196,26 @@ typedef struct {
     double last_transpiration_kilograms;
 } Planet_Vertex;
 
+
+/*
+ * ToC00300 Geology
+ *
+ * Purpose:    Tectonic plate state, hotspot positions and the settings for earthquake and eruption rates, with a
+ *             counter-based hash (geology_hash) so every geological draw is a pure function of seed and indices.
+ * Depends:    natural_logarithm_double, exponential_double, power_double, sine_double, cosine_double; Bits
+ * API:        geology_mix, geology_hash, geology_uniform, geology_log10, geology_power_of_ten,
+ *             geology_settings_create, geology_configure
+ * Ownership:  No function allocates or frees memory. Geology keeps its own copy of the settings.
+ * Invariants: After geology_configure: settings.seed != 0, total_hotspots <= GEOLOGY_MAXIMUM_HOTSPOTS, hotspot
+ *             rows below total_hotspots are unit vectors and the remaining rows are zero.
+ * Errors:     None. No function can fail.
+ */
+
 #define TERRAIN_PERMUTATION_LENGTH 512
 #define TERRAIN_MAXIMUM_PLATES 64
 
 #define GEOLOGY_MAXIMUM_HOTSPOTS 64
 #define GEOLOGY_MAXIMUM_EVENTS_PER_SITE_EPOCH 1024
-#define GEOLOGY_BOUNDARY_PROXIMITY 0.1
 
 #define BOUNDARY_NONE 0
 #define BOUNDARY_DIVERGENT 1
@@ -10172,6 +11244,7 @@ typedef struct {
 #define GEOLOGY_ATTRIBUTE_VOLUME 4
 #define GEOLOGY_TOTAL_ATTRIBUTES 16
 
+const double GEOLOGY_BOUNDARY_PROXIMITY = 0.1;
 const double GEOLOGY_NATURAL_LOGARITHM_OF_TEN = 2.30258509299404568402;
 
 typedef struct {
@@ -10249,22 +11322,22 @@ typedef struct {
 
 uint64_t geology_mix(uint64_t value) {
     uint64_t x = value + UINT64_C(0x9E3779B97F4A7C15);
-    x = (x ^ (x >> 30)) * UINT64_C(0xBF58476D1CE4E5B9);
-    x = (x ^ (x >> 27)) * UINT64_C(0x94D049BB133111EB);
-    return x ^ (x >> 31);
+    x = bits_exclusive_or(x, x / BITS_POWERS_OF_TWO[30]) * UINT64_C(0xBF58476D1CE4E5B9);
+    x = bits_exclusive_or(x, x / BITS_POWERS_OF_TWO[27]) * UINT64_C(0x94D049BB133111EB);
+    return bits_exclusive_or(x, x / BITS_POWERS_OF_TWO[31]);
 }
 
 uint64_t geology_hash(uint64_t seed, uint64_t kind, uint64_t a, uint64_t b, uint64_t c) {
     uint64_t hash = geology_mix(seed);
-    hash = geology_mix(hash ^ kind);
-    hash = geology_mix(hash ^ a);
-    hash = geology_mix(hash ^ b);
-    hash = geology_mix(hash ^ c);
+    hash = geology_mix(bits_exclusive_or(hash, kind));
+    hash = geology_mix(bits_exclusive_or(hash, a));
+    hash = geology_mix(bits_exclusive_or(hash, b));
+    hash = geology_mix(bits_exclusive_or(hash, c));
     return hash;
 }
 
 double geology_uniform(uint64_t hash) {
-    return (((double)(hash >> 11)) + 0.5) * (1.0 / 9007199254740992.0);
+    return (((double)(hash / BITS_POWERS_OF_TWO[11])) + 0.5) * (1.0 / 9007199254740992.0);
 }
 
 double geology_log10(double value) {
@@ -10305,7 +11378,7 @@ void geology_configure(Geology *geology, const GeologySettings *settings, uint64
     const double FULL_TURN = 6.28318530717958647692;
     geology->settings = *settings;
     if(geology->settings.seed == 0) {
-        geology->settings.seed = geology_hash(planet_seed, GEOLOGY_KIND_SEED, 0, 0, 0) | UINT64_C(1);
+        geology->settings.seed = bits_or(geology_hash(planet_seed, GEOLOGY_KIND_SEED, 0, 0, 0), UINT64_C(1));
     }
     if(geology->settings.epoch_days <= 0.0) {
         geology->settings.epoch_days = 1.0;
@@ -10323,12 +11396,31 @@ void geology_configure(Geology *geology, const GeologySettings *settings, uint64
         double z = (2.0 * geology_uniform(geology_hash(geology->settings.seed, GEOLOGY_KIND_HOTSPOT, h, 0, 0))) - 1.0;
         double phi = FULL_TURN * geology_uniform(geology_hash(geology->settings.seed, GEOLOGY_KIND_HOTSPOT, h, 1, 0));
         double r = 1.0 - (z * z);
-        r = (r > 0.0) ? power_double(r, 0.5) : 0.0;
+        if(r > 0.0) {
+            r = power_double(r, 0.5);
+        } else {
+            r = 0.0;
+        }
         geology->hotspots[h][0] = r * cosine_double(phi);
         geology->hotspots[h][1] = r * sine_double(phi);
         geology->hotspots[h][2] = z;
     }
 }
+
+
+/*
+ * ToC00400 ClimateTypes
+ *
+ * Purpose:    Data types of the weather and surface hydrology model: WeatherSettings, the per-vertex WeatherCell
+ *             and the Climate state. The weather functions that operate on them are defined in a later module.
+ * Depends:    Geology (TERRAIN_PERMUTATION_LENGTH, TOTAL_SPATIAL_AXES)
+ * API:        WeatherSettings, WeatherCell, Climate, climate_destroy (declared here, defined later)
+ * Ownership:  A Climate is heap-allocated and owned by Planet.climate. It owns every array it points to;
+ *             climate_destroy frees them and the Climate itself.
+ * Invariants: Per-vertex arrays hold total_vertices entries, neighbour arrays total_vertices *
+ *             MAXIMUM_VERTEX_NEIGHBORS entries, and per-edge arrays max(total_edges, 1) entries.
+ * Errors:     None declared here.
+ */
 
 #define GEOLOGY_KIND_WEATHER_SEED 7
 #define GEOLOGY_KIND_WEATHER_NOISE 8
@@ -10423,7 +11515,7 @@ typedef struct {
     double storminess;
 } WeatherCell;
 
-typedef struct Climate {
+typedef struct {
     WeatherSettings settings;
     uint8_t permutation[TERRAIN_PERMUTATION_LENGTH];
     double time_days;
@@ -10471,6 +11563,23 @@ typedef struct Climate {
 } Climate;
 
 void climate_destroy(Climate *climate);
+
+
+/*
+ * ToC00500 Planet
+ *
+ * Purpose:    The Planet aggregate (vertices, atmosphere, organism arrays, geology, climate) with the
+ *             create and copy functions of every record it holds and basic per-vertex volume and gas queries.
+ * Depends:    WorldEntities, Geology, ClimateTypes
+ * API:        planet_create, planet_destroy, cohort_create, cohort_copy, animal_cohort_create, animal_cohort_copy,
+ *             planet_vertex_create, planet_water_layer_volume_litres, planet_terrain_porosity,
+ *             planet_terrain_porewater_litres, planet_gas_temperature_kelvin, planet_gas_amount_for_partial_pressure
+ * Ownership:  The caller owns the Planet storage. planet_destroy frees every array and the Climate, then calls
+ *             planet_create again so all members are back at their defaults.
+ * Invariants: Every *_length <= its *_capacity; vertices, neighbor_indices, total_neighbors and vertex_positions
+ *             hold vertices_length entries (neighbor_indices MAXIMUM_VERTEX_NEIGHBORS per vertex).
+ * Errors:     None. No function in this module can fail.
+ */
 
 typedef struct {
     uint64_t seed;
@@ -10530,6 +11639,12 @@ typedef struct {
     double ocean_surface_layer_metres;
     double lake_surface_layer_metres;
     size_t maximum_water_layers;
+    size_t *cohort_location_heads;
+    size_t cohort_location_heads_capacity;
+    size_t *cohort_location_nexts;
+    size_t cohort_location_nexts_capacity;
+    size_t cohort_location_indexed_length;
+    uint8_t is_cohort_location_index_valid;
 } Planet;
 
 void microbial_genome_create(MicrobialGenome *genome) {
@@ -10815,8 +11930,9 @@ void planet_vertex_reset_terrain(Planet_Vertex *vertex) {
         for(size_t class_index = 0; class_index < TOTAL_ORGANIC_PARTICULATE_CLASSES; class_index++) {
             vertex->terrain_layer_organic_particulate_amounts_mol_carbon[layer][class_index] = 0.0;
             vertex->terrain_layer_organic_particulate_compensation_mol_carbon[layer][class_index] = 0.0;
+            double *composition = vertex->terrain_layer_organic_particulate_compositions[layer][class_index];
             for(size_t i = 0; i < TOTAL_CONSERVED_COMPONENTS; i++) {
-                vertex->terrain_layer_organic_particulate_compositions[layer][class_index][i] = PLANET_ORGANIC_PARTICULATE_DEFAULT_COMPOSITIONS[class_index][i];
+                composition[i] = PLANET_ORGANIC_PARTICULATE_DEFAULT_COMPOSITIONS[class_index][i];
             }
         }
     }
@@ -10845,8 +11961,9 @@ void planet_vertex_reset_water(Planet_Vertex *vertex) {
         for(size_t class_index = 0; class_index < TOTAL_ORGANIC_PARTICULATE_CLASSES; class_index++) {
             vertex->water_layer_organic_particulate_amounts_mol_carbon[layer][class_index] = 0.0;
             vertex->water_layer_organic_particulate_compensation_mol_carbon[layer][class_index] = 0.0;
+            double *composition = vertex->water_layer_organic_particulate_compositions[layer][class_index];
             for(size_t i = 0; i < TOTAL_CONSERVED_COMPONENTS; i++) {
-                vertex->water_layer_organic_particulate_compositions[layer][class_index][i] = PLANET_ORGANIC_PARTICULATE_DEFAULT_COMPOSITIONS[class_index][i];
+                composition[i] = PLANET_ORGANIC_PARTICULATE_DEFAULT_COMPOSITIONS[class_index][i];
             }
         }
     }
@@ -10972,6 +12089,12 @@ void planet_create(Planet *planet, uint64_t seed) {
     planet->vertex_positions = NULL;
     planet->geology_sites = NULL;
     planet->climate = NULL;
+    planet->cohort_location_heads = NULL;
+    planet->cohort_location_heads_capacity = 0;
+    planet->cohort_location_nexts = NULL;
+    planet->cohort_location_nexts_capacity = 0;
+    planet->cohort_location_indexed_length = 0;
+    planet->is_cohort_location_index_valid = 0;
 }
 
 void planet_destroy(Planet *planet) {
@@ -10985,6 +12108,8 @@ void planet_destroy(Planet *planet) {
     free(planet->animals);
     free(planet->pathogens);
     free(planet->plants);
+    free(planet->cohort_location_heads);
+    free(planet->cohort_location_nexts);
     planet_create(planet, planet->seed);
 }
 
@@ -11032,21 +12157,71 @@ double planet_gas_amount_for_partial_pressure(const Planet *planet, size_t gas_i
     return amount;
 }
 
+
+/*
+ * ToC00600 RandomStreams
+ *
+ * Purpose:    Named PCG streams per world and purpose, and the uniform, normal, gamma and Poisson draws built on
+ *             them, plus small numeric helpers (square_root_double, log_factorial, power_of_ten).
+ * Depends:    PCG (create_PCG, uniform_double_generator, gaussian_double_generator), natural_logarithm_double,
+ *             exponential_double, power_double, absolute_value_double
+ * API:        stream_create, stream_uniform, stream_uniform_open, stream_normal, stream_gamma, stream_poisson,
+ *             square_root_double, log_factorial, power_of_ten
+ * Ownership:  No function allocates or frees memory. The caller owns each PCG generator.
+ * Invariants: stream_uniform returns values in [0, 1); stream_uniform_open in (0, 1). Each draw advances only the
+ *             generator passed in, so streams with different purposes never interfere.
+ * Errors:     None. Rejection loops are bounded (stream_gamma 1000, stream_poisson POISSON_MAXIMUM_ATTEMPTS).
+ */
+
 #define STREAM_DEMOGRAPHY 1
 #define STREAM_FUNNEL 3
 #define STREAM_TOPOLOGY 9
 #define STREAM_PLANET_PARAMETERS 13
 #define POISSON_MAXIMUM_ATTEMPTS 1000
+#define SQUARE_ROOT_MAXIMUM_SCALINGS 1100
+#define SQUARE_ROOT_NEWTON_STEPS 8
 
 PCG stream_create(uint64_t seed, uint64_t world_index, uint64_t purpose) {
     const uint64_t STREAM = (world_index * UINT64_C(65536)) + purpose;
     return create_PCG(seed, (2 * STREAM) + 1);
 }
 
+/*
+ * square_root_double
+ * Returns the square root of value using Newton's method on a power-of-four scaled argument.
+ * Inputs: value  any double
+ * Output: the square root for value > 0, positive infinity for positive infinity, 0 otherwise (including NaN)
+ * Memory: none allocated or freed
+ */
 double square_root_double(double value) {
+    const double SCALE_UP = 4.0;
+    const double SCALE_DOWN = 0.25;
+    const double HALF = 0.5;
     double root = 0.0;
-    if(value > 0.0) {
-        root = power_double(value, 0.5);
+    if(value == DOUBLE_POSITIVE_INFINITY) {
+        root = DOUBLE_POSITIVE_INFINITY;
+    } else if(value > 0.0) {
+        double scaled = value;
+        double factor = 1.0;
+        for(size_t i = 0; i < SQUARE_ROOT_MAXIMUM_SCALINGS; i++) {
+            if(scaled < SCALE_UP) {
+                break;
+            }
+            scaled = scaled * SCALE_DOWN;
+            factor = factor * 2.0;
+        }
+        for(size_t i = 0; i < SQUARE_ROOT_MAXIMUM_SCALINGS; i++) {
+            if(scaled >= SCALE_DOWN) {
+                break;
+            }
+            scaled = scaled * SCALE_UP;
+            factor = factor * HALF;
+        }
+        double estimate = 1.0;
+        for(size_t i = 0; i < SQUARE_ROOT_NEWTON_STEPS; i++) {
+            estimate = HALF * (estimate + (scaled / estimate));
+        }
+        root = estimate * factor;
     }
     return root;
 }
@@ -11073,8 +12248,11 @@ double log_factorial(uint64_t k) {
     const double HALF_LOG_TWO_PI = 0.91893853320467274178;
     double value = 0.0;
     if(k < EXACT_LIMIT) {
-        for(uint64_t i = 2; i <= k; i++) {
-            value = value + natural_logarithm_double((double)i);
+        for(uint64_t factor_index = 0; factor_index < k; factor_index++) {
+            uint64_t factor = factor_index + 1;
+            if(factor >= 2) {
+                value = value + natural_logarithm_double((double)factor);
+            }
         }
     } else {
         double x = (double)k;
@@ -11118,7 +12296,11 @@ double stream_gamma(PCG *generator, double shape) {
         if(v > 0.0) {
             v = v * v * v;
             double u = stream_uniform_open(generator);
-            if((u < (1.0 - (0.0331 * x * x * x * x))) || (natural_logarithm_double(u) < ((0.5 * x * x) + (D * (1.0 - v + natural_logarithm_double(v)))))) {
+            uint8_t is_accepted = (uint8_t)(u < (1.0 - (0.0331 * x * x * x * x)));
+            if(is_accepted == 0) {
+                is_accepted = (uint8_t)(natural_logarithm_double(u) < ((0.5 * x * x) + (D * (1.0 - v + natural_logarithm_double(v)))));
+            }
+            if(is_accepted == 1) {
                 value = D * v;
                 break;
             }
@@ -11142,7 +12324,10 @@ uint64_t stream_poisson(PCG *generator, double mean) {
         const double LOG_MEAN = natural_logarithm_double(mean);
         uint8_t is_accepted = 0;
         draw = (uint64_t)(mean + 0.5);
-        for(size_t attempt = 0; (attempt < POISSON_MAXIMUM_ATTEMPTS) && (is_accepted == 0); attempt++) {
+        for(size_t attempt = 0; attempt < POISSON_MAXIMUM_ATTEMPTS; attempt++) {
+            if(is_accepted != 0) {
+                break;
+            }
             double u = stream_uniform(generator) - 0.5;
             double v = stream_uniform_open(generator);
             double us = 0.5 - absolute_value_double(u);
@@ -11170,6 +12355,24 @@ double power_of_ten(double x) {
     const double NATURAL_LOGARITHM_OF_TEN = 2.30258509299404568402;
     return exponential_double(x * NATURAL_LOGARITHM_OF_TEN);
 }
+
+
+/*
+ * ToC00700 PoolTransfers
+ *
+ * Purpose:    Addresses every material pool of the planet, applies element-balanced multi-term transfers between
+ *             pools, limits candidate transfers so no pool is overdrawn, totals the conserved inventory, and saves
+ *             and restores the mutable planet state (PlanetState).
+ * Depends:    WorldEntities, Planet
+ * API:        planet_pool_access, planet_pool_amount, transfer_create, transfer_add_*, planet_apply_transfer,
+ *             planet_inventory, candidate_list_*, planet_apply_candidate_lists, planet_state_* and location helpers
+ *             (location_set, location_equals)
+ * Ownership:  CandidateList, PoolDemandTable and PlanetState own their arrays; their destroy functions free them.
+ *             Transfer, Location and PoolAddress hold no dynamic memory.
+ * Invariants: A transfer is applied only if every term addresses a valid pool, no non-carrier pool goes below
+ *             -1e-9 times the term, and every conserved component nets to zero within transfer_relative_tolerance.
+ * Errors:     TRANSFER_INVALID_POOL, TRANSFER_UNBALANCED, TRANSFER_NEGATIVE, TRANSFER_FULL; allocation status 1.
+ */
 
 #define POOL_WATER_DISSOLVED 0
 #define POOL_POREWATER_DISSOLVED 1
@@ -11268,6 +12471,20 @@ void location_set(Location *location, size_t vertex_index, uint8_t kind, size_t 
     location->vertex_index = vertex_index;
     location->kind = kind;
     location->layer_index = layer_index;
+}
+
+/*
+ * location_equals
+ * Reports whether two locations name the same vertex, kind and layer.
+ * Inputs: first   not modified
+ *         second  not modified
+ * Output: 1 if every field matches, 0 otherwise
+ * Memory: none allocated or freed
+ */
+uint8_t location_equals(const Location *first, const Location *second) {
+    uint8_t is_equal = (uint8_t)((first->vertex_index == second->vertex_index) && (first->kind == second->kind));
+    is_equal = (uint8_t)((is_equal == 1) && (first->layer_index == second->layer_index));
+    return is_equal;
 }
 
 uint8_t planet_location_is_valid(const Planet *planet, const Location *location) {
@@ -11444,10 +12661,15 @@ uint8_t planet_pool_access(Planet *planet, const PoolAddress *address, double **
         *composition = *mutable_composition;
         is_invalid = 0;
     } else if((address->kind == POOL_PLANT_BIOMASS) && (I < planet->plants_length)) {
-        const size_t ORGAN = (L < TOTAL_PLANT_ORGANS) ? L : (TOTAL_PLANT_ORGANS - 1);
-        *amount = &planet->plants[I].organ_mol_carbon[ORGAN];
-        *compensation = &planet->plants[I].organ_compensation_mol_carbon[ORGAN];
-        *mutable_composition = planet->plants[I].compositions[ORGAN];
+        size_t organ = TOTAL_PLANT_ORGANS - 1;
+        if(L < TOTAL_PLANT_ORGANS) {
+            organ = L;
+        } else {
+            organ = TOTAL_PLANT_ORGANS - 1;
+        }
+        *amount = &planet->plants[I].organ_mol_carbon[organ];
+        *compensation = &planet->plants[I].organ_compensation_mol_carbon[organ];
+        *mutable_composition = planet->plants[I].compositions[organ];
         *composition = *mutable_composition;
         is_invalid = 0;
     }
@@ -11521,8 +12743,8 @@ uint8_t transfer_add_mineral(Transfer *transfer, const Location *location, size_
 }
 
 uint8_t transfer_add_organic(Transfer *transfer, const Location *location, size_t class_index, double amount, const double *composition) {
-    return transfer_add_term(transfer, location_pool_kind(location, 2), location->vertex_index, location->layer_index, class_index, amount,
-        composition);
+    const uint8_t KIND = location_pool_kind(location, 2);
+    return transfer_add_term(transfer, KIND, location->vertex_index, location->layer_index, class_index, amount, composition);
 }
 
 uint8_t transfer_add_gas(Transfer *transfer, size_t gas, double amount) {
@@ -11597,7 +12819,10 @@ uint8_t planet_apply_transfer(Planet *planet, const Transfer *transfer) {
         net[i] = 0.0;
         gross[i] = 0.0;
     }
-    for(size_t t = 0; (t < transfer->terms_length) && (status == TRANSFER_APPLIED); t++) {
+    for(size_t t = 0; t < transfer->terms_length; t++) {
+        if(status != TRANSFER_APPLIED) {
+            break;
+        }
         const TransferTerm *term = &transfer->terms[t];
         const double *composition = NULL;
         if(planet_pool_access(planet, &term->address, &amounts[t], &compensations[t], &mutable_compositions[t], &composition) != 0) {
@@ -11611,12 +12836,18 @@ uint8_t planet_apply_transfer(Planet *planet, const Transfer *transfer) {
             }
         }
     }
-    for(size_t i = 0; (i < TOTAL_CONSERVED_COMPONENTS) && (status == TRANSFER_APPLIED); i++) {
+    for(size_t i = 0; i < TOTAL_CONSERVED_COMPONENTS; i++) {
+        if(status != TRANSFER_APPLIED) {
+            break;
+        }
         if(absolute_value_double(net[i]) > (planet->transfer_relative_tolerance * gross[i])) {
             status = TRANSFER_UNBALANCED;
         }
     }
-    for(size_t t = 0; (t < transfer->terms_length) && (status == TRANSFER_APPLIED); t++) {
+    for(size_t t = 0; t < transfer->terms_length; t++) {
+        if(status != TRANSFER_APPLIED) {
+            break;
+        }
         transfer_term_apply(&transfer->terms[t], amounts[t], compensations[t], mutable_compositions[t], *amounts[t] + *compensations[t]);
     }
     return status;
@@ -11635,30 +12866,41 @@ size_t planet_inventory_vertex(const Planet *planet, size_t vertex_index, double
     size_t total_pools = 0;
     for(size_t layer = 0; layer < vertex->water_layers_length; layer++) {
         for(size_t i = 0; i < TOTAL_DISSOLVED_SPECIES; i++) {
-            inventory_add(sums, compensations, scale, vertex->water_layer_dissolved_amounts_mol[layer][i] + vertex->water_layer_dissolved_compensation_mol[layer][i], planet->dissolved_species_compositions[i]);
+            double pool_amount = vertex->water_layer_dissolved_amounts_mol[layer][i] + vertex->water_layer_dissolved_compensation_mol[layer][i];
+            inventory_add(sums, compensations, scale, pool_amount, planet->dissolved_species_compositions[i]);
         }
         for(size_t i = 0; i < TOTAL_MINERAL_TYPES; i++) {
-            inventory_add(sums, compensations, scale, vertex->water_layer_suspended_mineral_amounts_mol[layer][i] + vertex->water_layer_suspended_mineral_compensation_mol[layer][i], planet->mineral_compositions[i]);
+            double pool_amount = vertex->water_layer_suspended_mineral_amounts_mol[layer][i];
+            pool_amount = pool_amount + vertex->water_layer_suspended_mineral_compensation_mol[layer][i];
+            inventory_add(sums, compensations, scale, pool_amount, planet->mineral_compositions[i]);
         }
         for(size_t i = 0; i < TOTAL_ORGANIC_PARTICULATE_CLASSES; i++) {
-            inventory_add(sums, compensations, scale, vertex->water_layer_organic_particulate_amounts_mol_carbon[layer][i] + vertex->water_layer_organic_particulate_compensation_mol_carbon[layer][i], vertex->water_layer_organic_particulate_compositions[layer][i]);
+            double pool_amount = vertex->water_layer_organic_particulate_amounts_mol_carbon[layer][i];
+            pool_amount = pool_amount + vertex->water_layer_organic_particulate_compensation_mol_carbon[layer][i];
+            inventory_add(sums, compensations, scale, pool_amount, vertex->water_layer_organic_particulate_compositions[layer][i]);
         }
         total_pools = total_pools + TOTAL_DISSOLVED_SPECIES + TOTAL_MINERAL_TYPES + TOTAL_ORGANIC_PARTICULATE_CLASSES;
     }
     for(size_t layer = 0; layer < vertex->terrain_layers_length; layer++) {
         for(size_t i = 0; i < TOTAL_DISSOLVED_SPECIES; i++) {
-            inventory_add(sums, compensations, scale, vertex->terrain_layer_porewater_dissolved_amounts_mol[layer][i] + vertex->terrain_layer_porewater_dissolved_compensation_mol[layer][i], planet->dissolved_species_compositions[i]);
+            double pool_amount = vertex->terrain_layer_porewater_dissolved_amounts_mol[layer][i];
+            pool_amount = pool_amount + vertex->terrain_layer_porewater_dissolved_compensation_mol[layer][i];
+            inventory_add(sums, compensations, scale, pool_amount, planet->dissolved_species_compositions[i]);
         }
         for(size_t i = 0; i < TOTAL_MINERAL_TYPES; i++) {
-            inventory_add(sums, compensations, scale, vertex->terrain_layer_mineral_amounts_mol[layer][i] + vertex->terrain_layer_mineral_compensation_mol[layer][i], planet->mineral_compositions[i]);
+            double pool_amount = vertex->terrain_layer_mineral_amounts_mol[layer][i] + vertex->terrain_layer_mineral_compensation_mol[layer][i];
+            inventory_add(sums, compensations, scale, pool_amount, planet->mineral_compositions[i]);
         }
         for(size_t i = 0; i < TOTAL_ORGANIC_PARTICULATE_CLASSES; i++) {
-            inventory_add(sums, compensations, scale, vertex->terrain_layer_organic_particulate_amounts_mol_carbon[layer][i] + vertex->terrain_layer_organic_particulate_compensation_mol_carbon[layer][i], vertex->terrain_layer_organic_particulate_compositions[layer][i]);
+            double pool_amount = vertex->terrain_layer_organic_particulate_amounts_mol_carbon[layer][i];
+            pool_amount = pool_amount + vertex->terrain_layer_organic_particulate_compensation_mol_carbon[layer][i];
+            inventory_add(sums, compensations, scale, pool_amount, vertex->terrain_layer_organic_particulate_compositions[layer][i]);
         }
         total_pools = total_pools + TOTAL_DISSOLVED_SPECIES + TOTAL_MINERAL_TYPES + TOTAL_ORGANIC_PARTICULATE_CLASSES;
     }
     for(size_t i = 0; i < TOTAL_MINERAL_TYPES; i++) {
-        inventory_add(sums, compensations, scale, vertex->lithosphere_mineral_amounts_mol[i] + vertex->lithosphere_mineral_compensation_mol[i], planet->mineral_compositions[i]);
+        double pool_amount = vertex->lithosphere_mineral_amounts_mol[i] + vertex->lithosphere_mineral_compensation_mol[i];
+        inventory_add(sums, compensations, scale, pool_amount, planet->mineral_compositions[i]);
     }
     return total_pools + TOTAL_MINERAL_TYPES;
 }
@@ -11675,7 +12917,8 @@ size_t planet_inventory(const Planet *planet, double *totals, double *scale) {
         total_pools = total_pools + planet_inventory_vertex(planet, vertex_index, totals, compensations, scale);
     }
     for(size_t i = 0; i < TOTAL_GAS_SPECIES; i++) {
-        inventory_add(totals, compensations, scale, planet->atmosphere_gas_amounts_mol[i] + planet->atmosphere_gas_compensation_mol[i], planet->gas_species_compositions[i]);
+        double pool_amount = planet->atmosphere_gas_amounts_mol[i] + planet->atmosphere_gas_compensation_mol[i];
+        inventory_add(totals, compensations, scale, pool_amount, planet->gas_species_compositions[i]);
     }
     for(size_t c = 0; c < planet->cohorts_length; c++) {
         const Cohort *cohort = &planet->cohorts[c];
@@ -11689,13 +12932,15 @@ size_t planet_inventory(const Planet *planet, double *totals, double *scale) {
     for(size_t p = 0; p < planet->pathogens_length; p++) {
         const Pathogen *pathogen = &planet->pathogens[p];
         inventory_add(totals, compensations, scale, pathogen->free_mol_carbon + pathogen->free_compensation_mol_carbon, pathogen->free_composition);
-        inventory_add(totals, compensations, scale, pathogen->infected_mol_carbon + pathogen->infected_compensation_mol_carbon, pathogen->infected_composition);
-        inventory_add(totals, compensations, scale, pathogen->internal_mol_carbon + pathogen->internal_compensation_mol_carbon, pathogen->internal_composition);
+        double infected_amount = pathogen->infected_mol_carbon + pathogen->infected_compensation_mol_carbon;
+        inventory_add(totals, compensations, scale, infected_amount, pathogen->infected_composition);
+        double internal_amount = pathogen->internal_mol_carbon + pathogen->internal_compensation_mol_carbon;
+        inventory_add(totals, compensations, scale, internal_amount, pathogen->internal_composition);
     }
     for(size_t p = 0; p < planet->plants_length; p++) {
         for(size_t organ = 0; organ < TOTAL_PLANT_ORGANS; organ++) {
-            inventory_add(totals, compensations, scale, planet->plants[p].organ_mol_carbon[organ] + planet->plants[p].organ_compensation_mol_carbon[organ],
-                planet->plants[p].compositions[organ]);
+            double pool_amount = planet->plants[p].organ_mol_carbon[organ] + planet->plants[p].organ_compensation_mol_carbon[organ];
+            inventory_add(totals, compensations, scale, pool_amount, planet->plants[p].compositions[organ]);
         }
     }
     for(size_t i = 0; i < TOTAL_CONSERVED_COMPONENTS; i++) {
@@ -11761,7 +13006,10 @@ uint8_t pool_demand_table_create(PoolDemandTable *table, size_t capacity) {
     table->factors = (double *)malloc(capacity * sizeof(double));
     table->capacity = capacity;
     uint8_t status = (uint8_t)((table->codes == NULL) || (table->demands == NULL) || (table->factors == NULL));
-    for(size_t i = 0; (i < capacity) && (status == 0); i++) {
+    for(size_t i = 0; i < capacity; i++) {
+        if(status != 0) {
+            break;
+        }
         table->codes[i] = UINT64_MAX;
         table->demands[i] = 0.0;
         table->factors[i] = 1.0;
@@ -11839,7 +13087,10 @@ uint8_t planet_apply_candidate_lists(Planet *planet, const CandidateList *const 
     if(status == 0) {
         planet_limit_demands(planet, lists, weights, count, dt, &table);
     }
-    for(size_t l = 0; (l < count) && (status == 0); l++) {
+    for(size_t l = 0; l < count; l++) {
+        if(status != 0) {
+            break;
+        }
         for(size_t t = 0; t < lists[l]->transfers_length; t++) {
             const Transfer *transfer = &lists[l]->transfers[t];
             double factor = 1.0;
@@ -11953,19 +13204,34 @@ void vertex_copy_bytes(Planet_Vertex *destination, const Planet_Vertex *source) 
 
 uint8_t planet_state_save(PlanetState *state, const Planet *planet) {
     uint8_t status = planet_state_reserve(state, planet);
-    for(size_t v = 0; (v < planet->vertices_length) && (status == 0); v++) {
+    for(size_t v = 0; v < planet->vertices_length; v++) {
+        if(status != 0) {
+            break;
+        }
         vertex_copy_bytes(&state->vertices[v], &planet->vertices[v]);
     }
-    for(size_t c = 0; (c < planet->cohorts_length) && (status == 0); c++) {
+    for(size_t c = 0; c < planet->cohorts_length; c++) {
+        if(status != 0) {
+            break;
+        }
         cohort_copy(&state->cohorts[c], &planet->cohorts[c]);
     }
-    for(size_t a = 0; (a < planet->animals_length) && (status == 0); a++) {
+    for(size_t a = 0; a < planet->animals_length; a++) {
+        if(status != 0) {
+            break;
+        }
         animal_cohort_copy(&state->animals[a], &planet->animals[a]);
     }
-    for(size_t p = 0; (p < planet->pathogens_length) && (status == 0); p++) {
+    for(size_t p = 0; p < planet->pathogens_length; p++) {
+        if(status != 0) {
+            break;
+        }
         state->pathogens[p] = planet->pathogens[p];
     }
-    for(size_t p = 0; (p < planet->plants_length) && (status == 0); p++) {
+    for(size_t p = 0; p < planet->plants_length; p++) {
+        if(status != 0) {
+            break;
+        }
         state->plants[p] = planet->plants[p];
     }
     if(status == 0) {
@@ -11982,21 +13248,37 @@ uint8_t planet_state_save(PlanetState *state, const Planet *planet) {
 }
 
 uint8_t planet_state_restore(Planet *planet, const PlanetState *state) {
-    uint8_t status = (uint8_t)((state->cohorts_length != planet->cohorts_length) || (state->animals_length != planet->animals_length)
-        || (state->pathogens_length != planet->pathogens_length) || (state->plants_length != planet->plants_length));
-    for(size_t v = 0; (v < planet->vertices_length) && (status == 0); v++) {
+    uint8_t status = (uint8_t)((state->cohorts_length != planet->cohorts_length) || (state->animals_length != planet->animals_length));
+    status = (uint8_t)((status == 1) || (state->pathogens_length != planet->pathogens_length));
+    status = (uint8_t)((status == 1) || (state->plants_length != planet->plants_length));
+    for(size_t v = 0; v < planet->vertices_length; v++) {
+        if(status != 0) {
+            break;
+        }
         vertex_copy_bytes(&planet->vertices[v], &state->vertices[v]);
     }
-    for(size_t c = 0; (c < planet->cohorts_length) && (status == 0); c++) {
+    for(size_t c = 0; c < planet->cohorts_length; c++) {
+        if(status != 0) {
+            break;
+        }
         cohort_copy(&planet->cohorts[c], &state->cohorts[c]);
     }
-    for(size_t a = 0; (a < planet->animals_length) && (status == 0); a++) {
+    for(size_t a = 0; a < planet->animals_length; a++) {
+        if(status != 0) {
+            break;
+        }
         animal_cohort_copy(&planet->animals[a], &state->animals[a]);
     }
-    for(size_t p = 0; (p < planet->pathogens_length) && (status == 0); p++) {
+    for(size_t p = 0; p < planet->pathogens_length; p++) {
+        if(status != 0) {
+            break;
+        }
         planet->pathogens[p] = state->pathogens[p];
     }
-    for(size_t p = 0; (p < planet->plants_length) && (status == 0); p++) {
+    for(size_t p = 0; p < planet->plants_length; p++) {
+        if(status != 0) {
+            break;
+        }
         planet->plants[p] = state->plants[p];
     }
     if(status == 0) {
@@ -12007,6 +13289,20 @@ uint8_t planet_state_restore(Planet *planet, const PlanetState *state) {
     }
     return status;
 }
+
+
+/*
+ * ToC00800 Topology
+ *
+ * Purpose:    Builds the planet mesh: allocates the per-vertex arrays and subdivides the icosahedron into an
+ *             icosphere, sharing midpoints between neighbouring faces, then links neighbours and vertex areas.
+ * Depends:    WorldEntities (ICOSAHEDRON_VERTICES, ICOSAHEDRON_FACES), Planet, RandomStreams (square_root_double)
+ * API:        planet_allocate_vertices, icosphere_midpoint, icosphere_subdivide, and the mesh builders that follow
+ * Ownership:  planet_allocate_vertices allocates the Planet vertex arrays, which planet_destroy frees. The point
+ *             and face buffers passed to the icosphere functions are owned by the caller.
+ * Invariants: Every mesh point is a unit vector; *total_points <= point_capacity and *total_faces <= face_capacity.
+ * Errors:     Functions return uint8_t status: 0 success, 1 allocation failure or a capacity is too small.
+ */
 
 #define TOPOLOGY_MAXIMUM_LEVELS 4
 
@@ -12020,10 +13316,13 @@ uint8_t planet_allocate_vertices(Planet *planet, size_t total) {
     planet->vertices = (Planet_Vertex *)malloc(total * sizeof(Planet_Vertex));
     planet->neighbor_indices = (size_t *)malloc(total * MAXIMUM_VERTEX_NEIGHBORS * sizeof(size_t));
     planet->total_neighbors = (size_t *)malloc(total * sizeof(size_t));
-    planet->vertex_positions = (double (*)[TOTAL_SPATIAL_AXES])malloc(total * sizeof(double[TOTAL_SPATIAL_AXES]));
-    uint8_t status = (uint8_t)((planet->vertices == NULL) || (planet->neighbor_indices == NULL) || (planet->total_neighbors == NULL)
-        || (planet->vertex_positions == NULL));
-    for(size_t v = 0; (v < total) && (status == 0); v++) {
+    planet->vertex_positions = (double (*)[TOTAL_SPATIAL_AXES])malloc(total * TOTAL_SPATIAL_AXES * sizeof(double));
+    uint8_t status = (uint8_t)((planet->vertices == NULL) || (planet->neighbor_indices == NULL) || (planet->total_neighbors == NULL));
+    status = (uint8_t)((status == 1) || (planet->vertex_positions == NULL));
+    for(size_t v = 0; v < total; v++) {
+        if(status != 0) {
+            break;
+        }
         planet_vertex_create(&planet->vertices[v]);
         for(size_t axis = 0; axis < TOTAL_SPATIAL_AXES; axis++) {
             planet->vertex_positions[v][axis] = 0.0;
@@ -12052,7 +13351,12 @@ size_t icosphere_midpoint(double (*points)[TOTAL_SPATIAL_AXES], size_t *total_po
     for(size_t axis = 0; axis < TOTAL_SPATIAL_AXES; axis++) {
         middle[axis] = middle[axis] / length;
     }
-    for(size_t p = search_from; p < *total_points; p++) {
+    size_t total_candidates = 0;
+    if(*total_points > search_from) {
+        total_candidates = *total_points - search_from;
+    }
+    for(size_t candidate_index = 0; candidate_index < total_candidates; candidate_index++) {
+        size_t p = search_from + candidate_index;
         double distance = 0.0;
         for(size_t axis = 0; axis < TOTAL_SPATIAL_AXES; axis++) {
             distance = distance + absolute_value_double(points[p][axis] - middle[axis]);
@@ -12074,12 +13378,18 @@ size_t icosphere_midpoint(double (*points)[TOTAL_SPATIAL_AXES], size_t *total_po
 
 uint8_t icosphere_subdivide(double (*points)[TOTAL_SPATIAL_AXES], size_t (*faces)[TOTAL_TRIANGLE_CORNERS], size_t *total_points, size_t *total_faces, size_t levels, size_t point_capacity, size_t face_capacity) {
     uint8_t status = 0;
-    for(size_t level = 0; (level < levels) && (status == 0); level++) {
+    for(size_t level = 0; level < levels; level++) {
+        if(status != 0) {
+            break;
+        }
         const size_t OLD_POINTS = *total_points;
         const size_t OLD_FACES = *total_faces;
         size_t new_faces = OLD_FACES;
         status = (uint8_t)((4 * OLD_FACES) > face_capacity);
-        for(size_t f = 0; (f < OLD_FACES) && (status == 0); f++) {
+        for(size_t f = 0; f < OLD_FACES; f++) {
+            if(status != 0) {
+                break;
+            }
             size_t a = faces[f][0];
             size_t b = faces[f][1];
             size_t c = faces[f][2];
@@ -12142,6 +13452,22 @@ void planet_link_neighbours(Planet *planet, const double (*points)[TOTAL_SPATIAL
         planet->vertices[v].area_square_metres = planet->vertices[v].area_square_metres * (SPHERE_AREA / total_area);
     }
 }
+
+
+/*
+ * ToC00900 Terrain
+ *
+ * Purpose:    Terrain settings, simplex noise and shaping, tectonic plates and their boundary sampling,
+ *             per-vertex geology site rates, and the min-heap and quantile helpers used by terrain generation.
+ * Depends:    Planet, Geology, PCG streams, scalar math helpers, Bits
+ * API:        terrain_settings_create, terrain_create, terrain_destroy, tectonics_create, tectonics_sample,
+ *             geology_site_evaluate, planet_geology_build_sites, planet_set_geology
+ * Ownership:  The caller owns Terrain storage; terrain_create allocates every array and terrain_destroy frees them.
+ *             planet_geology_build_sites reallocates planet->geology_sites, which the Planet owns.
+ * Invariants: Every Terrain array holds total entries (heap_keys and heap_values hold total + 1, slot 0 unused).
+ *             tectonics->total_plates is in [2, TERRAIN_MAXIMUM_PLATES].
+ * Errors:     terrain_create, tectonics_create and planet_geology_build_sites return 1 on failure, 0 on success.
+ */
 
 #define TERRAIN_TOTAL_SHAPERS 8
 #define TERRAIN_TOTAL_CONTROLS 6
@@ -12310,11 +13636,15 @@ uint8_t terrain_create(Terrain *terrain, size_t total) {
     terrain->distances = (double *)malloc(total * sizeof(double));
     terrain->ascending = (size_t *)malloc(total * sizeof(size_t));
     terrain->scratch = (double *)malloc(total * sizeof(double));
-    uint8_t status = (uint8_t)((terrain->elevation == NULL) || (terrain->base == NULL) || (terrain->uplift == NULL) || (terrain->boundary == NULL)
-        || (terrain->hardness == NULL) || (terrain->slope == NULL) || (terrain->wetness == NULL) || (terrain->sediment == NULL)
-        || (terrain->filled == NULL) || (terrain->area == NULL) || (terrain->heap_keys == NULL) || (terrain->heap_values == NULL)
-        || (terrain->receivers == NULL) || (terrain->distances == NULL) || (terrain->ascending == NULL) || (terrain->scratch == NULL));
-    for(size_t v = 0; (v < total) && (status == 0); v++) {
+    uint8_t status = (uint8_t)((terrain->elevation == NULL) || (terrain->base == NULL) || (terrain->uplift == NULL) || (terrain->boundary == NULL));
+    status = (uint8_t)((status == 1) || (terrain->hardness == NULL) || (terrain->slope == NULL) || (terrain->wetness == NULL));
+    status = (uint8_t)((status == 1) || (terrain->sediment == NULL) || (terrain->filled == NULL) || (terrain->area == NULL));
+    status = (uint8_t)((status == 1) || (terrain->heap_keys == NULL) || (terrain->heap_values == NULL) || (terrain->receivers == NULL));
+    status = (uint8_t)((status == 1) || (terrain->distances == NULL) || (terrain->ascending == NULL) || (terrain->scratch == NULL));
+    for(size_t v = 0; v < total; v++) {
+        if(status != 0) {
+            break;
+        }
         terrain->sediment[v] = 0.0;
     }
     return status;
@@ -12340,12 +13670,15 @@ void terrain_destroy(Terrain *terrain) {
     free(terrain->scratch);
 }
 
+#define TERRAIN_PERMUTATION_TABLE_LENGTH 256
+
 void terrain_permutation_create(uint8_t *permutation, PCG *generator) {
     uint8_t table[256];
     for(size_t i = 0; i < 256; i++) {
         table[i] = (uint8_t)i;
     }
-    for(size_t i = 255; i > 0; i--) {
+    for(size_t swap_index = 255; swap_index-- > 0;) {
+        size_t i = swap_index + 1;
         size_t j = (size_t)(stream_uniform(generator) * (double)(i + 1));
         if(j > i) {
             j = i;
@@ -12355,15 +13688,19 @@ void terrain_permutation_create(uint8_t *permutation, PCG *generator) {
         table[j] = swap;
     }
     for(size_t i = 0; i < TERRAIN_PERMUTATION_LENGTH; i++) {
-        permutation[i] = table[i & 255];
+        permutation[i] = table[i % TERRAIN_PERMUTATION_TABLE_LENGTH];
     }
 }
 
 double terrain_corner(const uint8_t *permutation, int64_t i, int64_t j, int64_t k, double x, double y, double z) {
+    const int64_t TABLE_LENGTH = (int64_t)TERRAIN_PERMUTATION_TABLE_LENGTH;
     double t = 0.6 - (x * x) - (y * y) - (z * z);
     double value = 0.0;
     if(t > 0.0) {
-        const double *G = TERRAIN_GRADIENTS[permutation[(i & 255) + permutation[(j & 255) + permutation[k & 255]]] % 12];
+        int64_t wrapped_i = ((i % TABLE_LENGTH) + TABLE_LENGTH) % TABLE_LENGTH;
+        int64_t wrapped_j = ((j % TABLE_LENGTH) + TABLE_LENGTH) % TABLE_LENGTH;
+        int64_t wrapped_k = ((k % TABLE_LENGTH) + TABLE_LENGTH) % TABLE_LENGTH;
+        const double *G = TERRAIN_GRADIENTS[permutation[wrapped_i + permutation[wrapped_j + permutation[wrapped_k]]] % 12];
         t = t * t;
         value = t * t * ((G[0] * x) + (G[1] * y) + (G[2] * z));
     }
@@ -12381,22 +13718,39 @@ double terrain_simplex(const uint8_t *permutation, double x, double y, double z)
     double x0 = x - (fi - t);
     double y0 = y - (fj - t);
     double z0 = z - (fk - t);
-    int64_t i1 = 0, j1 = 0, k1 = 0, i2 = 0, j2 = 0, k2 = 0;
+    int64_t i1 = 0;
+    int64_t j1 = 0;
+    int64_t k1 = 0;
+    int64_t i2 = 0;
+    int64_t j2 = 0;
+    int64_t k2 = 0;
     if(x0 >= y0) {
         if(y0 >= z0) {
-            i1 = 1; i2 = 1; j2 = 1;
+            i1 = 1;
+            i2 = 1;
+            j2 = 1;
         } else if(x0 >= z0) {
-            i1 = 1; i2 = 1; k2 = 1;
+            i1 = 1;
+            i2 = 1;
+            k2 = 1;
         } else {
-            k1 = 1; i2 = 1; k2 = 1;
+            k1 = 1;
+            i2 = 1;
+            k2 = 1;
         }
     } else {
         if(y0 < z0) {
-            k1 = 1; j2 = 1; k2 = 1;
+            k1 = 1;
+            j2 = 1;
+            k2 = 1;
         } else if(x0 < z0) {
-            j1 = 1; j2 = 1; k2 = 1;
+            j1 = 1;
+            j2 = 1;
+            k2 = 1;
         } else {
-            j1 = 1; i2 = 1; j2 = 1;
+            j1 = 1;
+            i2 = 1;
+            j2 = 1;
         }
     }
     const int64_t I = (int64_t)fi;
@@ -12404,7 +13758,10 @@ double terrain_simplex(const uint8_t *permutation, double x, double y, double z)
     const int64_t K = (int64_t)fk;
     double n = terrain_corner(permutation, I, J, K, x0, y0, z0);
     n = n + terrain_corner(permutation, I + i1, J + j1, K + k1, x0 - (double)i1 + G3, y0 - (double)j1 + G3, z0 - (double)k1 + G3);
-    n = n + terrain_corner(permutation, I + i2, J + j2, K + k2, x0 - (double)i2 + (2.0 * G3), y0 - (double)j2 + (2.0 * G3), z0 - (double)k2 + (2.0 * G3));
+    double x2 = x0 - (double)i2 + (2.0 * G3);
+    double y2 = y0 - (double)j2 + (2.0 * G3);
+    double z2 = z0 - (double)k2 + (2.0 * G3);
+    n = n + terrain_corner(permutation, I + i2, J + j2, K + k2, x2, y2, z2);
     n = n + terrain_corner(permutation, I + 1, J + 1, K + 1, x0 - 1.0 + (3.0 * G3), y0 - 1.0 + (3.0 * G3), z0 - 1.0 + (3.0 * G3));
     return terrain_clamp(32.0 * n, -1.0, 1.0);
 }
@@ -12414,7 +13771,10 @@ double terrain_fbm(const uint8_t *permutation, const double *point, size_t octav
     double sum = 0.0;
     double norm = 0.0;
     for(size_t o = 0; o < octaves; o++) {
-        sum = sum + (amplitude * terrain_simplex(permutation, (point[0] * frequency) + offset, (point[1] * frequency) + (offset * 0.7), (point[2] * frequency) + (offset * 1.3)));
+        double sample_x = (point[0] * frequency) + offset;
+        double sample_y = (point[1] * frequency) + (offset * 0.7);
+        double sample_z = (point[2] * frequency) + (offset * 1.3);
+        sum = sum + (amplitude * terrain_simplex(permutation, sample_x, sample_y, sample_z));
         norm = norm + amplitude;
         amplitude = amplitude * 0.5;
         frequency = frequency * 2.0;
@@ -12460,8 +13820,7 @@ void terrain_random_unit(PCG *generator, double *point) {
     point[2] = z;
 }
 
-uint8_t tectonics_create(Tectonics *tectonics, uint64_t seed, size_t total_plates, double belt_width_radians, double oceanic_plate_fraction,
-    double continental_offset, double oceanic_offset) {
+uint8_t tectonics_create(Tectonics *tectonics, uint64_t seed, size_t total_plates, double belt_width_radians, double oceanic_plate_fraction, double continental_offset, double oceanic_offset) {
     PCG generator = stream_create(seed, 0, STREAM_TOPOLOGY);
     size_t plates = total_plates;
     if(plates < 2) {
@@ -12539,8 +13898,16 @@ void tectonics_sample(const Tectonics *tectonics, const double *P, TectonicSampl
     if(length > 0.0) {
         const double *A = tectonics->spins[first];
         const double *B = tectonics->spins[second];
-        double va[TOTAL_SPATIAL_AXES] = {(A[1] * warped[2]) - (A[2] * warped[1]), (A[2] * warped[0]) - (A[0] * warped[2]), (A[0] * warped[1]) - (A[1] * warped[0])};
-        double vb[TOTAL_SPATIAL_AXES] = {(B[1] * warped[2]) - (B[2] * warped[1]), (B[2] * warped[0]) - (B[0] * warped[2]), (B[0] * warped[1]) - (B[1] * warped[0])};
+        double va[TOTAL_SPATIAL_AXES] = {
+            (A[1] * warped[2]) - (A[2] * warped[1]),
+            (A[2] * warped[0]) - (A[0] * warped[2]),
+            (A[0] * warped[1]) - (A[1] * warped[0])
+        };
+        double vb[TOTAL_SPATIAL_AXES] = {
+            (B[1] * warped[2]) - (B[2] * warped[1]),
+            (B[2] * warped[0]) - (B[0] * warped[2]),
+            (B[0] * warped[1]) - (B[1] * warped[0])
+        };
         double relative_squared = 0.0;
         for(size_t axis = 0; axis < TOTAL_SPATIAL_AXES; axis++) {
             convergence = convergence + ((va[axis] - vb[axis]) * (normal[axis] / length));
@@ -12594,7 +13961,11 @@ void geology_site_evaluate(const Planet *planet, const double *point, double are
         if(SHEAR >= absolute_value_double(K->convergence)) {
             site->boundary_type = BOUNDARY_TRANSFORM;
         } else if(K->convergence > 0.0) {
-            site->boundary_type = (IS_SUBDUCTION == 1) ? BOUNDARY_SUBDUCTION : BOUNDARY_COLLISION;
+            if(IS_SUBDUCTION == 1) {
+                site->boundary_type = BOUNDARY_SUBDUCTION;
+            } else {
+                site->boundary_type = BOUNDARY_COLLISION;
+            }
         } else {
             site->boundary_type = BOUNDARY_DIVERGENT;
         }
@@ -12611,24 +13982,23 @@ void geology_site_evaluate(const Planet *planet, const double *point, double are
     if(IS_SUBDUCTION == 1) {
         closing_weight = S->earthquake_boundary_weights[BOUNDARY_SUBDUCTION];
     }
-    const double ACTIVITY = belt * ((closing_weight * CLOSING) + (S->earthquake_boundary_weights[BOUNDARY_TRANSFORM] * SHEAR)
-        + (S->earthquake_boundary_weights[BOUNDARY_DIVERGENT] * OPENING));
-    site->earthquakes_per_day = S->rate_multiplier * area_square_metres
-        * (S->earthquake_background_per_square_metre_per_day + (S->earthquake_boundary_per_square_metre_per_day * ACTIVITY));
+    const double CLOSING_AND_SHEAR = (closing_weight * CLOSING) + (S->earthquake_boundary_weights[BOUNDARY_TRANSFORM] * SHEAR);
+    const double ACTIVITY = belt * (CLOSING_AND_SHEAR + (S->earthquake_boundary_weights[BOUNDARY_DIVERGENT] * OPENING));
+    const double SCALED_AREA = S->rate_multiplier * area_square_metres;
+    const double BOUNDARY_DENSITY = S->earthquake_boundary_per_square_metre_per_day * ACTIVITY;
+    const double EARTHQUAKE_DENSITY = S->earthquake_background_per_square_metre_per_day + BOUNDARY_DENSITY;
+    site->earthquakes_per_day = SCALED_AREA * EARTHQUAKE_DENSITY;
     if((IS_SUBDUCTION == 1) && (site->is_overriding_plate == 1)) {
-        site->eruptions_per_day[ERUPTION_SOURCE_ARC] = S->rate_multiplier * area_square_metres
-            * S->eruptions_per_square_metre_per_day[ERUPTION_SOURCE_ARC] * belt * CLOSING;
+        site->eruptions_per_day[ERUPTION_SOURCE_ARC] = SCALED_AREA * S->eruptions_per_square_metre_per_day[ERUPTION_SOURCE_ARC] * belt * CLOSING;
     }
-    site->eruptions_per_day[ERUPTION_SOURCE_RIDGE] = S->rate_multiplier * area_square_metres
-        * S->eruptions_per_square_metre_per_day[ERUPTION_SOURCE_RIDGE] * belt * OPENING;
+    site->eruptions_per_day[ERUPTION_SOURCE_RIDGE] = SCALED_AREA * S->eruptions_per_square_metre_per_day[ERUPTION_SOURCE_RIDGE] * belt * OPENING;
     double plume = 0.0;
     if(S->hotspot_radius_radians > 0.0) {
         for(size_t h = 0; h < planet->geology.total_hotspots; h++) {
             plume = plume + exponential_double(-terrain_angle(point, planet->geology.hotspots[h]) / S->hotspot_radius_radians);
         }
     }
-    site->eruptions_per_day[ERUPTION_SOURCE_HOTSPOT] = S->rate_multiplier * area_square_metres
-        * S->eruptions_per_square_metre_per_day[ERUPTION_SOURCE_HOTSPOT] * plume;
+    site->eruptions_per_day[ERUPTION_SOURCE_HOTSPOT] = SCALED_AREA * S->eruptions_per_square_metre_per_day[ERUPTION_SOURCE_HOTSPOT] * plume;
 }
 
 uint8_t planet_geology_build_sites(Planet *planet) {
@@ -12660,8 +14030,11 @@ void terrain_heap_push(Terrain *terrain, size_t *length, double key, size_t valu
     *length = i;
     terrain->heap_keys[i] = key;
     terrain->heap_values[i] = value;
-    while(i > 1) {
-        size_t parent = i >> 1;
+    for(size_t level = 0; level < BITS_TOTAL_WORD_BITS; level++) {
+        if(i <= 1) {
+            break;
+        }
+        size_t parent = i / 2;
         if(terrain->heap_keys[parent] <= terrain->heap_keys[i]) {
             break;
         }
@@ -12681,8 +14054,8 @@ size_t terrain_heap_pop(Terrain *terrain, size_t *length) {
     terrain->heap_values[1] = terrain->heap_values[*length];
     *length = *length - 1;
     size_t i = 1;
-    for(;;) {
-        size_t left = i << 1;
+    for(size_t level = 0; level < BITS_TOTAL_WORD_BITS; level++) {
+        size_t left = i * 2;
         size_t right = left + 1;
         size_t smallest = i;
         if((left <= *length) && (terrain->heap_keys[left] < terrain->heap_keys[smallest])) {
@@ -12713,7 +14086,14 @@ double terrain_quantile(Terrain *terrain, const double *values, double fraction)
     for(size_t a = 1; a < N; a++) {
         double key = terrain->scratch[a];
         size_t b = a;
-        while((b > 0) && (terrain->scratch[b - 1] > key)) {
+        for(size_t shift_index = 0; shift_index < N; shift_index++) {
+            if(b == 0) {
+                break;
+            }
+            const uint8_t IS_GREATER = (uint8_t)(terrain->scratch[b - 1] > key);
+            if(IS_GREATER == 0) {
+                break;
+            }
             terrain->scratch[b] = terrain->scratch[b - 1];
             b = b - 1;
         }
@@ -12722,6 +14102,21 @@ double terrain_quantile(Terrain *terrain, const double *values, double fraction)
     size_t index = (size_t)terrain_clamp(fraction * (double)N, 0.0, (double)(N - 1));
     return terrain->scratch[index];
 }
+
+
+/*
+ * ToC01000 Hydrosphere
+ *
+ * Purpose:    Fills depressions of a height field with a given water volume per vertex, using
+ *             union-find lakes with per-lake boundary heaps, and finds the largest resulting water body.
+ * Depends:    Planet (neighbour lists), scalar math helpers, Bits
+ * API:        hydrosphere_fill, hydrosphere_largest_body
+ * Ownership:  hydrosphere_fill allocates a HydrosphereSolver internally and frees it before returning.
+ *             The caller owns every input array and the level and body output arrays (N entries each).
+ * Invariants: Every lake is a union-find root; heap entries are ordered by (height, vertex index).
+ * Errors:     hydrosphere_fill returns 1 when an allocation fails, 0 on success.
+ *             hydrosphere_largest_body returns SIZE_MAX when no body exists or allocation fails.
+ */
 
 typedef struct {
     size_t total;
@@ -12747,10 +14142,16 @@ uint8_t hydrosphere_is_below(const double *height, size_t a, size_t b) {
 
 size_t hydrosphere_find(HydrosphereSolver *H, size_t k) {
     size_t root = k;
-    while(H->parent[root] != root) {
+    for(size_t step = 0; step < H->total; step++) {
+        if(H->parent[root] == root) {
+            break;
+        }
         root = H->parent[root];
     }
-    while(H->parent[k] != root) {
+    for(size_t step = 0; step < H->total; step++) {
+        if(H->parent[k] == root) {
+            break;
+        }
         size_t next = H->parent[k];
         H->parent[k] = root;
         k = next;
@@ -12760,7 +14161,12 @@ size_t hydrosphere_find(HydrosphereSolver *H, size_t k) {
 
 uint8_t hydrosphere_heap_push(HydrosphereSolver *H, size_t lake, double key, size_t value) {
     if(H->heap_lengths[lake] == H->heap_capacities[lake]) {
-        size_t capacity = (H->heap_capacities[lake] == 0) ? 8 : (2 * H->heap_capacities[lake]);
+        size_t capacity = 0;
+        if(H->heap_capacities[lake] == 0) {
+            capacity = 8;
+        } else {
+            capacity = 2 * H->heap_capacities[lake];
+        }
         double *keys = (double *)realloc(H->heap_keys[lake], capacity * sizeof(double));
         if(keys == NULL) {
             return 1;
@@ -12777,7 +14183,10 @@ uint8_t hydrosphere_heap_push(HydrosphereSolver *H, size_t lake, double key, siz
     size_t *values = H->heap_values[lake];
     size_t i = H->heap_lengths[lake];
     H->heap_lengths[lake] = i + 1;
-    while(i > 0) {
+    for(size_t level = 0; level < BITS_TOTAL_WORD_BITS; level++) {
+        if(i == 0) {
+            break;
+        }
         size_t up = (i - 1) / 2;
         if((keys[up] < key) || ((keys[up] == key) && (values[up] < value))) {
             break;
@@ -12802,7 +14211,7 @@ void hydrosphere_heap_pop(HydrosphereSolver *H, size_t lake) {
     double key = keys[length];
     size_t value = values[length];
     size_t i = 0;
-    for(;;) {
+    for(size_t level = 0; level < BITS_TOTAL_WORD_BITS; level++) {
         size_t child = (2 * i) + 1;
         if(child >= length) {
             break;
@@ -12836,7 +14245,13 @@ size_t hydrosphere_merge(HydrosphereSolver *H, size_t a, size_t b) {
     H->volume[big] = H->volume[big] + H->volume[small];
     H->area[big] = H->area[big] + H->area[small];
     H->moment[big] = H->moment[big] + H->moment[small];
-    H->level[big] = (H->level[big] > H->level[small]) ? H->level[big] : H->level[small];
+    double merged_level = 0.0;
+    if(H->level[big] > H->level[small]) {
+        merged_level = H->level[big];
+    } else {
+        merged_level = H->level[small];
+    }
+    H->level[big] = merged_level;
     return big;
 }
 
@@ -12845,7 +14260,10 @@ uint8_t hydrosphere_absorb(HydrosphereSolver *H, const Planet *planet, const dou
     H->owner[c] = lake;
     H->area[lake] = H->area[lake] + area[c];
     H->moment[lake] = H->moment[lake] + (area[c] * height[c]);
-    for(size_t k = 0; (k < planet->total_neighbors[c]) && (status == 0); k++) {
+    for(size_t k = 0; k < planet->total_neighbors[c]; k++) {
+        if(status != 0) {
+            break;
+        }
         size_t w = planet->neighbor_indices[(c * MAXIMUM_VERTEX_NEIGHBORS) + k];
         if((w < H->total) && ((H->owner[w] == SIZE_MAX) || (hydrosphere_find(H, H->owner[w]) != lake))) {
             status = hydrosphere_heap_push(H, lake, height[w], w);
@@ -12855,7 +14273,10 @@ uint8_t hydrosphere_absorb(HydrosphereSolver *H, const Planet *planet, const dou
 }
 
 void hydrosphere_solver_destroy(HydrosphereSolver *H) {
-    for(size_t i = 0; (i < H->total) && (H->heap_keys != NULL) && (H->heap_values != NULL); i++) {
+    for(size_t i = 0; i < H->total; i++) {
+        if((H->heap_keys == NULL) || (H->heap_values == NULL)) {
+            break;
+        }
         free(H->heap_keys[i]);
         free(H->heap_values[i]);
     }
@@ -12879,35 +14300,71 @@ uint8_t hydrosphere_fill(const Planet *planet, size_t N, const double *height, c
     HydrosphereSolver solver;
     HydrosphereSolver *H = &solver;
     const double TOLERANCE = 1e-9;
+    const size_t MAXIMUM_SPILL_ITERATIONS = SIZE_MAX;
+    const size_t MAXIMUM_LAKE_STEPS = 2 * N;
     H->total = N;
     H->parent = (size_t *)malloc(N * sizeof(size_t));
     H->owner = (size_t *)malloc(N * sizeof(size_t));
     H->pit_of = (size_t *)malloc(N * sizeof(size_t));
     H->lake_of_pit = (size_t *)malloc(N * sizeof(size_t));
     H->path = (size_t *)malloc(N * sizeof(size_t));
-    H->volume = (double *)calloc(N, sizeof(double));
-    H->area = (double *)calloc(N, sizeof(double));
-    H->moment = (double *)calloc(N, sizeof(double));
-    H->level = (double *)calloc(N, sizeof(double));
-    H->heap_lengths = (size_t *)calloc(N, sizeof(size_t));
-    H->heap_capacities = (size_t *)calloc(N, sizeof(size_t));
-    H->heap_keys = (double **)calloc(N, sizeof(double *));
-    H->heap_values = (size_t **)calloc(N, sizeof(size_t *));
+    H->volume = (double *)malloc(N * sizeof(double));
+    if(H->volume != NULL) {
+        bytes_clear((uint8_t *)H->volume, N * sizeof(double));
+    }
+    H->area = (double *)malloc(N * sizeof(double));
+    if(H->area != NULL) {
+        bytes_clear((uint8_t *)H->area, N * sizeof(double));
+    }
+    H->moment = (double *)malloc(N * sizeof(double));
+    if(H->moment != NULL) {
+        bytes_clear((uint8_t *)H->moment, N * sizeof(double));
+    }
+    H->level = (double *)malloc(N * sizeof(double));
+    if(H->level != NULL) {
+        bytes_clear((uint8_t *)H->level, N * sizeof(double));
+    }
+    H->heap_lengths = (size_t *)malloc(N * sizeof(size_t));
+    if(H->heap_lengths != NULL) {
+        bytes_clear((uint8_t *)H->heap_lengths, N * sizeof(size_t));
+    }
+    H->heap_capacities = (size_t *)malloc(N * sizeof(size_t));
+    if(H->heap_capacities != NULL) {
+        bytes_clear((uint8_t *)H->heap_capacities, N * sizeof(size_t));
+    }
+    H->heap_keys = (double **)malloc(N * sizeof(double *));
+    if(H->heap_keys != NULL) {
+        bytes_clear((uint8_t *)H->heap_keys, N * sizeof(double *));
+    }
+    H->heap_values = (size_t **)malloc(N * sizeof(size_t *));
+    if(H->heap_values != NULL) {
+        bytes_clear((uint8_t *)H->heap_values, N * sizeof(size_t *));
+    }
     H->stack = (size_t *)malloc((N + 1) * sizeof(size_t));
-    uint8_t status = (uint8_t)((H->parent == NULL) || (H->owner == NULL) || (H->pit_of == NULL) || (H->lake_of_pit == NULL) || (H->path == NULL)
-        || (H->volume == NULL) || (H->area == NULL) || (H->moment == NULL) || (H->level == NULL) || (H->heap_lengths == NULL)
-        || (H->heap_capacities == NULL) || (H->heap_keys == NULL) || (H->heap_values == NULL) || (H->stack == NULL));
+    uint8_t status = (uint8_t)((H->parent == NULL) || (H->owner == NULL) || (H->pit_of == NULL) || (H->lake_of_pit == NULL) || (H->path == NULL));
+    status = (uint8_t)((status == 1) || (H->volume == NULL) || (H->area == NULL) || (H->moment == NULL) || (H->level == NULL));
+    status = (uint8_t)((status == 1) || (H->heap_lengths == NULL) || (H->heap_capacities == NULL) || (H->heap_keys == NULL));
+    status = (uint8_t)((status == 1) || (H->heap_values == NULL) || (H->stack == NULL));
     size_t lakes = 0;
-    for(size_t v = 0; (v < N) && (status == 0); v++) {
+    for(size_t v = 0; v < N; v++) {
+        if(status != 0) {
+            break;
+        }
         H->owner[v] = SIZE_MAX;
         H->pit_of[v] = SIZE_MAX;
         H->lake_of_pit[v] = SIZE_MAX;
         H->parent[v] = v;
     }
-    for(size_t v = 0; (v < N) && (status == 0); v++) {
+    for(size_t v = 0; v < N; v++) {
+        if(status != 0) {
+            break;
+        }
         size_t length = 0;
         size_t current = v;
-        while(H->pit_of[current] == SIZE_MAX) {
+        for(size_t step = 0; step < N; step++) {
+            if(H->pit_of[current] != SIZE_MAX) {
+                break;
+            }
             H->path[length] = current;
             length = length + 1;
             size_t lowest = current;
@@ -12927,7 +14384,10 @@ uint8_t hydrosphere_fill(const Planet *planet, size_t N, const double *height, c
             H->pit_of[H->path[i]] = H->pit_of[current];
         }
     }
-    for(size_t v = 0; (v < N) && (status == 0); v++) {
+    for(size_t v = 0; v < N; v++) {
+        if(status != 0) {
+            break;
+        }
         if(H->pit_of[v] == v) {
             H->lake_of_pit[v] = lakes;
             H->level[lakes] = height[v];
@@ -12935,28 +14395,51 @@ uint8_t hydrosphere_fill(const Planet *planet, size_t N, const double *height, c
             lakes = lakes + 1;
         }
     }
-    for(size_t v = 0; (v < N) && (status == 0); v++) {
+    for(size_t v = 0; v < N; v++) {
+        if(status != 0) {
+            break;
+        }
         size_t lake = H->lake_of_pit[H->pit_of[v]];
-        H->volume[lake] = H->volume[lake] + ((water[v] > 0.0) ? water[v] : 0.0);
+        double positive_water = 0.0;
+        if(water[v] > 0.0) {
+            positive_water = water[v];
+        } else {
+            positive_water = 0.0;
+        }
+        H->volume[lake] = H->volume[lake] + positive_water;
     }
-    for(size_t v = 0; (v < N) && (status == 0); v++) {
+    for(size_t v = 0; v < N; v++) {
+        if(status != 0) {
+            break;
+        }
         if(H->pit_of[v] == v) {
             status = hydrosphere_absorb(H, planet, height, area, H->lake_of_pit[v], v);
         }
     }
-    for(size_t v = 0; (v < N) && (status == 0); v++) {
+    for(size_t v = 0; v < N; v++) {
+        if(status != 0) {
+            break;
+        }
         if(H->owner[v] != SIZE_MAX) {
             H->owner[v] = H->lake_of_pit[v];
         }
     }
     size_t depth = lakes;
-    while((depth > 0) && (status == 0)) {
+    for(size_t iteration = 0; iteration < MAXIMUM_SPILL_ITERATIONS; iteration++) {
+        if((depth == 0) || (status != 0)) {
+            break;
+        }
         depth = depth - 1;
         size_t lake = hydrosphere_find(H, H->stack[depth]);
-        for(;;) {
+        for(size_t step = 0; step < MAXIMUM_LAKE_STEPS; step++) {
             const double SURFACE = (H->volume[lake] + H->moment[lake]) / H->area[lake];
-            while((H->heap_lengths[lake] > 0) && (H->owner[H->heap_values[lake][0]] != SIZE_MAX)
-                && (hydrosphere_find(H, H->owner[H->heap_values[lake][0]]) == lake)) {
+            size_t total_queued = H->heap_lengths[lake];
+            for(size_t pop_index = 0; pop_index < total_queued; pop_index++) {
+                uint8_t is_stale = (uint8_t)((H->heap_lengths[lake] > 0) && (H->owner[H->heap_values[lake][0]] != SIZE_MAX));
+                is_stale = (uint8_t)((is_stale == 1) && (hydrosphere_find(H, H->owner[H->heap_values[lake][0]]) == lake));
+                if(is_stale == 0) {
+                    break;
+                }
                 hydrosphere_heap_pop(H, lake);
             }
             if(H->heap_lengths[lake] == 0) {
@@ -12971,46 +14454,56 @@ uint8_t hydrosphere_fill(const Planet *planet, size_t N, const double *height, c
             }
             if(H->owner[C] != SIZE_MAX) {
                 lake = hydrosphere_merge(H, lake, hydrosphere_find(H, H->owner[C]));
-                continue;
-            }
-            size_t outlet = SIZE_MAX;
-            for(size_t k = 0; k < planet->total_neighbors[C]; k++) {
-                size_t w = planet->neighbor_indices[(C * MAXIMUM_VERTEX_NEIGHBORS) + k];
-                if((w < N) && (hydrosphere_is_below(height, w, C) == 1) && ((H->owner[w] == SIZE_MAX) || (hydrosphere_find(H, H->owner[w]) != lake))) {
-                    if((outlet == SIZE_MAX) || (hydrosphere_is_below(height, w, outlet) == 1)) {
-                        outlet = w;
+            } else {
+                size_t outlet = SIZE_MAX;
+                for(size_t k = 0; k < planet->total_neighbors[C]; k++) {
+                    size_t w = planet->neighbor_indices[(C * MAXIMUM_VERTEX_NEIGHBORS) + k];
+                    uint8_t is_candidate = (uint8_t)((w < N) && (hydrosphere_is_below(height, w, C) == 1));
+                    is_candidate = (uint8_t)((is_candidate == 1) && ((H->owner[w] == SIZE_MAX) || (hydrosphere_find(H, H->owner[w]) != lake)));
+                    if(is_candidate == 1) {
+                        if((outlet == SIZE_MAX) || (hydrosphere_is_below(height, w, outlet) == 1)) {
+                            outlet = w;
+                        }
                     }
                 }
-            }
-            size_t target = lake;
-            if(outlet != SIZE_MAX) {
-                target = (H->owner[outlet] != SIZE_MAX) ? hydrosphere_find(H, H->owner[outlet]) : hydrosphere_find(H, H->lake_of_pit[H->pit_of[outlet]]);
-            }
-            if(target == lake) {
-                hydrosphere_heap_pop(H, lake);
-                status = hydrosphere_absorb(H, planet, height, area, lake, C);
-                if(status != 0) {
+                size_t target = lake;
+                if(outlet != SIZE_MAX) {
+                    if(H->owner[outlet] != SIZE_MAX) {
+                        target = hydrosphere_find(H, H->owner[outlet]);
+                    } else {
+                        target = hydrosphere_find(H, H->lake_of_pit[H->pit_of[outlet]]);
+                    }
+                }
+                if(target == lake) {
+                    hydrosphere_heap_pop(H, lake);
+                    status = hydrosphere_absorb(H, planet, height, area, lake, C);
+                    if(status != 0) {
+                        break;
+                    }
+                } else if(H->level[target] >= (Z - (TOLERANCE * (1.0 + absolute_value_double(Z))))) {
+                    hydrosphere_heap_pop(H, lake);
+                    lake = hydrosphere_merge(H, lake, target);
+                    status = hydrosphere_absorb(H, planet, height, area, lake, C);
+                    if(status != 0) {
+                        break;
+                    }
+                } else {
+                    const double NEEDED = (Z * H->area[lake]) - H->moment[lake];
+                    const double EXCESS = H->volume[lake] - NEEDED;
+                    double positive_excess = 0.0;
+                    H->volume[lake] = NEEDED;
+                    H->level[lake] = Z;
+                    if(EXCESS > 0.0) {
+                        positive_excess = EXCESS;
+                    } else {
+                        positive_excess = 0.0;
+                    }
+                    H->volume[target] = H->volume[target] + positive_excess;
+                    H->stack[depth] = target;
+                    depth = depth + 1;
                     break;
                 }
-                continue;
             }
-            if(H->level[target] >= (Z - (TOLERANCE * (1.0 + absolute_value_double(Z))))) {
-                hydrosphere_heap_pop(H, lake);
-                lake = hydrosphere_merge(H, lake, target);
-                status = hydrosphere_absorb(H, planet, height, area, lake, C);
-                if(status != 0) {
-                    break;
-                }
-                continue;
-            }
-            const double NEEDED = (Z * H->area[lake]) - H->moment[lake];
-            const double EXCESS = H->volume[lake] - NEEDED;
-            H->volume[lake] = NEEDED;
-            H->level[lake] = Z;
-            H->volume[target] = H->volume[target] + ((EXCESS > 0.0) ? EXCESS : 0.0);
-            H->stack[depth] = target;
-            depth = depth + 1;
-            break;
         }
     }
     for(size_t v = 0; v < N; v++) {
@@ -13031,10 +14524,17 @@ uint8_t hydrosphere_fill(const Planet *planet, size_t N, const double *height, c
 size_t hydrosphere_largest_body(size_t N, const double *area, const size_t *body) {
     size_t best = SIZE_MAX;
     double best_area = -1.0;
-    double *totals = (double *)calloc((N > 0) ? N : 1, sizeof(double));
+    size_t totals_length = 1;
+    if(N > 0) {
+        totals_length = N;
+    } else {
+        totals_length = 1;
+    }
+    double *totals = (double *)malloc(totals_length * sizeof(double));
     if(totals == NULL) {
         return SIZE_MAX;
     }
+    bytes_clear((uint8_t *)totals, totals_length * sizeof(double));
     for(size_t v = 0; v < N; v++) {
         if(body[v] != SIZE_MAX) {
             totals[body[v]] = totals[body[v]] + area[v];
@@ -13048,12 +14548,30 @@ size_t hydrosphere_largest_body(size_t N, const double *area, const size_t *body
     return best;
 }
 
+
+/*
+ * ToC01100 TerrainGeneration
+ *
+ * Purpose:    Builds the planet surface: sea level from a hydrosphere fill, priority flood and flow routing,
+ *             tectonic and noise controls, shaped detail, erosion and deposition, then the icosphere build
+ *             that turns elevations into water columns and soil patches on every vertex.
+ * Depends:    Terrain, Hydrosphere, Planet (icosphere and vertex storage), Geology sites, Bits
+ * API:        terrain_generate, planet_build_icosphere
+ * Ownership:  planet_build_icosphere allocates and frees its own point, face and height buffers and a Terrain;
+ *             vertex storage it fills is owned by the Planet.
+ * Invariants: After terrain_route, terrain->ascending lists every reachable vertex in flood order and
+ *             receivers[v] is SIZE_MAX or a neighbour lower in the filled surface.
+ * Errors:     terrain_generate and planet_build_icosphere return non-zero when a level count is too large or an
+ *             allocation fails, 0 on success.
+ */
+
 double terrain_sea_level(const Planet *planet, size_t N, const double *height, const double *cell_areas, double water_units) {
     double *water = (double *)malloc(N * sizeof(double));
     double *level = (double *)malloc(N * sizeof(double));
     size_t *body = (size_t *)malloc(N * sizeof(size_t));
     double sea = DOUBLE_MINIMUM;
     if((water != NULL) && (level != NULL) && (body != NULL)) {
+        bytes_clear((uint8_t *)water, N * sizeof(double));
         for(size_t v = 0; v < N; v++) {
             water[v] = water_units * cell_areas[v];
         }
@@ -13068,7 +14586,9 @@ double terrain_sea_level(const Planet *planet, size_t N, const double *height, c
             if(sea == DOUBLE_MINIMUM) {
                 sea = height[0];
                 for(size_t v = 1; v < N; v++) {
-                    sea = (height[v] < sea) ? height[v] : sea;
+                    if(height[v] < sea) {
+                        sea = height[v];
+                    }
                 }
             }
         }
@@ -13084,8 +14604,9 @@ void terrain_flood(Terrain *terrain, const Planet *planet, const double *height,
     size_t length = 0;
     size_t count = 0;
     size_t lowest = 0;
-    uint8_t *seen = (uint8_t *)calloc(N, sizeof(uint8_t));
+    uint8_t *seen = (uint8_t *)malloc(N * sizeof(uint8_t));
     if(seen != NULL) {
+        bytes_clear(seen, N * sizeof(uint8_t));
         for(size_t v = 0; v < N; v++) {
             terrain->filled[v] = height[v];
             if(height[v] < height[lowest]) {
@@ -13100,7 +14621,10 @@ void terrain_flood(Terrain *terrain, const Planet *planet, const double *height,
             seen[lowest] = 1;
             terrain_heap_push(terrain, &length, height[lowest], lowest);
         }
-        while(length > 0) {
+        for(size_t pop_index = 0; pop_index < N; pop_index++) {
+            if(length == 0) {
+                break;
+            }
             size_t v = terrain_heap_pop(terrain, &length);
             terrain->ascending[count] = v;
             count = count + 1;
@@ -13150,8 +14674,7 @@ void terrain_route(Terrain *terrain, const Planet *planet, const double (*points
     }
 }
 
-void terrain_build_controls(Terrain *terrain, const Planet *planet, const double (*points)[TOTAL_SPATIAL_AXES], const double *cell_areas,
-    const Tectonics *tectonics, const TerrainSettings *settings) {
+void terrain_build_controls(Terrain *terrain, const Planet *planet, const double (*points)[TOTAL_SPATIAL_AXES], const double *cell_areas, const Tectonics *tectonics, const TerrainSettings *settings) {
     const size_t N = terrain->total;
     const uint8_t *permutation = tectonics->permutation;
     for(size_t v = 0; v < N; v++) {
@@ -13255,13 +14778,19 @@ void terrain_shape_detail(Terrain *terrain, const double (*points)[TOTAL_SPATIAL
         if(norm > 0.0) {
             detail = sum / norm;
         }
-        double relief = 0.35 + (0.65 * terrain_clamp(0.5 + (0.5 * controls[TERRAIN_CONTROL_UPLIFT]) + (0.3 * controls[TERRAIN_CONTROL_HARDNESS]), 0.0, 1.0));
-        terrain->elevation[v] = terrain->base[v] + (detail * relief * settings->relief * ((terrain->oceanic[v] > 0.5) ? settings->ocean_detail_scale : 1.0));
+        double relief_control = 0.5 + (0.5 * controls[TERRAIN_CONTROL_UPLIFT]) + (0.3 * controls[TERRAIN_CONTROL_HARDNESS]);
+        double relief = 0.35 + (0.65 * terrain_clamp(relief_control, 0.0, 1.0));
+        double ocean_scale = 1.0;
+        if(terrain->oceanic[v] > 0.5) {
+            ocean_scale = settings->ocean_detail_scale;
+        } else {
+            ocean_scale = 1.0;
+        }
+        terrain->elevation[v] = terrain->base[v] + (detail * relief * settings->relief * ocean_scale);
     }
 }
 
-void terrain_erode(Terrain *terrain, const Planet *planet, const double (*points)[TOTAL_SPATIAL_AXES], const double *cell_areas,
-    const TerrainSettings *settings) {
+void terrain_erode(Terrain *terrain, const Planet *planet, const double (*points)[TOTAL_SPATIAL_AXES], const double *cell_areas, const TerrainSettings *settings) {
     const size_t N = terrain->total;
     const double DT = settings->erosion_dt;
     double *flux = terrain->scratch;
@@ -13340,16 +14869,21 @@ void terrain_erode(Terrain *terrain, const Planet *planet, const double (*points
     }
 }
 
-uint8_t terrain_generate(Terrain *terrain, const Planet *planet, const double (*points)[TOTAL_SPATIAL_AXES], const Tectonics *tectonics,
-    const TerrainSettings *settings) {
+uint8_t terrain_generate(Terrain *terrain, const Planet *planet, const double (*points)[TOTAL_SPATIAL_AXES], const Tectonics *tectonics, const TerrainSettings *settings) {
     const size_t N = terrain->total;
     double *cell_areas = (double *)malloc(N * sizeof(double));
     uint8_t status = (uint8_t)(cell_areas == NULL);
     double total_area = 0.0;
-    for(size_t v = 0; (v < N) && (status == 0); v++) {
+    for(size_t v = 0; v < N; v++) {
+        if(status != 0) {
+            break;
+        }
         total_area = total_area + planet->vertices[v].area_square_metres;
     }
-    for(size_t v = 0; (v < N) && (status == 0); v++) {
+    for(size_t v = 0; v < N; v++) {
+        if(status != 0) {
+            break;
+        }
         cell_areas[v] = 1.0 / (double)N;
         if(total_area > 0.0) {
             cell_areas[v] = planet->vertices[v].area_square_metres / total_area;
@@ -13395,7 +14929,11 @@ void planet_layer_water_column(Planet_Vertex *vertex, double depth, double surfa
     double remaining = depth;
     double thickness = surface_layer;
     size_t count = 0;
-    for(size_t layer = 0; (layer < layers) && (remaining > 0.0); layer++) {
+    for(size_t layer = 0; layer < layers; layer++) {
+        const uint8_t IS_REMAINING = (uint8_t)(remaining > 0.0);
+        if(IS_REMAINING == 0) {
+            break;
+        }
         double share = thickness;
         if(((layer + 1) == layers) || (remaining < (SLIVER * thickness)) || (thickness <= 0.0)) {
             share = remaining;
@@ -13419,12 +14957,12 @@ void planet_make_patch(Planet *planet, size_t v, uint8_t is_water, double depth,
         vertex->water_layers_length = 0;
         vertex->terrain_layer_thickness_metres[0] = soil_thickness;
         vertex->terrain_layer_water_saturation_fraction[0] = LAND_WATER_SATURATION;
-        vertex->terrain_layer_soil_mass_kilograms[0][soil] = SOIL_BULK_DENSITY_KILOGRAMS_PER_CUBIC_METRE * soil_thickness * vertex->area_square_metres;
+        double soil_mass_per_square_metre = SOIL_BULK_DENSITY_KILOGRAMS_PER_CUBIC_METRE * soil_thickness;
+        vertex->terrain_layer_soil_mass_kilograms[0][soil] = soil_mass_per_square_metre * vertex->area_square_metres;
     }
 }
 
-uint8_t planet_build_icosphere(Planet *planet, size_t levels, double surface_layer, double lake_surface_layer, size_t water_layers, double minimum_water_metres,
-    uint8_t is_latitude_insolation, const TerrainSettings *terrain_settings) {
+uint8_t planet_build_icosphere(Planet *planet, size_t levels, double surface_layer, double lake_surface_layer, size_t water_layers, double minimum_water_metres, uint8_t is_latitude_insolation, const TerrainSettings *terrain_settings) {
     const double FOUR_OVER_PI = 1.27323954473516268615;
     uint8_t status = (uint8_t)(levels > TOPOLOGY_MAXIMUM_LEVELS);
     size_t faces_capacity = TOTAL_ICOSAHEDRON_FACES;
@@ -13441,14 +14979,21 @@ uint8_t planet_build_icosphere(Planet *planet, size_t levels, double surface_lay
     size_t *bodies = (size_t *)malloc(POINTS_CAPACITY * sizeof(size_t));
     size_t total_points = TOTAL_ICOSAHEDRON_VERTICES;
     size_t total_faces = TOTAL_ICOSAHEDRON_FACES;
-    status = (uint8_t)(status + (uint8_t)((points == NULL) || (faces == NULL) || (heights == NULL) || (areas == NULL) || (water == NULL) || (surfaces == NULL)
-        || (bodies == NULL)));
-    for(size_t p = 0; (p < TOTAL_ICOSAHEDRON_VERTICES) && (status == 0); p++) {
+    uint8_t is_missing = (uint8_t)((points == NULL) || (faces == NULL) || (heights == NULL) || (areas == NULL));
+    is_missing = (uint8_t)((is_missing == 1) || (water == NULL) || (surfaces == NULL) || (bodies == NULL));
+    status = (uint8_t)(status + is_missing);
+    for(size_t p = 0; p < TOTAL_ICOSAHEDRON_VERTICES; p++) {
+        if(status != 0) {
+            break;
+        }
         for(size_t axis = 0; axis < TOTAL_SPATIAL_AXES; axis++) {
             points[p][axis] = ICOSAHEDRON_VERTICES[p][axis];
         }
     }
-    for(size_t f = 0; (f < TOTAL_ICOSAHEDRON_FACES) && (status == 0); f++) {
+    for(size_t f = 0; f < TOTAL_ICOSAHEDRON_FACES; f++) {
+        if(status != 0) {
+            break;
+        }
         for(size_t corner = 0; corner < TOTAL_TRIANGLE_CORNERS; corner++) {
             faces[f][corner] = ICOSAHEDRON_FACES[f][corner];
         }
@@ -13471,13 +15016,23 @@ uint8_t planet_build_icosphere(Planet *planet, size_t levels, double surface_lay
             }
         }
         Terrain terrain;
-        status = tectonics_create(&planet->tectonics, planet->seed, terrain_settings->total_plates, terrain_settings->belt_width_radians,
-            terrain_settings->oceanic_plate_fraction, terrain_settings->continental_offset, terrain_settings->oceanic_offset);
-        status = (uint8_t)(status | terrain_create(&terrain, total_points));
+        Tectonics *tectonics = &planet->tectonics;
+        uint64_t seed = planet->seed;
+        size_t total_plates = terrain_settings->total_plates;
+        double belt_width_radians = terrain_settings->belt_width_radians;
+        double oceanic_plate_fraction = terrain_settings->oceanic_plate_fraction;
+        double continental_offset = terrain_settings->continental_offset;
+        double oceanic_offset = terrain_settings->oceanic_offset;
+        status = tectonics_create(tectonics, seed, total_plates, belt_width_radians, oceanic_plate_fraction, continental_offset, oceanic_offset);
+        uint8_t terrain_status = terrain_create(&terrain, total_points);
+        status = (uint8_t)bits_or((uint64_t)status, (uint64_t)terrain_status);
         if(status == 0) {
             status = terrain_generate(&terrain, planet, (const double (*)[TOTAL_SPATIAL_AXES])points, &planet->tectonics, terrain_settings);
         }
         if(status == 0) {
+            bytes_clear((uint8_t *)heights, total_points * sizeof(double));
+            bytes_clear((uint8_t *)areas, total_points * sizeof(double));
+            bytes_clear((uint8_t *)water, total_points * sizeof(double));
             for(size_t v = 0; v < total_points; v++) {
                 heights[v] = terrain.elevation[v] * terrain_settings->relief_metres;
                 areas[v] = planet->vertices[v].area_square_metres;
@@ -13493,7 +15048,9 @@ uint8_t planet_build_icosphere(Planet *planet, size_t levels, double surface_lay
                     sea_level = surfaces[v];
                     break;
                 }
-                sea_level = (heights[v] > sea_level) ? heights[v] : sea_level;
+                if(heights[v] > sea_level) {
+                    sea_level = heights[v];
+                }
             }
             double sediment_mean = 0.0;
             double land_count = 0.0;
@@ -13521,15 +15078,26 @@ uint8_t planet_build_icosphere(Planet *planet, size_t levels, double surface_lay
                 const double DEPTH = surfaces[v] - heights[v];
                 const uint8_t IS_WATER = (uint8_t)((bodies[v] != SIZE_MAX) && (DEPTH >= minimum_water_metres));
                 const uint8_t IS_OCEAN = (uint8_t)((IS_WATER == 1) && (bodies[v] == OCEAN));
-                vertex->water_body_index = (IS_WATER == 1) ? bodies[v] : SIZE_MAX;
+                if(IS_WATER == 1) {
+                    vertex->water_body_index = bodies[v];
+                } else {
+                    vertex->water_body_index = SIZE_MAX;
+                }
                 vertex->is_ocean_water = IS_OCEAN;
                 double thickness_factor = 1.0;
                 if(sediment_mean > 0.0) {
                     thickness_factor = 1.0 + (0.5 * ((terrain.sediment[v] / sediment_mean) - 1.0));
                 }
                 thickness_factor = terrain_clamp(thickness_factor - (0.3 * terrain.slope[v]), 0.4, 2.0);
-                planet_make_patch(planet, v, IS_WATER, DEPTH, (IS_OCEAN == 1) ? surface_layer : lake_surface_layer, water_layers,
-                    LAND_SOIL_THICKNESS_METRES * thickness_factor, terrain_soil_type(&terrain, v, sediment_mean));
+                double patch_surface_layer = lake_surface_layer;
+                if(IS_OCEAN == 1) {
+                    patch_surface_layer = surface_layer;
+                } else {
+                    patch_surface_layer = lake_surface_layer;
+                }
+                double soil_thickness = LAND_SOIL_THICKNESS_METRES * thickness_factor;
+                size_t soil = terrain_soil_type(&terrain, v, sediment_mean);
+                planet_make_patch(planet, v, IS_WATER, DEPTH, patch_surface_layer, water_layers, soil_thickness, soil);
             }
         }
         terrain_destroy(&terrain);
@@ -13546,6 +15114,21 @@ uint8_t planet_build_icosphere(Planet *planet, size_t levels, double surface_lay
     free(bodies);
     return status;
 }
+
+
+/*
+ * ToC01200 GeologyEvents
+ *
+ * Purpose:    Deterministic earthquakes and eruptions: per-site Poisson counts per epoch and per-event
+ *             attributes drawn from a counter-based hash, and time-ordered lists of events in a window.
+ * Depends:    Geology (settings, hash and uniform draws), Terrain (floor and clamp), Planet geology sites
+ * API:        planet_geology_site, planet_geology_epoch, planet_earthquake_count, planet_earthquake_get,
+ *             planet_eruption_count, planet_eruption_get, planet_earthquakes_between, planet_eruptions_between
+ * Ownership:  No function allocates. Callers own every output array and pass its capacity.
+ * Invariants: The same (seed, vertex, epoch, ordinal) always yields the same event. Listed events are sorted
+ *             by time, then vertex index, then ordinal, with ties kept in generation order.
+ * Errors:     planet_earthquake_get and planet_eruption_get return 1 when ordinal is past the epoch's count.
+ */
 
 const GeologySite *planet_geology_site(const Planet *planet, size_t vertex_index) {
     if((planet->geology_sites == NULL) || (vertex_index >= planet->vertices_length)) {
@@ -13567,7 +15150,11 @@ size_t geology_poisson(double mean, double uniform) {
     if(mean > 0.0) {
         double probability = exponential_double(-mean);
         double cumulative = probability;
-        while((uniform > cumulative) && (count < GEOLOGY_MAXIMUM_EVENTS_PER_SITE_EPOCH) && (probability > 0.0)) {
+        for(size_t step = 0; step < GEOLOGY_MAXIMUM_EVENTS_PER_SITE_EPOCH; step++) {
+            const uint8_t IS_CONTINUING = (uint8_t)((uniform > cumulative) && (count < GEOLOGY_MAXIMUM_EVENTS_PER_SITE_EPOCH) && (probability > 0.0));
+            if(IS_CONTINUING == 0) {
+                break;
+            }
             count = count + 1;
             probability = probability * (mean / (double)count);
             cumulative = cumulative + probability;
@@ -13577,8 +15164,8 @@ size_t geology_poisson(double mean, double uniform) {
 }
 
 double geology_event_uniform(const Planet *planet, uint64_t kind, size_t vertex_index, uint64_t epoch, size_t ordinal, size_t attribute) {
-    return geology_uniform(geology_hash(planet->geology.settings.seed, kind, (uint64_t)vertex_index, epoch,
-        ((uint64_t)ordinal * GEOLOGY_TOTAL_ATTRIBUTES) + (uint64_t)attribute));
+    uint64_t draw_index = ((uint64_t)ordinal * GEOLOGY_TOTAL_ATTRIBUTES) + (uint64_t)attribute;
+    return geology_uniform(geology_hash(planet->geology.settings.seed, kind, (uint64_t)vertex_index, epoch, draw_index));
 }
 
 size_t planet_earthquake_count(const Planet *planet, size_t vertex_index, uint64_t epoch) {
@@ -13686,28 +15273,78 @@ uint8_t planet_eruption_get(const Planet *planet, size_t vertex_index, uint64_t 
     return 0;
 }
 
-int geology_compare_earthquakes(const void *a, const void *b) {
-    const Earthquake *first = (const Earthquake *)a;
-    const Earthquake *second = (const Earthquake *)b;
+int8_t geology_compare_earthquakes(const Earthquake *first, const Earthquake *second) {
+    int8_t order = 0;
     if(first->time_days != second->time_days) {
-        return (first->time_days < second->time_days) ? -1 : 1;
+        if(first->time_days < second->time_days) {
+            order = -1;
+        } else {
+            order = 1;
+        }
+    } else if(first->vertex_index != second->vertex_index) {
+        if(first->vertex_index < second->vertex_index) {
+            order = -1;
+        } else {
+            order = 1;
+        }
+    } else if(first->ordinal < second->ordinal) {
+        order = -1;
+    } else if(first->ordinal > second->ordinal) {
+        order = 1;
     }
-    if(first->vertex_index != second->vertex_index) {
-        return (first->vertex_index < second->vertex_index) ? -1 : 1;
-    }
-    return (first->ordinal < second->ordinal) ? -1 : ((first->ordinal > second->ordinal) ? 1 : 0);
+    return order;
 }
 
-int geology_compare_eruptions(const void *a, const void *b) {
-    const Eruption *first = (const Eruption *)a;
-    const Eruption *second = (const Eruption *)b;
+int8_t geology_compare_eruptions(const Eruption *first, const Eruption *second) {
+    int8_t order = 0;
     if(first->time_days != second->time_days) {
-        return (first->time_days < second->time_days) ? -1 : 1;
+        if(first->time_days < second->time_days) {
+            order = -1;
+        } else {
+            order = 1;
+        }
+    } else if(first->vertex_index != second->vertex_index) {
+        if(first->vertex_index < second->vertex_index) {
+            order = -1;
+        } else {
+            order = 1;
+        }
+    } else if(first->ordinal < second->ordinal) {
+        order = -1;
+    } else if(first->ordinal > second->ordinal) {
+        order = 1;
     }
-    if(first->vertex_index != second->vertex_index) {
-        return (first->vertex_index < second->vertex_index) ? -1 : 1;
+    return order;
+}
+
+void geology_sort_earthquakes(Earthquake *quakes, size_t quakes_length) {
+    for(size_t sorted_length = 1; sorted_length < quakes_length; sorted_length++) {
+        Earthquake key = quakes[sorted_length];
+        size_t insert_index = sorted_length;
+        for(size_t shift_index = 0; shift_index < sorted_length; shift_index++) {
+            if(geology_compare_earthquakes(&quakes[insert_index - 1], &key) <= 0) {
+                break;
+            }
+            quakes[insert_index] = quakes[insert_index - 1];
+            insert_index = insert_index - 1;
+        }
+        quakes[insert_index] = key;
     }
-    return (first->ordinal < second->ordinal) ? -1 : ((first->ordinal > second->ordinal) ? 1 : 0);
+}
+
+void geology_sort_eruptions(Eruption *eruptions, size_t eruptions_length) {
+    for(size_t sorted_length = 1; sorted_length < eruptions_length; sorted_length++) {
+        Eruption key = eruptions[sorted_length];
+        size_t insert_index = sorted_length;
+        for(size_t shift_index = 0; shift_index < sorted_length; shift_index++) {
+            if(geology_compare_eruptions(&eruptions[insert_index - 1], &key) <= 0) {
+                break;
+            }
+            eruptions[insert_index] = eruptions[insert_index - 1];
+            insert_index = insert_index - 1;
+        }
+        eruptions[insert_index] = key;
+    }
 }
 
 size_t planet_earthquakes_between(const Planet *planet, double start, double end, Earthquake *output, size_t capacity) {
@@ -13717,7 +15354,12 @@ size_t planet_earthquakes_between(const Planet *planet, double start, double end
     }
     const uint64_t FIRST = planet_geology_epoch(planet, start);
     const uint64_t LAST = planet_geology_epoch(planet, end);
-    for(uint64_t epoch = FIRST; epoch <= LAST; epoch++) {
+    uint64_t total_epochs = 0;
+    if(LAST >= FIRST) {
+        total_epochs = (LAST - FIRST) + 1;
+    }
+    for(uint64_t epoch_offset = 0; epoch_offset < total_epochs; epoch_offset++) {
+        uint64_t epoch = FIRST + epoch_offset;
         for(size_t v = 0; v < planet->vertices_length; v++) {
             size_t count = planet_earthquake_count(planet, v, epoch);
             for(size_t i = 0; i < count; i++) {
@@ -13733,7 +15375,13 @@ size_t planet_earthquakes_between(const Planet *planet, double start, double end
         }
     }
     if((output != NULL) && (capacity > 0)) {
-        qsort(output, (total < capacity) ? total : capacity, sizeof(Earthquake), geology_compare_earthquakes);
+        size_t sorted_length = capacity;
+        if(total < capacity) {
+            sorted_length = total;
+        } else {
+            sorted_length = capacity;
+        }
+        geology_sort_earthquakes(output, sorted_length);
     }
     return total;
 }
@@ -13745,7 +15393,12 @@ size_t planet_eruptions_between(const Planet *planet, double start, double end, 
     }
     const uint64_t FIRST = planet_geology_epoch(planet, start);
     const uint64_t LAST = planet_geology_epoch(planet, end);
-    for(uint64_t epoch = FIRST; epoch <= LAST; epoch++) {
+    uint64_t total_epochs = 0;
+    if(LAST >= FIRST) {
+        total_epochs = (LAST - FIRST) + 1;
+    }
+    for(uint64_t epoch_offset = 0; epoch_offset < total_epochs; epoch_offset++) {
+        uint64_t epoch = FIRST + epoch_offset;
         for(size_t v = 0; v < planet->vertices_length; v++) {
             size_t count = planet_eruption_count(planet, v, epoch);
             for(size_t i = 0; i < count; i++) {
@@ -13761,14 +15414,35 @@ size_t planet_eruptions_between(const Planet *planet, double start, double end, 
         }
     }
     if((output != NULL) && (capacity > 0)) {
-        qsort(output, (total < capacity) ? total : capacity, sizeof(Eruption), geology_compare_eruptions);
+        size_t sorted_length = capacity;
+        if(total < capacity) {
+            sorted_length = total;
+        } else {
+            sorted_length = capacity;
+        }
+        geology_sort_eruptions(output, sorted_length);
     }
     return total;
 }
 
+
+/*
+ * ToC01300 PlanetPools
+ *
+ * Purpose:    Small helpers over the planet's matter pools: reset the atmosphere to outside air, flush a
+ *             pending Transfer before it overflows, and list the water and wet terrain locations of a vertex.
+ * Depends:    Planet (pools, locations, gas amounts), Transfer
+ * API:        planet_fill_outside_air, boundary_flush, planet_list_locations
+ * Ownership:  No function allocates. The caller owns the Transfer and the locations array, which must hold
+ *             TOTAL_LOCATIONS_PER_VERTEX entries.
+ * Invariants: boundary_flush leaves transfer->terms_length + 2 <= TRANSFER_MAXIMUM_TERMS whenever it returns.
+ * Errors:     boundary_flush returns the status of planet_apply_transfer, 0 when nothing was applied.
+ */
+
 void planet_fill_outside_air(Planet *planet) {
     for(size_t gas = 0; gas < TOTAL_GAS_SPECIES; gas++) {
-        planet->atmosphere_gas_amounts_mol[gas] = planet_gas_amount_for_partial_pressure(planet, gas, OUTSIDE_AIR_ATMOSPHERES[gas] * PASCALS_PER_ATMOSPHERE);
+        double partial_pressure = OUTSIDE_AIR_ATMOSPHERES[gas] * PASCALS_PER_ATMOSPHERE;
+        planet->atmosphere_gas_amounts_mol[gas] = planet_gas_amount_for_partial_pressure(planet, gas, partial_pressure);
         planet->atmosphere_gas_compensation_mol[gas] = 0.0;
     }
 }
@@ -13798,6 +15472,22 @@ size_t planet_list_locations(const Planet *planet, size_t vertex_index, Location
     }
     return count;
 }
+
+
+/*
+ * ToC01400 Chemistry
+ *
+ * Purpose:    Abiotic water chemistry: temperature-corrected acid-base constants, pH by bisection, phosphate
+ *             sorption, reversible redox and mineral pairs, organic breakdown, and burial to and return
+ *             from the lithosphere, all expressed as balanced Transfers.
+ * Depends:    Planet (locations and pools), Transfer, CandidateList, scalar math helpers
+ * API:        planet_update_equilibria, planet_add_abiotic_candidates, planet_bury_vertex, planet_return_vertex,
+ *             transfer_add_organic_breakdown, transfer_add_exudate, transfer_add_fermentation
+ * Ownership:  No function allocates. Transfers and constant tables live on the stack or at file scope.
+ * Invariants: Transfers are applied through planet_apply_transfer, which rejects unbalanced ones;
+ *             solved pH stays within [0, 14].
+ * Errors:     Functions return uint8_t status, 0 on success and non-zero when a Transfer or append fails.
+ */
 
 #define TOTAL_ACID_BASE_CONSTANTS 12
 #define ACID_K1 0
@@ -13857,7 +15547,9 @@ size_t planet_list_locations(const Planet *planet, size_t vertex_index, Location
 #define PAIR_PRESENT 3
 
 const double ACID_BASE_PK_25[TOTAL_ACID_BASE_CONSTANTS] = {6.35, 10.33, 14.0, 9.25, 7.0, 9.24, 2.15, 7.20, 12.35, 4.76, 8.48, 3.5};
-const double ACID_BASE_ENTHALPIES[TOTAL_ACID_BASE_CONSTANTS] = {9150.0, 14900.0, 55800.0, 52200.0, 22200.0, 13800.0, -8000.0, 3600.0, 16000.0, 0.0, 0.0, 0.0};
+const double ACID_BASE_ENTHALPIES[TOTAL_ACID_BASE_CONSTANTS] = {
+    9150.0, 14900.0, 55800.0, 52200.0, 22200.0, 13800.0, -8000.0, 3600.0, 16000.0, 0.0, 0.0, 0.0
+};
 const double LOG_OF_TEN = 2.30258509299404568402;
 
 const double GIBBS_FORMATION_KILOJOULES[TOTAL_GIBBS_SPECIES] = {
@@ -14007,10 +15699,13 @@ double acid_base_free_carbon_dioxide(const AcidBaseTotals *totals, const AcidBas
 double planet_location_concentration(const Planet *planet, const Location *location, size_t species) {
     const Planet_Vertex *vertex = &planet->vertices[location->vertex_index];
     const double VOLUME = planet_location_volume_litres(planet, location);
-    double amount = vertex->terrain_layer_porewater_dissolved_amounts_mol[location->layer_index][species] + vertex->terrain_layer_porewater_dissolved_compensation_mol[location->layer_index][species];
+    const size_t L = location->layer_index;
+    const double *porewater_amounts = vertex->terrain_layer_porewater_dissolved_amounts_mol[L];
+    const double *porewater_compensation = vertex->terrain_layer_porewater_dissolved_compensation_mol[L];
+    double amount = porewater_amounts[species] + porewater_compensation[species];
     double concentration = 0.0;
     if(location->kind == LOCATION_WATER) {
-        amount = vertex->water_layer_dissolved_amounts_mol[location->layer_index][species] + vertex->water_layer_dissolved_compensation_mol[location->layer_index][species];
+        amount = vertex->water_layer_dissolved_amounts_mol[L][species] + vertex->water_layer_dissolved_compensation_mol[L][species];
     }
     if((VOLUME > 0.0) && (amount > 0.0)) {
         concentration = amount / VOLUME;
@@ -14034,10 +15729,14 @@ double planet_location_mineral(const Planet *planet, const Location *location, s
 double planet_location_organic(const Planet *planet, const Location *location, size_t class_index, const double **composition) {
     const Planet_Vertex *vertex = &planet->vertices[location->vertex_index];
     const size_t L = location->layer_index;
-    double amount = vertex->terrain_layer_organic_particulate_amounts_mol_carbon[L][class_index] + vertex->terrain_layer_organic_particulate_compensation_mol_carbon[L][class_index];
+    const double *terrain_amounts = vertex->terrain_layer_organic_particulate_amounts_mol_carbon[L];
+    const double *terrain_compensation = vertex->terrain_layer_organic_particulate_compensation_mol_carbon[L];
+    double amount = terrain_amounts[class_index] + terrain_compensation[class_index];
     const double *found = vertex->terrain_layer_organic_particulate_compositions[L][class_index];
     if(location->kind == LOCATION_WATER) {
-        amount = vertex->water_layer_organic_particulate_amounts_mol_carbon[L][class_index] + vertex->water_layer_organic_particulate_compensation_mol_carbon[L][class_index];
+        const double *water_amounts = vertex->water_layer_organic_particulate_amounts_mol_carbon[L];
+        const double *water_compensation = vertex->water_layer_organic_particulate_compensation_mol_carbon[L];
+        amount = water_amounts[class_index] + water_compensation[class_index];
         found = vertex->water_layer_organic_particulate_compositions[L][class_index];
     }
     if(composition != NULL) {
@@ -14052,7 +15751,8 @@ double planet_location_organic(const Planet *planet, const Location *location, s
 void planet_location_totals(const Planet *planet, const Location *location, AcidBaseTotals *totals, AcidBaseConstants *constants) {
     acid_base_totals_create(totals);
     for(size_t i = 0; i < TOTAL_DISSOLVED_SPECIES; i++) {
-        totals->conservative_charge = totals->conservative_charge + (planet->dissolved_species_alkalinity_contributions[i] * planet_location_concentration(planet, location, i));
+        double concentration = planet_location_concentration(planet, location, i);
+        totals->conservative_charge = totals->conservative_charge + (planet->dissolved_species_alkalinity_contributions[i] * concentration);
     }
     totals->inorganic_carbon = planet_location_concentration(planet, location, DISSOLVED_INORGANIC_CARBON);
     totals->ammonia = planet_location_concentration(planet, location, DISSOLVED_TOTAL_AMMONIA);
@@ -14070,7 +15770,11 @@ double langmuir_sorbed(double total, double capacity, double volume) {
     if(capacity < high) {
         high = capacity;
     }
-    for(size_t i = 0; (i < STEPS) && (high > 0.0); i++) {
+    for(size_t i = 0; i < STEPS; i++) {
+        const uint8_t IS_POSITIVE = (uint8_t)(high > 0.0);
+        if(IS_POSITIVE == 0) {
+            break;
+        }
         double middle = 0.5 * (low + high);
         double concentration = (total - middle) / volume;
         double target = capacity * (concentration / (PHOSPHATE_SORPTION_HALF_SATURATION_MOLAR + concentration));
@@ -14090,7 +15794,11 @@ uint8_t planet_equilibrate_phosphate(Planet *planet, const Location *location, s
     const double CAPACITIES[2] = {IRON_PHOSPHATE_CAPACITY, CALCITE_PHOSPHATE_CAPACITY};
     uint8_t status = 0;
     Transfer transfer;
-    for(size_t h = 0; (h < 2) && (VOLUME > 0.0) && (status == 0); h++) {
+    for(size_t h = 0; h < 2; h++) {
+        const uint8_t IS_CONTINUING = (uint8_t)((VOLUME > 0.0) && (status == 0));
+        if(IS_CONTINUING == 0) {
+            break;
+        }
         double dissolved = planet_location_concentration(planet, location, DISSOLVED_TOTAL_PHOSPHATE) * VOLUME;
         double sorbed = planet_location_mineral(planet, location, SORBED[h]);
         double target = langmuir_sorbed(dissolved + sorbed, CAPACITIES[h] * planet_location_mineral(planet, location, HOSTS[h]), VOLUME);
@@ -14104,21 +15812,28 @@ uint8_t planet_equilibrate_phosphate(Planet *planet, const Location *location, s
     return status;
 }
 
-uint8_t planet_update_equilibria(Planet *planet, const ChemistrySettings *settings) {
+uint8_t planet_update_equilibria(Planet *planet) {
     size_t process = PROCESS_PHOSPHATE_SORPTION;
     uint8_t status = 0;
     Location locations[TOTAL_LOCATIONS_PER_VERTEX];
     AcidBaseTotals totals;
     AcidBaseConstants constants;
-    for(size_t v = 0; (v < planet->vertices_length) && (status == 0); v++) {
+    for(size_t v = 0; v < planet->vertices_length; v++) {
+        if(status != 0) {
+            break;
+        }
         size_t count = planet_list_locations(planet, v, locations);
-        for(size_t i = 0; (i < count) && (status == 0); i++) {
+        for(size_t i = 0; i < count; i++) {
+            if(status != 0) {
+                break;
+            }
             status = planet_equilibrate_phosphate(planet, &locations[i], process);
             planet_location_totals(planet, &locations[i], &totals, &constants);
             double ph = acid_base_solve_ph(&totals, &constants);
             if(locations[i].kind == LOCATION_WATER) {
                 planet->vertices[v].water_layer_ph[locations[i].layer_index] = ph;
-                planet->vertices[v].water_layer_free_carbon_dioxide_mol_per_litre[locations[i].layer_index] = acid_base_free_carbon_dioxide(&totals, &constants, ph);
+                double free_carbon_dioxide = acid_base_free_carbon_dioxide(&totals, &constants, ph);
+                planet->vertices[v].water_layer_free_carbon_dioxide_mol_per_litre[locations[i].layer_index] = free_carbon_dioxide;
             } else {
                 planet->vertices[v].terrain_layer_porewater_ph[locations[i].layer_index] = ph;
             }
@@ -14145,7 +15860,8 @@ uint8_t transfer_add_organic_breakdown(Transfer *transfer, const Location *locat
     double nitrogen = composition[COMPONENT_NITROGEN] - (amino * AMINO_NITROGEN_PER_CARBON) - (product * PRODUCT[COMPONENT_NITROGEN]);
     double phosphorus = composition[COMPONENT_PHOSPHORUS] - (product * PRODUCT[COMPONENT_PHOSPHORUS]);
     double sulfur = composition[COMPONENT_SULFUR];
-    double electrons = composition[COMPONENT_ELECTRON] - (6.0 * amino) - (4.0 * sugar) - (product * PRODUCT[COMPONENT_ELECTRON]) - (8.0 * nitrogen) - (8.0 * sulfur);
+    double carbon_electrons = composition[COMPONENT_ELECTRON] - (6.0 * amino) - (4.0 * sugar) - (product * PRODUCT[COMPONENT_ELECTRON]);
+    double electrons = carbon_electrons - (8.0 * nitrogen) - (8.0 * sulfur);
     double inorganic_carbon = 0.0;
     if((electrons < 0.0) && (sugar > 0.0)) {
         inorganic_carbon = -electrons / 4.0;
@@ -14243,14 +15959,13 @@ double pair_redox_log_ratio(size_t pair, double reduced, double oxygen, double s
     double log_quotient = ((8.0 * LOG_H) - (4.0 * natural_logarithm_double(reduced))) - natural_logarithm_double(oxygen);
     if(pair == PAIR_SULFIDE_OXIDATION) {
         const double NEUTRAL = reduced * (h / (h + constants->values[ACID_KS]));
-        log_quotient = (natural_logarithm_double(sulfate) + (2.0 * LOG_H)) - natural_logarithm_double(NEUTRAL)
-            - (2.0 * natural_logarithm_double(oxygen));
+        const double PRODUCTS_OVER_SULFIDE = (natural_logarithm_double(sulfate) + (2.0 * LOG_H)) - natural_logarithm_double(NEUTRAL);
+        log_quotient = PRODUCTS_OVER_SULFIDE - (2.0 * natural_logarithm_double(oxygen));
     }
     return log_quotient - LOG_K;
 }
 
-uint8_t planet_pair_state(const Planet *planet, const Location *location, const AcidBaseConstants *constants, double ph, size_t pair,
-    double *log_ratio) {
+uint8_t planet_pair_state(const Planet *planet, const Location *location, const AcidBaseConstants *constants, double ph, size_t pair, double *log_ratio) {
     const double H = power_of_ten(-ph);
     const double FERROUS = planet_location_concentration(planet, location, DISSOLVED_FERROUS_IRON);
     const double SULFIDE = planet_location_concentration(planet, location, DISSOLVED_TOTAL_SULFIDE);
@@ -14384,14 +16099,16 @@ uint8_t chemistry_add_organic_candidates(const Planet *planet, CandidateList *li
     if(location->kind == LOCATION_WATER) {
         light = planet->vertices[location->vertex_index].water_layer_light_at_top_watts_per_square_metre[location->layer_index];
     }
-    double rate = PHOTODEGRADATION_PER_WATT_DAY * light * planet_location_concentration(planet, location, DISSOLVED_REFRACTORY_ORGANIC_MATTER) * volume;
+    double refractory_concentration = planet_location_concentration(planet, location, DISSOLVED_REFRACTORY_ORGANIC_MATTER);
+    double rate = PHOTODEGRADATION_PER_WATT_DAY * light * refractory_concentration * volume;
     transfer_create(&transfer, process);
     if(rate > 0.0) {
         transfer_add_dissolved(&transfer, location, DISSOLVED_REFRACTORY_ORGANIC_MATTER, -rate);
         transfer_add_dissolved(&transfer, location, DISSOLVED_INORGANIC_CARBON, rate);
         transfer_add_dissolved(&transfer, location, DISSOLVED_TOTAL_AMMONIA, rate * REFRACTORY[COMPONENT_NITROGEN]);
         transfer_add_dissolved(&transfer, location, DISSOLVED_TOTAL_PHOSPHATE, rate * REFRACTORY[COMPONENT_PHOSPHORUS]);
-        transfer_add_dissolved(&transfer, location, DISSOLVED_OXYGEN, -rate * ((REFRACTORY[COMPONENT_ELECTRON] - (8.0 * REFRACTORY[COMPONENT_NITROGEN])) / 4.0));
+        double oxygen_per_carbon = (REFRACTORY[COMPONENT_ELECTRON] - (8.0 * REFRACTORY[COMPONENT_NITROGEN])) / 4.0;
+        transfer_add_dissolved(&transfer, location, DISSOLVED_OXYGEN, -rate * oxygen_per_carbon);
         status = candidate_list_append(list, &transfer);
     }
     const size_t HYDROLYSED[2] = {ORGANIC_PARTICULATE_LABILE_DETRITUS, ORGANIC_PARTICULATE_FAECAL_PELLETS};
@@ -14418,7 +16135,8 @@ uint8_t chemistry_add_organic_candidates(const Planet *planet, CandidateList *li
             status = (uint8_t)(status + candidate_list_append(list, &transfer));
         }
     }
-    rate = REFRACTORY_DISSOLVED_BREAKDOWN_RATE_PER_DAY * FACTOR * planet_location_concentration(planet, location, DISSOLVED_REFRACTORY_ORGANIC_MATTER) * volume;
+    refractory_concentration = planet_location_concentration(planet, location, DISSOLVED_REFRACTORY_ORGANIC_MATTER);
+    rate = REFRACTORY_DISSOLVED_BREAKDOWN_RATE_PER_DAY * FACTOR * refractory_concentration * volume;
     transfer_create(&transfer, process);
     if(rate > 0.0) {
         transfer_add_dissolved(&transfer, location, DISSOLVED_REFRACTORY_ORGANIC_MATTER, -rate);
@@ -14447,9 +16165,15 @@ uint8_t planet_add_abiotic_candidates(Planet *planet, CandidateList *list, const
     Location locations[TOTAL_LOCATIONS_PER_VERTEX];
     AcidBaseTotals totals;
     AcidBaseConstants constants;
-    for(size_t v = 0; (v < planet->vertices_length) && (status == 0); v++) {
+    for(size_t v = 0; v < planet->vertices_length; v++) {
+        if(status != 0) {
+            break;
+        }
         size_t count = planet_list_locations(planet, v, locations);
-        for(size_t i = 0; (i < count) && (status == 0); i++) {
+        for(size_t i = 0; i < count; i++) {
+            if(status != 0) {
+                break;
+            }
             double volume = planet_location_volume_litres(planet, &locations[i]);
             double ph = planet_location_ph(planet, &locations[i]);
             planet_location_totals(planet, &locations[i], &totals, &constants);
@@ -14531,7 +16255,10 @@ uint8_t planet_apply_burial_and_return(Planet *planet, const ChemistrySettings *
     size_t returned = PROCESS_RETURN;
     uint8_t status = 0;
     planet->geological_acceleration_factor = settings->geological_acceleration;
-    for(size_t v = 0; (v < planet->vertices_length) && (status == 0); v++) {
+    for(size_t v = 0; v < planet->vertices_length; v++) {
+        if(status != 0) {
+            break;
+        }
         const Planet_Vertex *vertex = &planet->vertices[v];
         if(vertex->terrain_layers_length > 0) {
             double thickness = vertex->terrain_layer_thickness_metres[vertex->terrain_layers_length - 1];
@@ -14550,6 +16277,21 @@ void chemistry_settings_create(ChemistrySettings *settings) {
     settings->return_rate_per_day = 1e-5;
     settings->geological_acceleration = 1.0;
 }
+
+
+/*
+ * ToC01500 MicrobialMutation
+ *
+ * Purpose:    Layout of the microbial genome loci, the mutation classes with their draw and their
+ *             effect on a genome, and the branching-process odds that a beneficial mutant establishes.
+ * Depends:    random streams (PCG, stream_uniform, stream_normal), MicrobialGenome, math helpers
+ * API:        mutation_parameters_create, mutation_create, genome_performance_multiplier, genome_innovation_capacity,
+ *             microbial_mutation_draw, genome_apply_mutation, supply_establishment, supply_seed_cells
+ * Ownership:  Nothing is allocated. Callers own every MutationParameters, Mutation and MicrobialGenome.
+ * Invariants: class_shares sum to 1. Loci stay within [-LOCUS_LIMIT, LOCUS_LIMIT]; total_copies and
+ *             total_potentiations never exceed GENOME_MAXIMUM_COUNT.
+ * Errors:     None. No function in this module can fail.
+ */
 
 #define LOCUS_GROWTH 0
 #define LOCUS_RATE 1
@@ -14739,6 +16481,28 @@ double supply_seed_cells(double s) {
     return cells;
 }
 
+
+/*
+ * ToC01600 MicrobialMetabolism
+ *
+ * Purpose:    Functional-type tables and the thermodynamic growth model of microbial cohorts: redox legs
+ *             around one electron carrier, growth found by bisection, traits set from the genome, and the
+ *             candidate transfers for metabolism, losses and hydrolysis.
+ * Depends:    MicrobialMutation, chemistry (Gibbs tables, acid-base constants, Location, Transfer, CandidateList), Planet
+ * API:        metabolism_settings_create, metabolism_solve_growth, cohort_initialise, cohort_apply_genome,
+ *             planet_add_cohort, planet_add_metabolism_candidates, planet_regulate_allocations, cohort_biomass,
+ *             cohort_is_at, planet_build_cohort_location_index, planet_invalidate_cohort_location_index,
+ *             planet_cohort_at_first, planet_cohort_at_next
+ * Ownership:  planet_add_cohort grows planet->cohorts with realloc (doubling from COHORT_INITIAL_CAPACITY);
+ *             the Planet owns and frees it. The cohort location index arrays also belong to the Planet.
+ *             Every other function works on caller-owned structs.
+ * Invariants: legs_length <= TOTAL_MAXIMUM_COHORT_LEGS. allocation_centres on the donor side and on the
+ *             acceptor side each sum to 1. A solved growth rate lies in [0, growth_cap]. While the location index
+ *             is usable, the list for a location holds exactly the cohorts there, in ascending index order.
+ * Errors:     uint8_t status, 0 is success; non-zero is a count of failed transfer or list operations.
+ *             planet_add_cohort returns SIZE_MAX when the array cannot grow.
+ */
+
 #define TOTAL_FUNCTIONAL_TYPES 19
 #define LEG_NONE 255
 #define LEG_ACCEPTOR 0
@@ -14751,6 +16515,11 @@ double supply_seed_cells(double s) {
 #define GROWTH_MAXIMUM_ITERATIONS 200
 #define THROTTLE_BISECTION_STEPS 40
 #define COHORT_INITIAL_CAPACITY 16
+#define COHORT_LOCATION_KINDS 2
+#define COHORT_LOCATION_SLOTS_PER_KIND 32
+#define COHORT_LOCATION_SLOTS_PER_VERTEX 64
+
+const size_t COHORT_LOCATION_NONE = SIZE_MAX;
 #define FUNNEL_MAXIMUM_MUTATIONS_PER_COHORT 20
 #define GENOTYPE_SCRATCH 8192
 #define TYPE_OXYGENIC_PHOTOTROPH 0
@@ -14869,13 +16638,21 @@ const uint8_t FUNCTIONAL_TYPE_LEG_ROLES[TOTAL_FUNCTIONAL_TYPES][TOTAL_MAXIMUM_CO
     {1, 1, 0, 0, 0, 0}
 };
 const uint8_t FUNCTIONAL_TYPE_CARBON_MODES[TOTAL_FUNCTIONAL_TYPES] = {0, 1, 1, 1, 0, 0, 0, 2, 0, 2, 0, 0, 3, 1, 0, 0, 0, 0, 1};
-const double FUNCTIONAL_TYPE_MAXIMUM_GROWTH[TOTAL_FUNCTIONAL_TYPES] = {1.5, 5.0, 3.0, 3.0, 1.0, 1.0, 0.1, 1.0, 1.0, 1.0, 2.0, 0.5, 1.0, 3.0, 2.0, 0.8, 1.0, 0.3, 4.0};
-const double FUNCTIONAL_TYPE_LEG_RATES[TOTAL_FUNCTIONAL_TYPES] = {100.0, 120.0, 80.0, 80.0, 80.0, 80.0, 40.0, 60.0, 80.0, 60.0, 80.0, 60.0, 80.0, 120.0, 80.0, 100.0, 80.0, 40.0, 100.0};
-const double FUNCTIONAL_TYPE_EFFICIENCIES[TOTAL_FUNCTIONAL_TYPES] = {0.4, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.4, 0.4, 0.3, 0.3};
+const double FUNCTIONAL_TYPE_MAXIMUM_GROWTH[TOTAL_FUNCTIONAL_TYPES] = {
+    1.5, 5.0, 3.0, 3.0, 1.0, 1.0, 0.1, 1.0, 1.0, 1.0, 2.0, 0.5, 1.0, 3.0, 2.0, 0.8, 1.0, 0.3, 4.0
+};
+const double FUNCTIONAL_TYPE_LEG_RATES[TOTAL_FUNCTIONAL_TYPES] = {
+    100.0, 120.0, 80.0, 80.0, 80.0, 80.0, 40.0, 60.0, 80.0, 60.0, 80.0, 60.0, 80.0, 120.0, 80.0, 100.0, 80.0, 40.0, 100.0
+};
+const double FUNCTIONAL_TYPE_EFFICIENCIES[TOTAL_FUNCTIONAL_TYPES] = {
+    0.4, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.4, 0.4, 0.3, 0.3
+};
 const double FUNCTIONAL_TYPE_CELL_MASSES[TOTAL_FUNCTIONAL_TYPES] = {
     1e-12, 2e-15, 2e-15, 2e-15, 2e-15, 2e-15, 2e-15, 2e-15, 2e-15, 2e-15, 2e-15, 2e-15, 2e-15, 2e-15, 2e-15, 5e-14, 5e-14, 2e-15, 2e-15
 };
-const double FUNCTIONAL_TYPE_LIFTS[TOTAL_FUNCTIONAL_TYPES] = {1.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.8, 1.2, 0.0, 0.0};
+const double FUNCTIONAL_TYPE_LIFTS[TOTAL_FUNCTIONAL_TYPES] = {
+    1.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.8, 1.2, 0.0, 0.0
+};
 const uint8_t FUNCTIONAL_TYPE_IS_PHOTOTROPH[TOTAL_FUNCTIONAL_TYPES] = {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0};
 const uint8_t FUNCTIONAL_TYPE_HAS_LABILE_HYDROLASE[TOTAL_FUNCTIONAL_TYPES] = {0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
 const double FUNCTIONAL_TYPE_EXUDATE_ACID_SHARES[TOTAL_FUNCTIONAL_TYPES] = {
@@ -15107,7 +16884,8 @@ void metabolism_carrier_solve(const GrowthProblem *problem, double demand, doubl
 double metabolism_supported_growth(const GrowthProblem *problem, const GrowthSolution *solution) {
     double supported = problem->growth_cap;
     if(problem->biomass > 0.0) {
-        double energy = ((problem->efficiency * solution->power) - (problem->maintenance_power * problem->biomass)) / (problem->synthesis_gibbs_energy * problem->biomass);
+        double net_power = (problem->efficiency * solution->power) - (problem->maintenance_power * problem->biomass);
+        double energy = net_power / (problem->synthesis_gibbs_energy * problem->biomass);
         if(energy < supported) {
             supported = energy;
         }
@@ -15158,7 +16936,11 @@ void metabolism_solve_growth(const GrowthProblem *problem, GrowthSolution *solut
         growth = CAP;
     } else if(CAP > 0.0) {
         double high = CAP;
-        for(size_t iteration = 0; (iteration < GROWTH_MAXIMUM_ITERATIONS) && ((high - growth) > (GROWTH_RELATIVE_TOLERANCE * CAP)); iteration++) {
+        for(size_t iteration = 0; iteration < GROWTH_MAXIMUM_ITERATIONS; iteration++) {
+            const uint8_t IS_ABOVE_TOLERANCE = (uint8_t)((high - growth) > (GROWTH_RELATIVE_TOLERANCE * CAP));
+            if(IS_ABOVE_TOLERANCE == 0) {
+                break;
+            }
             double middle = 0.5 * (growth + high);
             if(metabolism_growth_is_feasible(problem, middle, solution) == 1) {
                 growth = middle;
@@ -15175,7 +16957,8 @@ void metabolism_solve_growth(const GrowthProblem *problem, GrowthSolution *solut
     if((growth > 0.0) && ((growth / problem->growth_cap) > (1.0 - 1e-6))) {
         metabolism_throttle(problem, solution);
     }
-    double spare = (problem->efficiency * solution->power) - (problem->maintenance_power * problem->biomass) - (problem->synthesis_gibbs_energy * growth * problem->biomass);
+    double net_power = (problem->efficiency * solution->power) - (problem->maintenance_power * problem->biomass);
+    double spare = net_power - (problem->synthesis_gibbs_energy * growth * problem->biomass);
     if(spare < 0.0) {
         solution->deficit = -spare;
     }
@@ -15234,12 +17017,6 @@ double clamp_double(double value, double low, double high) {
     if(clamped > high) {
         clamped = high;
     }
-    if(clamped < 0.0) {
-        clamped = 0.0;
-    }
-    if(clamped > 1.0) {
-        clamped = 1.0;
-    }
     return clamped;
 }
 
@@ -15262,9 +17039,11 @@ double thermal_performance(double temperature, double optimum, double breadth) {
 
 double cohort_uptake_scale(const Cohort *cohort) {
     const float *LOCI = cohort->genome.loci;
-    double scale = power_double(genome_performance_multiplier((double)LOCI[LOCUS_GROWTH]), TRADEOFF_GROWTH_AFFINITY) / genome_performance_multiplier((double)LOCI[LOCUS_AFFINITY]);
+    double growth_term = power_double(genome_performance_multiplier((double)LOCI[LOCUS_GROWTH]), TRADEOFF_GROWTH_AFFINITY);
+    double scale = growth_term / genome_performance_multiplier((double)LOCI[LOCUS_AFFINITY]);
     if((cohort->functional_type_index < TOTAL_FUNCTIONAL_TYPES) && (cohort->cell_mass_mol_carbon > 0.0)) {
-        scale = scale * power_double(cohort->cell_mass_mol_carbon / FUNCTIONAL_TYPE_CELL_MASSES[cohort->functional_type_index], TRADEOFF_SIZE_AFFINITY_EXPONENT);
+        double size_ratio = cohort->cell_mass_mol_carbon / FUNCTIONAL_TYPE_CELL_MASSES[cohort->functional_type_index];
+        scale = scale * power_double(size_ratio, TRADEOFF_SIZE_AFFINITY_EXPONENT);
     }
     return scale;
 }
@@ -15318,7 +17097,8 @@ void cohort_apply_legs(Cohort *cohort, const MetabolismSettings *settings) {
                 locus = (double)cohort->genome.loci[LOCUS_FIRST_ALLOCATION + i];
             }
             weights[i] = exponential_double(locus);
-            side_totals[(size_t)(FUNCTIONAL_TYPE_LEG_ROLES[TYPE][i] != LEG_ACCEPTOR)] += weights[i];
+            const size_t SIDE = (size_t)(FUNCTIONAL_TYPE_LEG_ROLES[TYPE][i] != LEG_ACCEPTOR);
+            side_totals[SIDE] = side_totals[SIDE] + weights[i];
             cohort->legs_length = i + 1;
         }
     }
@@ -15356,15 +17136,18 @@ void cohort_apply_genome(Cohort *cohort, const MetabolismSettings *settings) {
         efficiency = 0.98 * ETA_MAXIMUM;
     }
     cohort->energy_capture_efficiency = efficiency;
-    cohort->maximum_growth_rate_per_day = FUNCTIONAL_TYPE_MAXIMUM_GROWTH[TYPE] * genome_performance_multiplier((double)LOCI[LOCUS_GROWTH])
-        * power_double(genome_performance_multiplier((double)LOCI[LOCUS_TEMPERATURE_BREADTH]), -TRADEOFF_BREADTH_PEAK);
+    double growth_scale = FUNCTIONAL_TYPE_MAXIMUM_GROWTH[TYPE] * genome_performance_multiplier((double)LOCI[LOCUS_GROWTH]);
+    double breadth_multiplier = genome_performance_multiplier((double)LOCI[LOCUS_TEMPERATURE_BREADTH]);
+    cohort->maximum_growth_rate_per_day = growth_scale * power_double(breadth_multiplier, -TRADEOFF_BREADTH_PEAK);
     cohort->optimum_temperature_kelvin = 298.15 + (2.0 * (double)LOCI[LOCUS_TEMPERATURE]);
     cohort->temperature_breadth_kelvin = 15.0 * genome_performance_multiplier((double)LOCI[LOCUS_TEMPERATURE_BREADTH]);
     cohort->optimum_ph = 7.5 + (0.3 * (double)LOCI[LOCUS_PH]) + (0.5 * (double)(TYPE == TYPE_OXYGENIC_PHOTOTROPH));
     cohort->ph_breadth = 3.0 + (0.5 * (double)IS_PHOTOTROPH);
     double copies_cost = 1.0 + (settings->mutation.cost_per_copy * (double)cohort->genome.total_copies);
     cohort->has_bicarbonate_uptake = (uint8_t)((TYPE == TYPE_OXYGENIC_PHOTOTROPH) || (TYPE == TYPE_DIAZOTROPHIC_PHOTOTROPH));
-    cohort->maintenance_power_joules_per_mol_carbon_per_day = (settings->maintenance_power / genome_performance_multiplier((double)LOCI[LOCUS_MAINTENANCE])) * copies_cost * (1.0 + (BICARBONATE_UPTAKE_COST * (double)cohort->has_bicarbonate_uptake));
+    double maintenance_base = settings->maintenance_power / genome_performance_multiplier((double)LOCI[LOCUS_MAINTENANCE]);
+    double bicarbonate_surcharge = 1.0 + (BICARBONATE_UPTAKE_COST * (double)cohort->has_bicarbonate_uptake);
+    cohort->maintenance_power_joules_per_mol_carbon_per_day = (maintenance_base * copies_cost) * bicarbonate_surcharge;
     cohort->regulation_width = settings->regulation_width;
     cohort->regulation_time_days = settings->regulation_time_days;
     if(cohort->regulation_time_days <= 0.0) {
@@ -15374,13 +17157,13 @@ void cohort_apply_genome(Cohort *cohort, const MetabolismSettings *settings) {
         cohort->regulation_time_days = DOUBLE_MAXIMUM;
     }
     const double LEGS = (double)functional_type_total_legs(TYPE);
-    cohort->maintenance_power_joules_per_mol_carbon_per_day = cohort->maintenance_power_joules_per_mol_carbon_per_day
-        * (1.0 + (REGULATION_MAINTENANCE_SURCHARGE * LEGS * cohort->regulation_width));
-    cohort->maintenance_power_joules_per_mol_carbon_per_day = cohort->maintenance_power_joules_per_mol_carbon_per_day
-        * (1.0 + (PATHOGEN_RESISTANCE_COST * cohort_resistance(cohort)));
+    double regulation_surcharge = 1.0 + (REGULATION_MAINTENANCE_SURCHARGE * LEGS * cohort->regulation_width);
+    cohort->maintenance_power_joules_per_mol_carbon_per_day = cohort->maintenance_power_joules_per_mol_carbon_per_day * regulation_surcharge;
+    double resistance_surcharge = 1.0 + (PATHOGEN_RESISTANCE_COST * cohort_resistance(cohort));
+    cohort->maintenance_power_joules_per_mol_carbon_per_day = cohort->maintenance_power_joules_per_mol_carbon_per_day * resistance_surcharge;
     cohort->mortality_rate_per_day = 0.05 / genome_performance_multiplier((double)LOCI[LOCUS_MORTALITY]);
-    cohort->maintenance_power_joules_per_mol_carbon_per_day = cohort->maintenance_power_joules_per_mol_carbon_per_day
-        * power_double(genome_performance_multiplier((double)LOCI[LOCUS_MORTALITY]), TRADEOFF_MORTALITY_MAINTENANCE);
+    double mortality_surcharge = power_double(genome_performance_multiplier((double)LOCI[LOCUS_MORTALITY]), TRADEOFF_MORTALITY_MAINTENANCE);
+    cohort->maintenance_power_joules_per_mol_carbon_per_day = cohort->maintenance_power_joules_per_mol_carbon_per_day * mortality_surcharge;
     cohort->leakage_fraction = (0.05 + (0.05 * (double)IS_PHOTOTROPH)) * exponential_double((double)LOCI[LOCUS_LEAKAGE]);
     if(cohort->leakage_fraction > 0.5) {
         cohort->leakage_fraction = 0.5;
@@ -15393,8 +17176,8 @@ void cohort_apply_genome(Cohort *cohort, const MetabolismSettings *settings) {
     }
     cohort->absorption_cross_section_square_metres_per_mol_carbon = 5.0 * cohort->pigment_fraction;
     if(IS_PHOTOTROPH == 1) {
-        cohort->maintenance_power_joules_per_mol_carbon_per_day = cohort->maintenance_power_joules_per_mol_carbon_per_day
-            * (1.0 + (PIGMENT_MAINTENANCE_COST * (cohort->pigment_fraction - PIGMENT_REFERENCE_FRACTION)));
+        double pigment_surcharge = 1.0 + (PIGMENT_MAINTENANCE_COST * (cohort->pigment_fraction - PIGMENT_REFERENCE_FRACTION));
+        cohort->maintenance_power_joules_per_mol_carbon_per_day = cohort->maintenance_power_joules_per_mol_carbon_per_day * pigment_surcharge;
     }
     cohort->cell_mass_mol_carbon = FUNCTIONAL_TYPE_CELL_MASSES[TYPE] * exponential_double(0.3 * (double)LOCI[LOCUS_CELL_SIZE]);
     cohort->is_nitrogen_fixer = (uint8_t)(TYPE == TYPE_DIAZOTROPHIC_PHOTOTROPH);
@@ -15407,7 +17190,8 @@ void cohort_apply_genome(Cohort *cohort, const MetabolismSettings *settings) {
     if(cohort->genome.is_mutator == 1) {
         rate = rate * settings->mutation.mutator_multiplier;
     }
-    cohort->mutational_load_factor = exponential_double(-rate * (settings->mutation.class_shares[MUTATION_POINT] + settings->mutation.class_shares[MUTATION_LARGE]));
+    double selected_share = settings->mutation.class_shares[MUTATION_POINT] + settings->mutation.class_shares[MUTATION_LARGE];
+    cohort->mutational_load_factor = exponential_double(-rate * selected_share);
     cohort_apply_legs(cohort, settings);
 }
 
@@ -15421,13 +17205,201 @@ void cohort_initialise(Cohort *cohort, size_t type_index, const Location *locati
     for(size_t i = 0; i < TOTAL_CONSERVED_COMPONENTS; i++) {
         cohort->composition[i] = COMPOSITION[i];
     }
-    cohort->carbon_electrons_per_mol_carbon = COMPOSITION[COMPONENT_ELECTRON] - (8.0 * COMPOSITION[COMPONENT_NITROGEN]) - (8.0 * COMPOSITION[COMPONENT_SULFUR]);
+    double nitrogen_corrected = COMPOSITION[COMPONENT_ELECTRON] - (8.0 * COMPOSITION[COMPONENT_NITROGEN]);
+    cohort->carbon_electrons_per_mol_carbon = nitrogen_corrected - (8.0 * COMPOSITION[COMPONENT_SULFUR]);
     cohort->stoichiometric_number = settings->stoichiometric_number;
     cohort->minimum_energy_quantum_joules_per_mol_electrons = settings->minimum_energy_quantum;
     cohort->is_stochastic = 1;
     cohort_set_quotas(cohort, settings);
     cohort_apply_genome(cohort, settings);
     cohort->last_potential_growth_rate_per_day = cohort->maximum_growth_rate_per_day;
+}
+
+/*
+ * cohort_is_at
+ * Reports whether a cohort lives at a location.
+ * Inputs: cohort    not modified
+ *         location  not modified
+ * Output: 1 if the vertex, kind and layer all match, 0 otherwise
+ * Memory: none allocated or freed
+ */
+uint8_t cohort_is_at(const Cohort *cohort, const Location *location) {
+    uint8_t is_at = (uint8_t)((cohort->vertex_index == location->vertex_index) && (cohort->location_kind == location->kind));
+    is_at = (uint8_t)((is_at == 1) && (cohort->layer_index == location->layer_index));
+    return is_at;
+}
+
+/*
+ * planet_invalidate_cohort_location_index
+ * Marks the per-location cohort index as stale so lookups fall back to scanning every cohort.
+ * Inputs: planet  modified
+ * Output: none
+ * Memory: none allocated or freed (the index arrays are kept for reuse)
+ */
+void planet_invalidate_cohort_location_index(Planet *planet) {
+    planet->is_cohort_location_index_valid = 0;
+    planet->cohort_location_indexed_length = 0;
+}
+
+/*
+ * planet_cohort_location_slot
+ * Returns the index slot of a location: vertex * COHORT_LOCATION_SLOTS_PER_VERTEX + kind * slots per kind + layer.
+ * Inputs: planet        not modified
+ *         vertex_index  any value
+ *         kind          LOCATION_WATER or LOCATION_TERRAIN
+ *         layer_index   any value
+ * Output: the slot, or COHORT_LOCATION_NONE when the location cannot be indexed
+ * Memory: none allocated or freed
+ */
+size_t planet_cohort_location_slot(const Planet *planet, size_t vertex_index, uint8_t kind, size_t layer_index) {
+    size_t slot = COHORT_LOCATION_NONE;
+    const uint8_t IS_INDEXABLE = (uint8_t)((vertex_index < planet->vertices_length) && (kind < COHORT_LOCATION_KINDS));
+    if((IS_INDEXABLE == 1) && (layer_index < COHORT_LOCATION_SLOTS_PER_KIND)) {
+        const size_t KIND_OFFSET = (size_t)kind * COHORT_LOCATION_SLOTS_PER_KIND;
+        slot = (vertex_index * COHORT_LOCATION_SLOTS_PER_VERTEX) + (KIND_OFFSET + layer_index);
+    }
+    return slot;
+}
+
+/*
+ * planet_reserve_cohort_location_index
+ * Grows the index arrays by doubling until they hold every slot and every cohort.
+ * Inputs: planet  modified (index arrays and their capacities)
+ * Output: 0 success, 1 allocation failed (the old arrays are kept)
+ * Memory: may reallocate cohort_location_heads and cohort_location_nexts
+ */
+uint8_t planet_reserve_cohort_location_index(Planet *planet) {
+    const size_t TOTAL_SLOTS = planet->vertices_length * COHORT_LOCATION_SLOTS_PER_VERTEX;
+    uint8_t status = 0;
+    size_t heads_capacity = planet->cohort_location_heads_capacity;
+    if(heads_capacity < TOTAL_SLOTS) {
+        heads_capacity = TOTAL_SLOTS;
+        size_t *grown_heads = NULL;
+        grown_heads = (size_t *)realloc(planet->cohort_location_heads, heads_capacity * sizeof(size_t));
+        if(grown_heads == NULL) {
+            status = 1;
+        } else {
+            planet->cohort_location_heads = grown_heads;
+            planet->cohort_location_heads_capacity = heads_capacity;
+        }
+    }
+    size_t nexts_capacity = planet->cohort_location_nexts_capacity;
+    if(nexts_capacity == 0) {
+        nexts_capacity = COHORT_INITIAL_CAPACITY;
+    }
+    for(size_t i = 0; i < BITS_TOTAL_WORD_BITS; i++) {
+        if(nexts_capacity >= planet->cohorts_length) {
+            break;
+        }
+        nexts_capacity = nexts_capacity * 2;
+    }
+    if((status == 0) && (nexts_capacity > planet->cohort_location_nexts_capacity)) {
+        size_t *grown_nexts = NULL;
+        grown_nexts = (size_t *)realloc(planet->cohort_location_nexts, nexts_capacity * sizeof(size_t));
+        if(grown_nexts == NULL) {
+            status = 1;
+        } else {
+            planet->cohort_location_nexts = grown_nexts;
+            planet->cohort_location_nexts_capacity = nexts_capacity;
+        }
+    }
+    return status;
+}
+
+/*
+ * planet_build_cohort_location_index
+ * Builds a linked list of cohorts per location so scans over one location visit only its own cohorts.
+ * Cohorts are linked from the last to the first, so every list is in ascending cohort order and sums
+ * taken over a list match a full ascending scan bit for bit. The index stays valid until
+ * planet_invalidate_cohort_location_index is called or the number of cohorts changes.
+ * Inputs: planet  modified (index arrays, validity flag)
+ * Output: 0 success, 1 allocation failed (the index is left invalid and lookups scan every cohort)
+ * Memory: may reallocate the index arrays
+ */
+uint8_t planet_build_cohort_location_index(Planet *planet) {
+    planet_invalidate_cohort_location_index(planet);
+    uint8_t status = planet_reserve_cohort_location_index(planet);
+    uint8_t is_indexable = 1;
+    if(status == 0) {
+        const size_t TOTAL_SLOTS = planet->vertices_length * COHORT_LOCATION_SLOTS_PER_VERTEX;
+        for(size_t i = 0; i < TOTAL_SLOTS; i++) {
+            planet->cohort_location_heads[i] = COHORT_LOCATION_NONE;
+        }
+        for(size_t cohort_index = planet->cohorts_length; cohort_index-- > 0;) {
+            const Cohort *COHORT = &planet->cohorts[cohort_index];
+            const size_t SLOT = planet_cohort_location_slot(planet, COHORT->vertex_index, COHORT->location_kind, COHORT->layer_index);
+            if(SLOT == COHORT_LOCATION_NONE) {
+                is_indexable = 0;
+                break;
+            }
+            planet->cohort_location_nexts[cohort_index] = planet->cohort_location_heads[SLOT];
+            planet->cohort_location_heads[SLOT] = cohort_index;
+        }
+    }
+    if((status == 0) && (is_indexable == 1)) {
+        planet->cohort_location_indexed_length = planet->cohorts_length;
+        planet->is_cohort_location_index_valid = 1;
+    }
+    return status;
+}
+
+/*
+ * planet_cohort_location_index_is_usable
+ * Reports whether the index is valid and still describes the current cohort array.
+ * Inputs: planet  not modified
+ * Output: 1 usable, 0 stale or never built
+ * Memory: none allocated or freed
+ */
+uint8_t planet_cohort_location_index_is_usable(const Planet *planet) {
+    const uint8_t IS_VALID = planet->is_cohort_location_index_valid;
+    return (uint8_t)((IS_VALID == 1) && (planet->cohort_location_indexed_length == planet->cohorts_length));
+}
+
+/*
+ * planet_cohort_at_next
+ * Returns the next cohort at a location after a given cohort, in ascending cohort order.
+ * Inputs: planet        not modified
+ *         location      not modified
+ *         cohort_index  a cohort at location, or COHORT_LOCATION_NONE to start from the first cohort
+ * Output: the next cohort index at location, or COHORT_LOCATION_NONE when there are no more
+ * Memory: none allocated or freed
+ */
+size_t planet_cohort_at_next(const Planet *planet, const Location *location, size_t cohort_index) {
+    size_t next = COHORT_LOCATION_NONE;
+    if(planet_cohort_location_index_is_usable(planet) == 1) {
+        if(cohort_index == COHORT_LOCATION_NONE) {
+            const size_t SLOT = planet_cohort_location_slot(planet, location->vertex_index, location->kind, location->layer_index);
+            if(SLOT != COHORT_LOCATION_NONE) {
+                next = planet->cohort_location_heads[SLOT];
+            }
+        } else {
+            next = planet->cohort_location_nexts[cohort_index];
+        }
+    } else {
+        size_t start = 0;
+        if(cohort_index != COHORT_LOCATION_NONE) {
+            start = cohort_index + 1;
+        }
+        for(size_t candidate = start; candidate < planet->cohorts_length; candidate++) {
+            if(cohort_is_at(&planet->cohorts[candidate], location) == 1) {
+                next = candidate;
+                break;
+            }
+        }
+    }
+    return next;
+}
+
+/*
+ * planet_cohort_at_first
+ * Returns the first cohort at a location, in ascending cohort order.
+ * Inputs: planet    not modified
+ *         location  not modified
+ * Output: the lowest cohort index at location, or COHORT_LOCATION_NONE when there is none
+ * Memory: none allocated or freed
+ */
+size_t planet_cohort_at_first(const Planet *planet, const Location *location) {
+    return planet_cohort_at_next(planet, location, COHORT_LOCATION_NONE);
 }
 
 size_t planet_add_cohort(Planet *planet, const Cohort *cohort) {
@@ -15454,6 +17426,7 @@ size_t planet_add_cohort(Planet *planet, const Cohort *cohort) {
         planet->cohorts[index].carrier_electrons_mol = 0.0;
         planet->cohorts[index].carrier_compensation_electrons_mol = 0.0;
         planet->cohorts_length = index + 1;
+        planet_invalidate_cohort_location_index(planet);
     }
     return index;
 }
@@ -15561,7 +17534,11 @@ double couple_potential(const Planet *planet, const Location *location, size_t c
     AcidBaseConstants constants;
     acid_base_constants_at(&constants, planet_location_temperature(planet, location));
     double log_quotient = 0.0;
-    for(size_t i = 0; (i < TOTAL_COUPLE_PARTICIPANTS) && (volume >= 0.0); i++) {
+    for(size_t i = 0; i < TOTAL_COUPLE_PARTICIPANTS; i++) {
+        const uint8_t HAS_VOLUME = (uint8_t)(volume >= 0.0);
+        if(HAS_VOLUME == 0) {
+            break;
+        }
         if(COUPLE_GIBBS_COEFFICIENTS[couple][i] != 0.0) {
             const double ACTIVITY = couple_species_activity(planet, location, COUPLE_GIBBS_SPECIES[couple][i], H, &constants);
             log_quotient = log_quotient + (COUPLE_GIBBS_COEFFICIENTS[couple][i] * natural_logarithm_double(ACTIVITY));
@@ -15597,7 +17574,8 @@ double leg_substrate_saturation(const Planet *planet, const Location *location, 
         if(COUPLE_REDUCED_IS_MINERAL[COUPLE] == 0) {
             half = SPECIES_HALF_SATURATIONS[species];
         }
-        saturation = monod(planet_location_substrate(planet, location, species, COUPLE_REDUCED_IS_MINERAL[COUPLE], volume), half * leg->half_saturation_mol_per_litre * penalty);
+        double substrate = planet_location_substrate(planet, location, species, COUPLE_REDUCED_IS_MINERAL[COUPLE], volume);
+        saturation = monod(substrate, half * leg->half_saturation_mol_per_litre * penalty);
     } else if(leg->is_donor == 0) {
         for(size_t k = 0; k < 2; k++) {
             size_t species = COUPLE_OXIDISED_SPECIES[COUPLE][k];
@@ -15606,7 +17584,8 @@ double leg_substrate_saturation(const Planet *planet, const Location *location, 
                 if(COUPLE_OXIDISED_IS_MINERAL[COUPLE] == 0) {
                     half = SPECIES_HALF_SATURATIONS[species];
                 }
-                saturation = saturation * monod(planet_location_substrate(planet, location, species, COUPLE_OXIDISED_IS_MINERAL[COUPLE], volume), half * leg->half_saturation_mol_per_litre * penalty);
+                double substrate = planet_location_substrate(planet, location, species, COUPLE_OXIDISED_IS_MINERAL[COUPLE], volume);
+                saturation = saturation * monod(substrate, half * leg->half_saturation_mol_per_litre * penalty);
             }
         }
     }
@@ -15618,7 +17597,10 @@ void cohort_choose_carbon(const Planet *planet, const Cohort *cohort, const Loca
     const double SCALE = cohort_uptake_scale(cohort) * cohort_diffusion_penalty(cohort);
     *species = SIZE_MAX;
     *saturation = 0.0;
-    for(size_t i = 0; (i < cohort->legs_length) && ((MODE == CARBON_ORGANIC) || (MODE == CARBON_EITHER)); i++) {
+    for(size_t i = 0; i < cohort->legs_length; i++) {
+        if((MODE != CARBON_ORGANIC) && (MODE != CARBON_EITHER)) {
+            break;
+        }
         size_t reduced = COUPLE_REDUCED_SPECIES[cohort->legs[i].redox_couple];
         uint8_t is_organic = (uint8_t)((reduced == DISSOLVED_SUGAR) || (reduced == DISSOLVED_ORGANIC_ACID) || (reduced == DISSOLVED_AMINO_COMPOUND));
         if((cohort->legs[i].is_donor == 1) && (is_organic == 1)) {
@@ -15746,7 +17728,8 @@ void cohort_plan_build(const Planet *planet, size_t cohort_index, const Metaboli
         const Cohort_Leg *leg = &cohort->legs[i];
         problem->is_donor[i] = leg->is_donor;
         problem->potentials[i] = couple_potential(planet, &plan->location, (size_t)leg->redox_couple, plan->volume_litres);
-        problem->capacities[i] = leg->maximum_rate_mol_electrons_per_mol_carbon_per_day * problem->biomass * niche * leg_substrate_saturation(planet, &plan->location, leg, plan->volume_litres, PENALTY);
+        double substrate_saturation = leg_substrate_saturation(planet, &plan->location, leg, plan->volume_litres, PENALTY);
+        problem->capacities[i] = leg->maximum_rate_mol_electrons_per_mol_carbon_per_day * problem->biomass * niche * substrate_saturation;
         if(leg->is_light_driven == 1) {
             problem->potentials[i] = problem->potentials[i] - FUNCTIONAL_TYPE_LIFTS[cohort->functional_type_index];
             problem->caps[i] = cohort->absorbed_photons_mol_per_day / PHOTONS_PER_ELECTRON;
@@ -15763,18 +17746,27 @@ void cohort_plan_build(const Planet *planet, size_t cohort_index, const Metaboli
         problem->growth_cap = 0.0;
     }
     carbon_source_heijnen(source, &carbons, &reduction);
-    problem->synthesis_gibbs_energy = heijnen_synthesis_energy(carbons, reduction) + (plan->dinitrogen_share * B[COMPONENT_NITROGEN] * 8.0 * ATP_GIBBS_ENERGY);
+    double fixation_energy = plan->dinitrogen_share * B[COMPONENT_NITROGEN] * 8.0 * ATP_GIBBS_ENERGY;
+    problem->synthesis_gibbs_energy = heijnen_synthesis_energy(carbons, reduction) + fixation_energy;
     double sulfur_electrons = 8.0 * plan->sulfide_share;
-    double inputs = PLANET_DISSOLVED_SPECIES_COMPOSITIONS[source][COMPONENT_ELECTRON] + (B[COMPONENT_NITROGEN] * ((8.0 * plan->ammonium_share) + (5.0 * plan->dinitrogen_share))) + (B[COMPONENT_SULFUR] * sulfur_electrons);
+    double source_electrons = PLANET_DISSOLVED_SPECIES_COMPOSITIONS[source][COMPONENT_ELECTRON];
+    double nitrogen_electrons = B[COMPONENT_NITROGEN] * ((8.0 * plan->ammonium_share) + (5.0 * plan->dinitrogen_share));
+    double inputs = (source_electrons + nitrogen_electrons) + (B[COMPONENT_SULFUR] * sulfur_electrons);
     problem->synthesis_electrons = B[COMPONENT_ELECTRON] + (B[COMPONENT_NITROGEN] * plan->dinitrogen_share) - inputs;
 }
 
 uint8_t transfer_accumulate(Transfer *transfer, uint8_t kind, size_t vertex_index, size_t layer_index, size_t item_index, double amount) {
     uint8_t status = 0;
     uint8_t is_merged = 0;
-    for(size_t i = 0; (i < transfer->terms_length) && (amount != 0.0); i++) {
+    for(size_t i = 0; i < transfer->terms_length; i++) {
+        const uint8_t IS_NONZERO = (uint8_t)(amount != 0.0);
+        if(IS_NONZERO == 0) {
+            break;
+        }
         TransferTerm *term = &transfer->terms[i];
-        if((term->has_composition == 0) && (term->address.kind == kind) && (term->address.vertex_index == vertex_index) && (term->address.layer_index == layer_index) && (term->address.item_index == item_index)) {
+        uint8_t is_match = (uint8_t)((term->has_composition == 0) && (term->address.kind == kind) && (term->address.vertex_index == vertex_index));
+        is_match = (uint8_t)((is_match == 1) && (term->address.layer_index == layer_index) && (term->address.item_index == item_index));
+        if(is_match == 1) {
             term->amount = term->amount + amount;
             is_merged = 1;
             break;
@@ -15806,22 +17798,32 @@ uint8_t cohort_build_metabolism_transfer(const CohortPlan *plan, const GrowthSol
         carrier = carrier + (sign * flux);
         for(size_t k = 0; k < 2; k++) {
             if(COUPLE_OXIDISED_SPECIES[C][k] != SIZE_MAX) {
-                status = (uint8_t)(status + transfer_accumulate_species(transfer, L, COUPLE_OXIDISED_SPECIES[C][k], COUPLE_OXIDISED_IS_MINERAL[C], sign * flux * COUPLE_OXIDISED_COEFFICIENTS[C][k]));
+                size_t species = COUPLE_OXIDISED_SPECIES[C][k];
+                double amount = sign * flux * COUPLE_OXIDISED_COEFFICIENTS[C][k];
+                status = (uint8_t)(status + transfer_accumulate_species(transfer, L, species, COUPLE_OXIDISED_IS_MINERAL[C], amount));
             }
         }
         if(COUPLE_REDUCED_SPECIES[C] != SIZE_MAX) {
-            status = (uint8_t)(status + transfer_accumulate_species(transfer, L, COUPLE_REDUCED_SPECIES[C], COUPLE_REDUCED_IS_MINERAL[C], -sign * flux * COUPLE_REDUCED_COEFFICIENTS[C]));
+            size_t species = COUPLE_REDUCED_SPECIES[C];
+            double amount = -sign * flux * COUPLE_REDUCED_COEFFICIENTS[C];
+            status = (uint8_t)(status + transfer_accumulate_species(transfer, L, species, COUPLE_REDUCED_IS_MINERAL[C], amount));
         }
     }
     if((GROWTH > 0.0) && (plan->carbon_species != SIZE_MAX)) {
+        double ammonium_uptake = -GROWTH * B[COMPONENT_NITROGEN] * plan->ammonium_share;
+        double nitrate_uptake = -GROWTH * B[COMPONENT_NITROGEN] * plan->nitrate_share;
+        double dinitrogen_uptake = -0.5 * GROWTH * B[COMPONENT_NITROGEN] * plan->dinitrogen_share;
+        double hydrogen_release = 0.5 * GROWTH * B[COMPONENT_NITROGEN] * plan->dinitrogen_share;
+        double sulfide_uptake = -GROWTH * B[COMPONENT_SULFUR] * plan->sulfide_share;
+        double sulfate_uptake = -GROWTH * B[COMPONENT_SULFUR] * (1.0 - plan->sulfide_share);
         status = (uint8_t)(status + transfer_accumulate_species(transfer, L, plan->carbon_species, 0, -GROWTH));
-        status = (uint8_t)(status + transfer_accumulate_species(transfer, L, DISSOLVED_TOTAL_AMMONIA, 0, -GROWTH * B[COMPONENT_NITROGEN] * plan->ammonium_share));
-        status = (uint8_t)(status + transfer_accumulate_species(transfer, L, DISSOLVED_NITRATE, 0, -GROWTH * B[COMPONENT_NITROGEN] * plan->nitrate_share));
-        status = (uint8_t)(status + transfer_accumulate_species(transfer, L, DISSOLVED_NITROGEN_GAS, 0, -0.5 * GROWTH * B[COMPONENT_NITROGEN] * plan->dinitrogen_share));
-        status = (uint8_t)(status + transfer_accumulate_species(transfer, L, DISSOLVED_HYDROGEN, 0, 0.5 * GROWTH * B[COMPONENT_NITROGEN] * plan->dinitrogen_share));
+        status = (uint8_t)(status + transfer_accumulate_species(transfer, L, DISSOLVED_TOTAL_AMMONIA, 0, ammonium_uptake));
+        status = (uint8_t)(status + transfer_accumulate_species(transfer, L, DISSOLVED_NITRATE, 0, nitrate_uptake));
+        status = (uint8_t)(status + transfer_accumulate_species(transfer, L, DISSOLVED_NITROGEN_GAS, 0, dinitrogen_uptake));
+        status = (uint8_t)(status + transfer_accumulate_species(transfer, L, DISSOLVED_HYDROGEN, 0, hydrogen_release));
         status = (uint8_t)(status + transfer_accumulate_species(transfer, L, DISSOLVED_TOTAL_PHOSPHATE, 0, -GROWTH * B[COMPONENT_PHOSPHORUS]));
-        status = (uint8_t)(status + transfer_accumulate_species(transfer, L, DISSOLVED_TOTAL_SULFIDE, 0, -GROWTH * B[COMPONENT_SULFUR] * plan->sulfide_share));
-        status = (uint8_t)(status + transfer_accumulate_species(transfer, L, DISSOLVED_SULFATE, 0, -GROWTH * B[COMPONENT_SULFUR] * (1.0 - plan->sulfide_share)));
+        status = (uint8_t)(status + transfer_accumulate_species(transfer, L, DISSOLVED_TOTAL_SULFIDE, 0, sulfide_uptake));
+        status = (uint8_t)(status + transfer_accumulate_species(transfer, L, DISSOLVED_SULFATE, 0, sulfate_uptake));
         status = (uint8_t)(status + transfer_add_cohort(transfer, cohort_index, GROWTH, B));
     }
     status = (uint8_t)(status + transfer_add_carrier(transfer, cohort_index, carrier));
@@ -15926,7 +17928,8 @@ uint8_t cohort_build_hydrolysis_transfers(const Planet *planet, const CohortPlan
     transfer_create(&transfer, process);
     if(rate > 0.0) {
         transfer_add_dissolved(&transfer, L, DISSOLVED_REFRACTORY_ORGANIC_MATTER, -rate);
-        transfer_add_organic_breakdown(&transfer, L, PLANET_DISSOLVED_SPECIES_COMPOSITIONS[DISSOLVED_REFRACTORY_ORGANIC_MATTER], rate, (uint8_t)BREAKDOWN_TO_DISSOLVED_ORGANICS);
+        const double *refractory_composition = PLANET_DISSOLVED_SPECIES_COMPOSITIONS[DISSOLVED_REFRACTORY_ORGANIC_MATTER];
+        transfer_add_organic_breakdown(&transfer, L, refractory_composition, rate, (uint8_t)BREAKDOWN_TO_DISSOLVED_ORGANICS);
         status = (uint8_t)(status + candidate_list_append(list, &transfer));
     }
     return status;
@@ -15965,11 +17968,23 @@ void cohort_allocation_targets(const Cohort *cohort, uint8_t is_donor_side, doub
             if(total > 0.0) {
                 target = targets[i] / total;
             }
-            targets[i] = clamp_double(target, cohort->allocation_centres[i] - cohort->regulation_width, cohort->allocation_centres[i] + cohort->regulation_width);
+            double low = cohort->allocation_centres[i] - cohort->regulation_width;
+            double high = cohort->allocation_centres[i] + cohort->regulation_width;
+            if(low < 0.0) {
+                low = 0.0;
+            }
+            if(high > 1.0) {
+                high = 1.0;
+            }
+            targets[i] = clamp_double(target, low, high);
             clipped = clipped + targets[i];
         }
     }
-    for(size_t i = 0; (i < cohort->legs_length) && (clipped > 0.0); i++) {
+    for(size_t i = 0; i < cohort->legs_length; i++) {
+        const uint8_t IS_CLIPPED = (uint8_t)(clipped > 0.0);
+        if(IS_CLIPPED == 0) {
+            break;
+        }
         if(cohort->legs[i].is_donor == is_donor_side) {
             targets[i] = targets[i] / clipped;
         }
@@ -15991,7 +18006,8 @@ void cohort_regulate_allocation(Cohort *cohort, double dt) {
             target = donor_targets[i];
         }
         cohort->allocations[i] = cohort->allocations[i] + (FRACTION * (target - cohort->allocations[i]));
-        cohort->legs[i].maximum_rate_mol_electrons_per_mol_carbon_per_day = cohort->leg_rate_scale_mol_electrons_per_mol_carbon_per_day * cohort->allocations[i];
+        double rate_scale = cohort->leg_rate_scale_mol_electrons_per_mol_carbon_per_day;
+        cohort->legs[i].maximum_rate_mol_electrons_per_mol_carbon_per_day = rate_scale * cohort->allocations[i];
     }
 }
 
@@ -16011,7 +18027,10 @@ uint8_t planet_add_metabolism_candidates(Planet *planet, CandidateList *list, co
     CohortPlan plan;
     GrowthSolution solution;
     Transfer transfer;
-    for(size_t c = 0; (c < planet->cohorts_length) && (status == 0); c++) {
+    for(size_t c = 0; c < planet->cohorts_length; c++) {
+        if(status != 0) {
+            break;
+        }
         Cohort *cohort = &planet->cohorts[c];
         if((cohort_biomass(cohort) > 0.0) && (cohort->is_dormant == 1)) {
             status = cohort_build_dormant_loss_transfer(planet, cohort, c, list, losses);
@@ -16031,6 +18050,22 @@ uint8_t planet_add_metabolism_candidates(Planet *planet, CandidateList *list, co
     }
     return status;
 }
+
+
+/*
+ * ToC01700 CohortDemography
+ *
+ * Purpose:    Changes to the list of microbial cohorts: removal to detritus, stochastic deaths and extinction,
+ *             merging identical or closest genotypes under the cohort cap, and the funnel that seeds mutants.
+ * Depends:    MicrobialMetabolism, MicrobialMutation, transfers (planet_apply_transfer), random streams
+ * API:        planet_remove_cohort, planet_apply_demography, planet_enforce_genotype_cap, planet_apply_funnel
+ * Ownership:  Cohorts live in planet->cohorts. Removal shifts later cohorts down; mutants are appended with
+ *             planet_add_cohort, which may realloc. Sorting uses GENOTYPE_SCRATCH-sized stack arrays.
+ * Invariants: cohorts_length <= cohorts_capacity. Removal and merging move biomass and carrier electrons
+ *             through balanced transfers. A cohort with fewer than one cell is removed.
+ * Errors:     uint8_t status from planet_apply_transfer, TRANSFER_APPLIED (0) is success. Pair searches
+ *             return 0 (not found) when cohorts_length exceeds GENOTYPE_SCRATCH.
+ */
 
 uint8_t planet_remove_cohort(Planet *planet, size_t index) {
     const Cohort *cohort = &planet->cohorts[index];
@@ -16054,10 +18089,15 @@ uint8_t planet_remove_cohort(Planet *planet, size_t index) {
         status = planet_apply_transfer(planet, &transfer);
     }
     if(status == 0) {
-        for(size_t c = index; (c + 1) < planet->cohorts_length; c++) {
-            cohort_copy(&planet->cohorts[c], &planet->cohorts[c + 1]);
+        for(size_t shift = 0; shift < planet->cohorts_length; shift++) {
+            const size_t DESTINATION = index + shift;
+            if((DESTINATION + 1) >= planet->cohorts_length) {
+                break;
+            }
+            cohort_copy(&planet->cohorts[DESTINATION], &planet->cohorts[DESTINATION + 1]);
         }
         planet->cohorts_length = planet->cohorts_length - 1;
+        planet_invalidate_cohort_location_index(planet);
     }
     return status;
 }
@@ -16111,12 +18151,16 @@ size_t planet_apply_demography(Planet *planet, const MetabolismSettings *setting
 uint8_t cohort_genome_equals(const Cohort *first, const Cohort *second) {
     const MicrobialGenome *A = &first->genome;
     const MicrobialGenome *B = &second->genome;
-    uint8_t is_equal = (uint8_t)((first->functional_type_index == second->functional_type_index) && (first->vertex_index == second->vertex_index)
-        && (first->location_kind == second->location_kind) && (first->layer_index == second->layer_index) && (first->is_dormant == second->is_dormant));
+    uint8_t is_equal = (uint8_t)((first->functional_type_index == second->functional_type_index) && (first->vertex_index == second->vertex_index));
+    is_equal = (uint8_t)((is_equal == 1) && (first->location_kind == second->location_kind) && (first->layer_index == second->layer_index));
+    is_equal = (uint8_t)((is_equal == 1) && (first->is_dormant == second->is_dormant));
     is_equal = (uint8_t)(is_equal * (uint8_t)((A->total_potentiations == B->total_potentiations) && (A->is_actualised == B->is_actualised)));
     is_equal = (uint8_t)(is_equal * (uint8_t)((A->total_copies == B->total_copies) && (A->is_mutator == B->is_mutator)));
     is_equal = (uint8_t)(is_equal * (uint8_t)(A->total_passengers == B->total_passengers));
-    for(size_t i = 0; (i < TOTAL_MICROBIAL_LOCI) && (is_equal == 1); i++) {
+    for(size_t i = 0; i < TOTAL_MICROBIAL_LOCI; i++) {
+        if(is_equal != 1) {
+            break;
+        }
         is_equal = (uint8_t)(A->loci[i] == B->loci[i]);
     }
     return is_equal;
@@ -16143,7 +18187,8 @@ uint8_t planet_merge_cohorts(Planet *planet, size_t keep, size_t absorb) {
     if((BIOMASS > 0.0) && ((KEPT + BIOMASS) > 0.0)) {
         Cohort *KEEP = &planet->cohorts[keep];
         KEEP->attached_fraction = ((KEEP->attached_fraction * KEPT) + (ABSORBED->attached_fraction * BIOMASS)) / (KEPT + BIOMASS);
-        KEEP->last_potential_growth_rate_per_day = ((KEEP->last_potential_growth_rate_per_day * KEPT) + (ABSORBED->last_potential_growth_rate_per_day * BIOMASS)) / (KEPT + BIOMASS);
+        double weighted_growth = (KEEP->last_potential_growth_rate_per_day * KEPT) + (ABSORBED->last_potential_growth_rate_per_day * BIOMASS);
+        KEEP->last_potential_growth_rate_per_day = weighted_growth / (KEPT + BIOMASS);
     }
     if(BIOMASS > 0.0) {
         status = transfer_add_cohort(&transfer, absorb, -BIOMASS, NULL);
@@ -16162,8 +18207,8 @@ uint8_t planet_merge_cohorts(Planet *planet, size_t keep, size_t absorb) {
 }
 
 double cohort_genotype_key(const Cohort *cohort) {
-    double key = (double)cohort->functional_type_index + (1000.0 * (double)cohort->vertex_index) + (1e6 * (double)cohort->location_kind)
-        + (1e7 * (double)cohort->layer_index) + (double)cohort->genome.total_passengers;
+    double key = (double)cohort->functional_type_index + (1000.0 * (double)cohort->vertex_index) + (1e6 * (double)cohort->location_kind);
+    key = key + (1e7 * (double)cohort->layer_index) + (double)cohort->genome.total_passengers;
     for(size_t i = 0; i < TOTAL_MICROBIAL_LOCI; i++) {
         key = key + ((double)cohort->genome.loci[i] * (1.6180339887498949 + (double)i));
     }
@@ -16183,8 +18228,16 @@ uint8_t planet_find_identical_pair(const Planet *planet, size_t *keep, size_t *a
         order[i] = i;
         keys[i] = cohort_genotype_key(&planet->cohorts[i]);
     }
-    for(size_t width = 1; width < N; width = width * 2) {
-        for(size_t start = 0; start < N; start = start + (2 * width)) {
+    size_t width = 1;
+    for(size_t pass = 0; pass < BITS_TOTAL_WORD_BITS; pass++) {
+        if(width >= N) {
+            break;
+        }
+        for(size_t block = 0; block < N; block++) {
+            size_t start = block * (2 * width);
+            if(start >= N) {
+                break;
+            }
             size_t middle = start + width;
             size_t end = start + (2 * width);
             if(middle > N) {
@@ -16195,7 +18248,8 @@ uint8_t planet_find_identical_pair(const Planet *planet, size_t *keep, size_t *a
             }
             size_t left = start;
             size_t right = middle;
-            for(size_t out = start; out < end; out++) {
+            for(size_t out_offset = 0; out_offset < (end - start); out_offset++) {
+                size_t out = start + out_offset;
                 if((left < middle) && ((right >= end) || (keys[order[left]] <= keys[order[right]]))) {
                     scratch[out] = order[left];
                     left = left + 1;
@@ -16208,9 +18262,18 @@ uint8_t planet_find_identical_pair(const Planet *planet, size_t *keep, size_t *a
         for(size_t i = 0; i < N; i++) {
             order[i] = scratch[i];
         }
+        width = width * 2;
     }
-    for(size_t i = 0; ((i + 1) < N) && (is_found == 0); i++) {
-        for(size_t j = i + 1; (j < N) && (keys[order[j]] == keys[order[i]]) && (is_found == 0); j++) {
+    for(size_t i = 0; i < N; i++) {
+        if(((i + 1) >= N) || (is_found != 0)) {
+            break;
+        }
+        for(size_t j_offset = 0; j_offset < (N - (i + 1)); j_offset++) {
+            size_t j = (i + 1) + j_offset;
+            const uint8_t IS_SAME_KEY = (uint8_t)(keys[order[j]] == keys[order[i]]);
+            if((IS_SAME_KEY == 0) || (is_found != 0)) {
+                break;
+            }
             if(cohort_genome_equals(&planet->cohorts[order[i]], &planet->cohorts[order[j]]) == 1) {
                 *keep = order[i];
                 *absorb = order[j];
@@ -16231,8 +18294,16 @@ void planet_sort_by_biomass(const Planet *planet, size_t *order) {
     for(size_t i = 0; i < N; i++) {
         order[i] = i;
     }
-    for(size_t width = 1; width < N; width = width * 2) {
-        for(size_t start = 0; start < N; start = start + (2 * width)) {
+    size_t width = 1;
+    for(size_t pass = 0; pass < BITS_TOTAL_WORD_BITS; pass++) {
+        if(width >= N) {
+            break;
+        }
+        for(size_t block = 0; block < N; block++) {
+            size_t start = block * (2 * width);
+            if(start >= N) {
+                break;
+            }
             size_t middle = start + width;
             size_t end = start + (2 * width);
             if(middle > N) {
@@ -16243,10 +18314,16 @@ void planet_sort_by_biomass(const Planet *planet, size_t *order) {
             }
             size_t left = start;
             size_t right = middle;
-            for(size_t out = start; out < end; out++) {
-                const uint8_t IS_LEFT = (uint8_t)((left < middle) && ((right >= end)
-                    || (cohort_biomass(&planet->cohorts[order[left]]) <= cohort_biomass(&planet->cohorts[order[right]]))));
-                if(IS_LEFT == 1) {
+            for(size_t out_offset = 0; out_offset < (end - start); out_offset++) {
+                size_t out = start + out_offset;
+                uint8_t is_left = 0;
+                if(left < middle) {
+                    is_left = (uint8_t)(right >= end);
+                    if(is_left == 0) {
+                        is_left = (uint8_t)(cohort_biomass(&planet->cohorts[order[left]]) <= cohort_biomass(&planet->cohorts[order[right]]));
+                    }
+                }
+                if(is_left == 1) {
                     scratch[out] = order[left];
                     left = left + 1;
                 } else {
@@ -16258,6 +18335,7 @@ void planet_sort_by_biomass(const Planet *planet, size_t *order) {
         for(size_t i = 0; i < N; i++) {
             order[i] = scratch[i];
         }
+        width = width * 2;
     }
 }
 
@@ -16279,12 +18357,14 @@ uint8_t planet_find_rare_pair(const Planet *planet, size_t *keep, size_t *absorb
     uint8_t is_found = 0;
     for(size_t i = 0; i < rare; i++) {
         const Cohort *A = &planet->cohorts[order[i]];
-        for(size_t j = i + 1; j < rare; j++) {
+        for(size_t j_offset = 0; j_offset < (rare - (i + 1)); j_offset++) {
+            size_t j = (i + 1) + j_offset;
             const Cohort *B = &planet->cohorts[order[j]];
-            const uint8_t IS_COMPARABLE = (uint8_t)((A->functional_type_index == B->functional_type_index) && (A->vertex_index == B->vertex_index)
-                && (A->location_kind == B->location_kind) && (A->layer_index == B->layer_index) && (A->is_dormant == B->is_dormant));
+            uint8_t is_comparable = (uint8_t)((A->functional_type_index == B->functional_type_index) && (A->vertex_index == B->vertex_index));
+            is_comparable = (uint8_t)((is_comparable == 1) && (A->location_kind == B->location_kind) && (A->layer_index == B->layer_index));
+            is_comparable = (uint8_t)((is_comparable == 1) && (A->is_dormant == B->is_dormant));
             const double DISTANCE = cohort_genome_distance(A, B);
-            if((IS_COMPARABLE == 1) && (DISTANCE < best)) {
+            if((is_comparable == 1) && (DISTANCE < best)) {
                 best = DISTANCE;
                 *keep = order[j];
                 *absorb = order[i];
@@ -16299,14 +18379,21 @@ size_t planet_enforce_genotype_cap(Planet *planet, MetabolismSettings *settings)
     size_t merges = 0;
     size_t keep = 0;
     size_t absorb = 0;
-    for(size_t guard = 0; (guard < GENOTYPE_SCRATCH) && (planet_find_identical_pair(planet, &keep, &absorb) == 1); guard++) {
+    for(size_t guard = 0; guard < GENOTYPE_SCRATCH; guard++) {
+        if(planet_find_identical_pair(planet, &keep, &absorb) != 1) {
+            break;
+        }
         if(planet_merge_cohorts(planet, keep, absorb) != 0) {
             break;
         }
         merges = merges + 1;
     }
     const double PRESSURE = GENOTYPE_PRESSURE_FRACTION * (double)settings->maximum_cohorts;
-    for(size_t guard = 0; (guard < GENOTYPE_SCRATCH) && ((double)planet->cohorts_length >= PRESSURE); guard++) {
+    for(size_t guard = 0; guard < GENOTYPE_SCRATCH; guard++) {
+        const uint8_t IS_UNDER_PRESSURE = (uint8_t)((double)planet->cohorts_length >= PRESSURE);
+        if(IS_UNDER_PRESSURE == 0) {
+            break;
+        }
         if((planet_find_rare_pair(planet, &keep, &absorb) == 0) || (planet_merge_cohorts(planet, keep, absorb) != 0)) {
             break;
         }
@@ -16367,47 +18454,65 @@ size_t planet_apply_funnel(Planet *planet, MetabolismSettings *settings, PCG *ge
     size_t made = 0;
     Mutation mutation;
     Cohort trial;
-    for(size_t c = 0; (c < TOTAL) && (settings->is_evolution_on == 1); c++) {
+    for(size_t c = 0; c < TOTAL; c++) {
+        if(settings->is_evolution_on != 1) {
+            break;
+        }
         const Cohort *parent = &planet->cohorts[c];
-        if(parent->is_dormant == 1) {
-            continue;
-        }
-        double rate = settings->mutation.rate_per_division;
-        if(parent->genome.is_mutator == 1) {
-            rate = rate * settings->mutation.mutator_multiplier;
-        }
-        double divisions = (parent->last_growth_rate_per_day * cohort_biomass(parent) * dt) / parent->cell_mass_mol_carbon;
-        uint64_t total = 0;
-        if((parent->is_stochastic == 0) && (divisions > 0.0)) {
-            total = stream_poisson(generator, rate * divisions);
-        }
-        if(total > FUNNEL_MAXIMUM_MUTATIONS_PER_COHORT) {
-            total = FUNNEL_MAXIMUM_MUTATIONS_PER_COHORT;
-        }
-        double parent_growth = 0.0;
-        if(total > 0) {
-            parent_growth = cohort_trial_growth(planet, c, &planet->cohorts[c], settings);
-        }
-        for(uint64_t m = 0; m < total; m++) {
-            microbial_mutation_draw(generator, &settings->mutation, &mutation);
-            cohort_copy(&trial, &planet->cohorts[c]);
-            genome_apply_mutation(&trial.genome, &mutation);
-            uint8_t cls = mutation.mutation_class;
-            if(cls == MUTATION_PASSENGER) {
-                genome_apply_mutation(&planet->cohorts[c].genome, &mutation);
-            } else if((cls == MUTATION_DUPLICATION) || (cls == MUTATION_PROMOTER_CAPTURE) || (cls == MUTATION_POTENTIATION) || (cls == MUTATION_MUTATOR)) {
-                made = made + planet_instantiate_mutant(planet, c, &trial.genome, 1.0, settings);
-            } else if(parent_growth > 0.0) {
-                cohort_apply_genome(&trial, settings);
-                double s = (cohort_trial_growth(planet, c, &trial, settings) / parent_growth) - 1.0;
-                if((s > 0.0) && (stream_uniform(generator) < supply_establishment(s))) {
-                    made = made + planet_instantiate_mutant(planet, c, &trial.genome, supply_seed_cells(s), settings);
+        if(parent->is_dormant != 1) {
+            double rate = settings->mutation.rate_per_division;
+            if(parent->genome.is_mutator == 1) {
+                rate = rate * settings->mutation.mutator_multiplier;
+            }
+            double divisions = (parent->last_growth_rate_per_day * cohort_biomass(parent) * dt) / parent->cell_mass_mol_carbon;
+            uint64_t total = 0;
+            if((parent->is_stochastic == 0) && (divisions > 0.0)) {
+                total = stream_poisson(generator, rate * divisions);
+            }
+            if(total > FUNNEL_MAXIMUM_MUTATIONS_PER_COHORT) {
+                total = FUNNEL_MAXIMUM_MUTATIONS_PER_COHORT;
+            }
+            double parent_growth = 0.0;
+            if(total > 0) {
+                parent_growth = cohort_trial_growth(planet, c, &planet->cohorts[c], settings);
+            }
+            for(uint64_t m = 0; m < total; m++) {
+                microbial_mutation_draw(generator, &settings->mutation, &mutation);
+                cohort_copy(&trial, &planet->cohorts[c]);
+                genome_apply_mutation(&trial.genome, &mutation);
+                uint8_t cls = mutation.mutation_class;
+                uint8_t is_structural = (uint8_t)((cls == MUTATION_DUPLICATION) || (cls == MUTATION_PROMOTER_CAPTURE));
+                is_structural = (uint8_t)((is_structural == 1) || (cls == MUTATION_POTENTIATION) || (cls == MUTATION_MUTATOR));
+                if(cls == MUTATION_PASSENGER) {
+                    genome_apply_mutation(&planet->cohorts[c].genome, &mutation);
+                } else if(is_structural == 1) {
+                    made = made + planet_instantiate_mutant(planet, c, &trial.genome, 1.0, settings);
+                } else if(parent_growth > 0.0) {
+                    cohort_apply_genome(&trial, settings);
+                    double s = (cohort_trial_growth(planet, c, &trial, settings) / parent_growth) - 1.0;
+                    if((s > 0.0) && (stream_uniform(generator) < supply_establishment(s))) {
+                        made = made + planet_instantiate_mutant(planet, c, &trial.genome, supply_seed_cells(s), settings);
+                    }
                 }
             }
         }
     }
     return made;
 }
+
+
+/*
+ * ToC01800 PhysicsRadiation
+ *
+ * Purpose:    Physical settings and the radiation balance: solar geometry, light absorbed by microbial and plant
+ *             cohorts through water, sediment and canopies, surface cover and albedo, and vertex temperatures.
+ * Depends:    MicrobialMetabolism (cohorts), plants, weather (Climate, WeatherSettings), Planet, math helpers
+ * API:        physics_settings_create, planet_update_light, planet_update_temperature, planet_patch_albedo,
+ *             planet_set_vertex_temperature, weather_daily_mean_cos_zenith
+ * Ownership:  Nothing is allocated. Functions write absorbed photons, cover and temperatures into the Planet.
+ * Invariants: Light only decreases on its way down a vertex column. Cover fractions and albedos lie in [0, 1].
+ * Errors:     None. No function in this module can fail.
+ */
 
 const double PHOTONS_PER_WATT_DAY = 4.57e-6 * 86400.0;
 const double STEFAN_BOLTZMANN = 5.670374419e-8;
@@ -16460,7 +18565,8 @@ double weather_cos_zenith(const WeatherSettings *settings, const double *point, 
     const double FULL_TURN = 6.28318530717958647692;
     const double DECLINATION = weather_declination(settings, time);
     const double ANGLE = (FULL_TURN * (time - terrain_floor(time))) - (0.5 * FULL_TURN);
-    return (point[2] * sine_double(DECLINATION)) + (cosine_double(DECLINATION) * ((point[0] * cosine_double(ANGLE)) - (point[1] * sine_double(ANGLE))));
+    double rotated = (point[0] * cosine_double(ANGLE)) - (point[1] * sine_double(ANGLE));
+    return (point[2] * sine_double(DECLINATION)) + (cosine_double(DECLINATION) * rotated);
 }
 
 double weather_daily_mean_cos_zenith(double sin_latitude, double cos_latitude, double declination) {
@@ -16499,28 +18605,33 @@ double cohort_cover_albedo(const Cohort *cohort, double par_fraction) {
     return (par_fraction * (1.0 - cohort->pigment_fraction)) + ((1.0 - par_fraction) * cohort->nir_reflectance);
 }
 
-uint8_t cohort_is_at(const Cohort *cohort, const Location *location) {
-    return (uint8_t)((cohort->vertex_index == location->vertex_index) && (cohort->location_kind == location->kind) && (cohort->layer_index == location->layer_index));
-}
-
-double planet_light_layer(Planet *planet, const Location *location, const PhysicsSettings *settings, double *par, double dz, double background,
-    uint8_t is_water) {
+double planet_light_layer(Planet *planet, const Location *location, const PhysicsSettings *settings, double *par, double dz, double background, uint8_t is_water) {
     const double AREA = planet->vertices[location->vertex_index].area_square_metres;
     double attenuation = background + ((double)is_water * settings->water_attenuation);
-    for(size_t c = 0; c < planet->cohorts_length; c++) {
-        const Cohort *COHORT = &planet->cohorts[c];
-        if(cohort_is_at(COHORT, location) == 1) {
-            attenuation = attenuation + ((COHORT->absorption_cross_section_square_metres_per_mol_carbon * cohort_biomass(COHORT)) / (AREA * dz));
+    size_t cohort_index = planet_cohort_at_first(planet, location);
+    for(size_t visit = 0; visit < planet->cohorts_length; visit++) {
+        if(cohort_index == COHORT_LOCATION_NONE) {
+            break;
         }
+        const Cohort *COHORT = &planet->cohorts[cohort_index];
+        attenuation = attenuation + ((COHORT->absorption_cross_section_square_metres_per_mol_carbon * cohort_biomass(COHORT)) / (AREA * dz));
+        cohort_index = planet_cohort_at_next(planet, location, cohort_index);
     }
     const double TRANSMITTED = exponential_double(-attenuation * dz);
     const double ABSORBED = *par * AREA * (1.0 - TRANSMITTED);
-    for(size_t c = 0; (c < planet->cohorts_length) && (attenuation > 0.0); c++) {
-        Cohort *cohort = &planet->cohorts[c];
-        if(cohort_is_at(cohort, location) == 1) {
-            const double SHARE = (cohort->absorption_cross_section_square_metres_per_mol_carbon * cohort_biomass(cohort)) / (AREA * dz * attenuation);
-            cohort->absorbed_photons_mol_per_day = cohort->absorbed_photons_mol_per_day + (SHARE * ABSORBED * PHOTONS_PER_WATT_DAY);
+    const uint8_t IS_ATTENUATING = (uint8_t)(attenuation > 0.0);
+    size_t absorber_index = COHORT_LOCATION_NONE;
+    if(IS_ATTENUATING == 1) {
+        absorber_index = planet_cohort_at_first(planet, location);
+    }
+    for(size_t visit = 0; visit < planet->cohorts_length; visit++) {
+        if(absorber_index == COHORT_LOCATION_NONE) {
+            break;
         }
+        Cohort *cohort = &planet->cohorts[absorber_index];
+        const double SHARE = (cohort->absorption_cross_section_square_metres_per_mol_carbon * cohort_biomass(cohort)) / (AREA * dz * attenuation);
+        cohort->absorbed_photons_mol_per_day = cohort->absorbed_photons_mol_per_day + (SHARE * ABSORBED * PHOTONS_PER_WATT_DAY);
+        absorber_index = planet_cohort_at_next(planet, location, absorber_index);
     }
     double transmitted = 1.0;
     if(*par > 0.0) {
@@ -16535,13 +18646,18 @@ void planet_update_cover(Planet *planet, size_t vertex_index, const Location *su
     double absorbing = 0.0;
     double weighted = 0.0;
     double biomass = 0.0;
-    for(size_t c = 0; c < planet->cohorts_length; c++) {
-        const Cohort *cohort = &planet->cohorts[c];
-        if((cohort_is_at(cohort, surface) == 1) && (cohort->pigment_fraction > 0.0)) {
+    size_t cohort_index = planet_cohort_at_first(planet, surface);
+    for(size_t visit = 0; visit < planet->cohorts_length; visit++) {
+        if(cohort_index == COHORT_LOCATION_NONE) {
+            break;
+        }
+        const Cohort *cohort = &planet->cohorts[cohort_index];
+        if(cohort->pigment_fraction > 0.0) {
             absorbing = absorbing + (cohort->absorption_cross_section_square_metres_per_mol_carbon * cohort_biomass(cohort));
             weighted = weighted + (cohort_biomass(cohort) * cohort_cover_albedo(cohort, par_fraction));
             biomass = biomass + cohort_biomass(cohort);
         }
+        cohort_index = planet_cohort_at_next(planet, surface, cohort_index);
     }
     vertex->phototroph_cover_fraction = 1.0 - exponential_double(-absorbing / vertex->area_square_metres);
     vertex->phototroph_cover_albedo = 0.0;
@@ -16551,7 +18667,8 @@ void planet_update_cover(Planet *planet, size_t vertex_index, const Location *su
 }
 
 double plant_leaf_area_index(const Planet *planet, const PlantCohort *plant) {
-    return (plant_organ(plant, PLANT_ORGAN_LEAF) / planet->vertices[plant->vertex_index].area_square_metres) * PLANT_SPECIFIC_LEAF_AREAS[plant->plant_type_index];
+    double leaf_per_area = plant_organ(plant, PLANT_ORGAN_LEAF) / planet->vertices[plant->vertex_index].area_square_metres;
+    return leaf_per_area * PLANT_SPECIFIC_LEAF_AREAS[plant->plant_type_index];
 }
 
 double planet_water_depth(const Planet_Vertex *vertex) {
@@ -16575,7 +18692,12 @@ uint8_t plant_can_grow_at(const Planet *planet, size_t type, size_t vertex_index
 
 double planet_canopy_light_types(Planet *planet, size_t vertex_index, double par, size_t first, size_t last) {
     const double AREA = planet->vertices[vertex_index].area_square_metres;
-    for(size_t type = last + 1; type-- > first;) {
+    size_t total_types = 0;
+    if((last + 1) > first) {
+        total_types = (last + 1) - first;
+    }
+    for(size_t type_offset = total_types; type_offset-- > 0;) {
+        size_t type = first + type_offset;
         for(size_t p = 0; p < planet->plants_length; p++) {
             PlantCohort *plant = &planet->plants[p];
             if((plant->vertex_index == vertex_index) && (plant->plant_type_index == type) && (plant_can_grow_at(planet, type, vertex_index) == 1)) {
@@ -16600,24 +18722,32 @@ void planet_update_plant_cover(Planet *planet) {
     for(size_t p = 0; p < planet->plants_length; p++) {
         const PlantCohort *PLANT = &planet->plants[p];
         Planet_Vertex *vertex = &planet->vertices[PLANT->vertex_index];
-        if(PLANT_IS_AQUATIC[PLANT->plant_type_index] == 1) {
-            continue;
+        if(PLANT_IS_AQUATIC[PLANT->plant_type_index] != 1) {
+            const double LAI = plant_leaf_area_index(planet, PLANT);
+            vertex->plant_cover_fraction = vertex->plant_cover_fraction + LAI;
+            vertex->plant_cover_albedo = vertex->plant_cover_albedo + (LAI * PLANT_CANOPY_ALBEDOS[PLANT->plant_type_index]);
         }
-        const double LAI = plant_leaf_area_index(planet, PLANT);
-        vertex->plant_cover_fraction = vertex->plant_cover_fraction + LAI;
-        vertex->plant_cover_albedo = vertex->plant_cover_albedo + (LAI * PLANT_CANOPY_ALBEDOS[PLANT->plant_type_index]);
     }
     for(size_t v = 0; v < planet->vertices_length; v++) {
         Planet_Vertex *vertex = &planet->vertices[v];
         const double LAI = vertex->plant_cover_fraction;
-        vertex->plant_cover_albedo = (LAI > 0.0) ? (vertex->plant_cover_albedo / LAI) : 0.0;
-        vertex->plant_cover_fraction = (vertex->water_layers_length == 0) ? (1.0 - exponential_double(-PLANT_LIGHT_EXTINCTION * LAI)) : 0.0;
+        if(LAI > 0.0) {
+            vertex->plant_cover_albedo = vertex->plant_cover_albedo / LAI;
+        } else {
+            vertex->plant_cover_albedo = 0.0;
+        }
+        if(vertex->water_layers_length == 0) {
+            vertex->plant_cover_fraction = 1.0 - exponential_double(-PLANT_LIGHT_EXTINCTION * LAI);
+        } else {
+            vertex->plant_cover_fraction = 0.0;
+        }
     }
 }
 
 void planet_update_light(Planet *planet, const PhysicsSettings *settings, double time) {
     Location location;
     double par = 0.0;
+    planet_build_cohort_location_index(planet);
     for(size_t c = 0; c < planet->cohorts_length; c++) {
         planet->cohorts[c].absorbed_photons_mol_per_day = 0.0;
     }
@@ -16632,7 +18762,9 @@ void planet_update_light(Planet *planet, const PhysicsSettings *settings, double
         if(vertex->water_layers_length > 0) {
             const double BEFORE = par;
             par = planet_canopy_light_types(planet, v, par, PLANT_KELP, PLANT_KELP);
-            shortwave = (BEFORE > 0.0) ? (shortwave * (par / BEFORE)) : shortwave;
+            if(BEFORE > 0.0) {
+                shortwave = shortwave * (par / BEFORE);
+            }
         }
         for(size_t layer = 0; layer < vertex->water_layers_length; layer++) {
             double organic = 0.0;
@@ -16660,6 +18792,7 @@ void planet_update_light(Planet *planet, const PhysicsSettings *settings, double
         planet_update_cover(planet, v, &location, settings->par_fraction);
     }
     planet_update_plant_cover(planet);
+    planet_invalidate_cohort_location_index(planet);
 }
 
 double planet_patch_albedo(const Planet *planet, size_t vertex_index) {
@@ -16667,7 +18800,10 @@ double planet_patch_albedo(const Planet *planet, size_t vertex_index) {
     double bare = BARE_GROUND_ALBEDO;
     double mass = 0.0;
     double weighted = 0.0;
-    for(size_t i = 0; (i < TOTAL_SOIL_TYPES) && (vertex->terrain_layers_length > 0); i++) {
+    for(size_t i = 0; i < TOTAL_SOIL_TYPES; i++) {
+        if(vertex->terrain_layers_length == 0) {
+            break;
+        }
         mass = mass + vertex->terrain_layer_soil_mass_kilograms[0][i];
         weighted = weighted + (vertex->terrain_layer_soil_mass_kilograms[0][i] * SOIL_TYPE_DRY_ALBEDOS[i]);
     }
@@ -16686,15 +18822,26 @@ const double WATER_FREEZING_KELVIN = 271.35;
 void planet_set_vertex_temperature(Planet *planet, size_t vertex_index, double temperature) {
     Planet_Vertex *vertex = &planet->vertices[vertex_index];
     vertex->local_air_temperature_kelvin = temperature;
-    vertex->water_layer_temperature_kelvin[0] = (temperature > WATER_FREEZING_KELVIN) ? temperature : WATER_FREEZING_KELVIN;
+    if(temperature > WATER_FREEZING_KELVIN) {
+        vertex->water_layer_temperature_kelvin[0] = temperature;
+    } else {
+        vertex->water_layer_temperature_kelvin[0] = WATER_FREEZING_KELVIN;
+    }
     if(vertex->water_layers_length == 0) {
-        for(size_t layer = 1; layer < TOTAL_WATER_LAYERS; layer++) {
-            vertex->water_layer_temperature_kelvin[layer] = vertex->water_layer_temperature_kelvin[0];
+        for(size_t layer = 0; layer < TOTAL_WATER_LAYERS; layer++) {
+            if(layer > 0) {
+                vertex->water_layer_temperature_kelvin[layer] = vertex->water_layer_temperature_kelvin[0];
+            }
         }
     }
-    const double BOTTOM = (vertex->water_layers_length > 0) ? vertex->water_layer_temperature_kelvin[vertex->water_layers_length - 1] : temperature;
+    double bottom = temperature;
+    if(vertex->water_layers_length > 0) {
+        bottom = vertex->water_layer_temperature_kelvin[vertex->water_layers_length - 1];
+    } else {
+        bottom = temperature;
+    }
     for(size_t layer = 0; layer < TOTAL_TERRAIN_LAYERS; layer++) {
-        vertex->terrain_layer_temperature_kelvin[layer] = BOTTOM;
+        vertex->terrain_layer_temperature_kelvin[layer] = bottom;
     }
 }
 
@@ -16731,6 +18878,19 @@ double planet_update_temperature(Planet *planet, const PhysicsSettings *settings
     return albedo;
 }
 
+
+/*
+ * ToC01900 WaterTransport
+ *
+ * Purpose:    Movement of matter between neighbouring pools: diffusive exchange of dissolved species between
+ *             stacked water and sediment layers, settling of particulates, and air-water gas exchange.
+ * Depends:    PhysicsRadiation (PhysicsSettings), transfers (Transfer, boundary_flush), acid-base chemistry, Planet
+ * API:        water_density, planet_exchange_pair, planet_apply_mixing, planet_apply_sinking, planet_apply_gas_exchange
+ * Ownership:  Nothing is allocated. Each function builds Transfers on the stack and applies them to the Planet.
+ * Invariants: Every amount removed from one pool is added to another in the same transfer, so mass is conserved.
+ * Errors:     uint8_t status from boundary_flush, 0 is success; work stops at the first non-zero status.
+ */
+
 double water_density(double temperature) {
     const double CELSIUS = temperature - CELSIUS_OFFSET_KELVIN;
     return 1000.0 * (1.0 - (((CELSIUS - 3.98) * (CELSIUS - 3.98) * (CELSIUS + 283.0)) / (503570.0 * (CELSIUS + 67.26))));
@@ -16747,7 +18907,10 @@ uint8_t planet_exchange_pair(Planet *planet, const Location *first, const Locati
     transfer_create(&transfer, process);
     if((VOLUME_A > 0.0) && (VOLUME_B > 0.0) && (flow > 0.0)) {
         double decay = exponential_double(-flow * ((1.0 / VOLUME_A) + (1.0 / VOLUME_B)) * dt);
-        for(size_t i = 0; (i < TOTAL_DISSOLVED_SPECIES) && (status == 0); i++) {
+        for(size_t i = 0; i < TOTAL_DISSOLVED_SPECIES; i++) {
+            if(status != 0) {
+                break;
+            }
             double amount_a = planet_location_concentration(planet, first, i) * VOLUME_A;
             double amount_b = planet_location_concentration(planet, second, i) * VOLUME_B;
             double equilibrium = (amount_a + amount_b) * (VOLUME_A / (VOLUME_A + VOLUME_B));
@@ -16768,16 +18931,25 @@ uint8_t planet_apply_mixing(Planet *planet, const PhysicsSettings *settings, dou
     uint8_t status = 0;
     Location upper;
     Location lower;
-    for(size_t v = 0; (v < planet->vertices_length) && (status == 0); v++) {
+    for(size_t v = 0; v < planet->vertices_length; v++) {
+        if(status != 0) {
+            break;
+        }
         const Planet_Vertex *vertex = &planet->vertices[v];
         const double AREA_LITRES = vertex->area_square_metres * LITRES_PER_CUBIC_METRE;
-        for(size_t layer = 0; ((layer + 1) < vertex->water_layers_length) && (status == 0); layer++) {
+        for(size_t layer = 0; layer < vertex->water_layers_length; layer++) {
+            if(((layer + 1) >= vertex->water_layers_length) || (status != 0)) {
+                break;
+            }
             double factor = water_layer_stability_factor(vertex, layer);
             location_set(&upper, v, (uint8_t)LOCATION_WATER, layer);
             location_set(&lower, v, (uint8_t)LOCATION_WATER, layer + 1);
             status = planet_exchange_pair(planet, &upper, &lower, settings->mixing_velocity * factor * AREA_LITRES, dt, process);
         }
-        for(size_t layer = 0; (layer < vertex->terrain_layers_length) && (status == 0); layer++) {
+        for(size_t layer = 0; layer < vertex->terrain_layers_length; layer++) {
+            if(status != 0) {
+                break;
+            }
             double porosity = planet_terrain_porosity(vertex, layer);
             double tortuosity = 1.0 - (2.0 * natural_logarithm_double(porosity));
             double velocity = settings->sediment_exchange_velocity * (porosity / tortuosity);
@@ -16809,12 +18981,16 @@ uint8_t planet_sink_layer(Planet *planet, size_t v, size_t layer, double dt, siz
     }
     transfer_create(&transfer, process);
     for(size_t k = 0; k < TOTAL_ORGANIC_PARTICULATE_CLASSES; k++) {
-        double amount = planet_location_organic(planet, &from, k, &composition) * (1.0 - exponential_double(-(ORGANIC_SETTLING_VELOCITIES[k] * dt) / DZ));
+        double settled_fraction = 1.0 - exponential_double(-(ORGANIC_SETTLING_VELOCITIES[k] * dt) / DZ);
+        double amount = planet_location_organic(planet, &from, k, &composition) * settled_fraction;
         transfer_add_organic(&transfer, &from, k, -amount, NULL);
         transfer_add_organic(&transfer, &to, k, amount, composition);
     }
     status = boundary_flush(planet, &transfer, 1);
-    for(size_t m = 0; (m < TOTAL_MINERAL_TYPES) && (status == 0); m++) {
+    for(size_t m = 0; m < TOTAL_MINERAL_TYPES; m++) {
+        if(status != 0) {
+            break;
+        }
         double amount = planet_location_mineral(planet, &from, m) * (1.0 - exponential_double(-(MINERAL_SETTLING_VELOCITIES[m] * dt) / DZ));
         transfer_add_mineral(&transfer, &from, m, -amount);
         transfer_add_mineral(&transfer, &to, m, amount);
@@ -16828,9 +19004,15 @@ uint8_t planet_sink_layer(Planet *planet, size_t v, size_t layer, double dt, siz
 uint8_t planet_apply_sinking(Planet *planet, double dt) {
     size_t process = PROCESS_SINKING;
     uint8_t status = 0;
-    for(size_t v = 0; (v < planet->vertices_length) && (status == 0); v++) {
+    for(size_t v = 0; v < planet->vertices_length; v++) {
+        if(status != 0) {
+            break;
+        }
         const Planet_Vertex *vertex = &planet->vertices[v];
-        for(size_t layer = vertex->water_layers_length; (layer-- > 0) && (status == 0);) {
+        for(size_t layer = vertex->water_layers_length; layer-- > 0;) {
+            if(status != 0) {
+                break;
+            }
             if(((layer + 1) < vertex->water_layers_length) || (vertex->terrain_layers_length > 0)) {
                 status = planet_sink_layer(planet, v, layer, dt, process);
             }
@@ -16862,7 +19044,10 @@ uint8_t planet_apply_gas_exchange(Planet *planet, const PhysicsSettings *setting
     Transfer transfer;
     AcidBaseTotals totals;
     AcidBaseConstants constants;
-    for(size_t v = 0; (v < planet->vertices_length) && (status == 0); v++) {
+    for(size_t v = 0; v < planet->vertices_length; v++) {
+        if(status != 0) {
+            break;
+        }
         const Planet_Vertex *vertex = &planet->vertices[v];
         if(vertex->water_layers_length > 0) {
             location_set(&surface, v, (uint8_t)LOCATION_WATER, 0);
@@ -16873,7 +19058,9 @@ uint8_t planet_apply_gas_exchange(Planet *planet, const PhysicsSettings *setting
             transfer_create(&transfer, process);
             for(size_t gas = 0; gas < TOTAL_GAS_SPECIES; gas++) {
                 double capacity = planet_gas_amount_for_partial_pressure(planet, gas, PASCALS_PER_ATMOSPHERE);
-                double henry = planet->gas_henry_constants_mol_per_litre_atmosphere[gas] * exponential_double(planet->gas_henry_temperature_factors_kelvin[gas] * ((1.0 / temperature) - (1.0 / STANDARD_TEMPERATURE_KELVIN)));
+                double inverse_difference = (1.0 / temperature) - (1.0 / STANDARD_TEMPERATURE_KELVIN);
+                double temperature_factor = planet->gas_henry_temperature_factors_kelvin[gas] * inverse_difference;
+                double henry = planet->gas_henry_constants_mol_per_litre_atmosphere[gas] * exponential_double(temperature_factor);
                 size_t species = planet->gas_dissolved_counterparts[gas];
                 double water = planet_location_concentration(planet, &surface, species) * volume * gas_neutral_fraction(gas, &constants, h);
                 double air = planet->atmosphere_gas_amounts_mol[gas] + planet->atmosphere_gas_compensation_mol[gas];
@@ -16883,7 +19070,8 @@ uint8_t planet_apply_gas_exchange(Planet *planet, const PhysicsSettings *setting
                 if(capacity > 0.0) {
                     double a = (henry * volume) / capacity;
                     double equilibrium = (water + air) * (a / (1.0 + a));
-                    double rate = settings->gas_transfer_velocity * vertex->area_square_metres * LITRES_PER_CUBIC_METRE * ((henry / capacity) + (1.0 / volume));
+                    double exchange_litres = settings->gas_transfer_velocity * vertex->area_square_metres * LITRES_PER_CUBIC_METRE;
+                    double rate = exchange_litres * ((henry / capacity) + (1.0 / volume));
                     double moved = (equilibrium - water) * (1.0 - exponential_double(-rate * dt));
                     transfer_add_dissolved(&transfer, &surface, species, moved);
                     transfer_add_gas(&transfer, gas, -moved);
@@ -16900,8 +19088,17 @@ uint8_t planet_apply_lateral_exchange(Planet *planet, double rate, double dt) {
     uint8_t status = 0;
     Location first;
     Location second;
-    for(size_t v = 0; (v < planet->vertices_length) && (status == 0) && (planet->neighbor_indices != NULL); v++) {
-        for(size_t k = 0; (k < planet->total_neighbors[v]) && (status == 0); k++) {
+    for(size_t v = 0; v < planet->vertices_length; v++) {
+        if(status != 0) {
+            break;
+        }
+        if(planet->neighbor_indices == NULL) {
+            break;
+        }
+        for(size_t k = 0; k < planet->total_neighbors[v]; k++) {
+            if(status != 0) {
+                break;
+            }
             size_t w = planet->neighbor_indices[(v * MAXIMUM_VERTEX_NEIGHBORS) + k];
             if((w > v) && (planet->vertices[v].water_layers_length > 0) && (planet->vertices[w].water_layers_length > 0)) {
                 location_set(&first, v, (uint8_t)LOCATION_WATER, 0);
@@ -16916,6 +19113,23 @@ uint8_t planet_apply_lateral_exchange(Planet *planet, double rate, double dt) {
     }
     return status;
 }
+
+
+/*
+ * ToC02000 Weather
+ *
+ * Purpose:    Energy-balance weather and surface hydrology on the planet mesh: zonal, thermal and eddy winds,
+ *             moisture advection, clouds, rain and snow, soil water, river routing and lake and ocean rebalancing.
+ * Depends:    ClimateTypes, Planet, Geology (geology_hash), terrain and hydrosphere helpers, pool transfers,
+ *             Physics (weather_declination, planet_patch_albedo); WaterBodies functions through forward declarations.
+ * API:        weather_settings_create, climate_destroy, planet_climate_create, planet_climate_advance
+ * Ownership:  planet_climate_create allocates the Climate and every array in it and stores it in planet->climate.
+ *             climate_destroy frees the arrays and the Climate itself.
+ * Invariants: Per-vertex arrays hold total_vertices entries and edge arrays max(total_edges, 1). downhill_order lists
+ *             every vertex once, highest first. time_days advances in whole steps of settings.step_days.
+ * Errors:     Functions return uint8_t status, 0 on success: 1 when an allocation fails, otherwise the first
+ *             non-zero status of a transfer or water-body operation.
+ */
 
 void weather_settings_create(WeatherSettings *settings) {
     settings->is_enabled = 1;
@@ -17036,18 +19250,23 @@ double weather_saturation_humidity(const WeatherSettings *settings, double tempe
 void weather_zonal_wind(const WeatherSettings *settings, double latitude, double *east, double *north) {
     const double SIXTH = 3.14159265358979323846 / 6.0;
     const double A = terrain_clamp(absolute_value_double(latitude), 0.0, 3.0 * SIXTH);
-    const double SIGN = (latitude < 0.0) ? -1.0 : 1.0;
+    double sign = 1.0;
+    if(latitude < 0.0) {
+        sign = -1.0;
+    } else {
+        sign = 1.0;
+    }
     if(A < SIXTH) {
         *east = -settings->trade_wind_speed * cosine_double(3.0 * A);
-        *north = -SIGN * settings->hadley_wind_speed * sine_double(6.0 * A);
+        *north = -sign * settings->hadley_wind_speed * sine_double(6.0 * A);
     } else if(A < (2.0 * SIXTH)) {
         double phase = 6.0 * (A - SIXTH);
         *east = settings->westerly_wind_speed * sine_double(phase);
-        *north = SIGN * settings->ferrel_wind_speed * sine_double(phase);
+        *north = sign * settings->ferrel_wind_speed * sine_double(phase);
     } else {
         double phase = 6.0 * (A - (2.0 * SIXTH));
         *east = -settings->polar_wind_speed * sine_double(phase);
-        *north = -SIGN * settings->polar_cell_wind_speed * sine_double(phase);
+        *north = -sign * settings->polar_cell_wind_speed * sine_double(phase);
     }
 }
 
@@ -17062,8 +19281,10 @@ void climate_eddies(const Climate *C, const double *point, double time, double *
     const double PHASE = time / S->eddy_timescale_days;
     const double F = S->eddy_frequency;
     for(size_t i = 0; i < WEATHER_TOTAL_EDDY_FIELDS; i++) {
-        fields[i] = terrain_simplex(C->permutation, (F * QX) + (17.3 * (double)i) + (0.71 * PHASE), (F * QY) + (5.1 * (double)i) - (0.53 * PHASE),
-            (F * QZ) + (9.7 * (double)i) + (0.37 * PHASE));
+        double sample_x = (F * QX) + (17.3 * (double)i) + (0.71 * PHASE);
+        double sample_y = (F * QY) + (5.1 * (double)i) - (0.53 * PHASE);
+        double sample_z = (F * QZ) + (9.7 * (double)i) + (0.37 * PHASE);
+        fields[i] = terrain_simplex(C->permutation, sample_x, sample_y, sample_z);
     }
 }
 
@@ -17073,7 +19294,13 @@ uint8_t climate_is_lake(const Planet *planet, const Climate *C, size_t v) {
 
 double climate_elevation(const Planet *planet, size_t v) {
     double elevation = planet->vertices[v].elevation_metres;
-    return (elevation > 0.0) ? elevation : 0.0;
+    double clipped = 0.0;
+    if(elevation > 0.0) {
+        clipped = elevation;
+    } else {
+        clipped = 0.0;
+    }
+    return clipped;
 }
 
 double climate_soil_capacity_kilograms(const Planet *planet, size_t v) {
@@ -17092,7 +19319,10 @@ uint8_t climate_move_solutes(Planet *planet, const Location *from, const Locatio
     if((VOLUME > 0.0) && (SHARE > 0.0)) {
         Transfer transfer;
         transfer_create(&transfer, PROCESS_LATERAL_EXCHANGE);
-        for(size_t i = 0; (i < TOTAL_DISSOLVED_SPECIES) && (status == 0); i++) {
+        for(size_t i = 0; i < TOTAL_DISSOLVED_SPECIES; i++) {
+            if(status != 0) {
+                break;
+            }
             double amount = planet_location_concentration(planet, from, i) * VOLUME * SHARE;
             if(amount > 0.0) {
                 transfer_add_dissolved(&transfer, from, i, -amount);
@@ -17150,7 +19380,11 @@ double climate_take_evaporation(Planet *planet, Climate *C, size_t v, double dem
         return 0.0;
     }
     if(C->is_ocean[v] == 1) {
-        taken = (surface_temperature < S->sea_ice_kelvin) ? (0.1 * demand) : demand;
+        if(surface_temperature < S->sea_ice_kelvin) {
+            taken = 0.1 * demand;
+        } else {
+            taken = demand;
+        }
         if(is_spin_up == 0) {
             climate_add_surface_water(planet, v, -(taken * vertex->area_square_metres) / LITRES_PER_CUBIC_METRE);
         }
@@ -17163,10 +19397,18 @@ double climate_take_evaporation(Planet *planet, Climate *C, size_t v, double dem
             cell->snow_water_kilograms = cell->snow_water_kilograms - taken;
         }
     } else if(vertex->water_layers_length > 0) {
-        taken = (surface_temperature < WEATHER_FRESH_FREEZING_KELVIN) ? (0.1 * demand) : demand;
+        if(surface_temperature < WEATHER_FRESH_FREEZING_KELVIN) {
+            taken = 0.1 * demand;
+        } else {
+            taken = demand;
+        }
         double available = (vertex->water_layer_thickness_metres[0] - 0.001) * LITRES_PER_CUBIC_METRE;
         if(taken > available) {
-            taken = (available > 0.0) ? available : 0.0;
+            if(available > 0.0) {
+                taken = available;
+            } else {
+                taken = 0.0;
+            }
         }
         if(is_spin_up == 0) {
             vertex->water_layer_thickness_metres[0] = vertex->water_layer_thickness_metres[0] - (taken / LITRES_PER_CUBIC_METRE);
@@ -17174,7 +19416,12 @@ double climate_take_evaporation(Planet *planet, Climate *C, size_t v, double dem
     } else {
         double remaining = demand;
         if(cell->ponded_water_kilograms > 0.0) {
-            double from_pond = (remaining < cell->ponded_water_kilograms) ? remaining : cell->ponded_water_kilograms;
+            double from_pond = 0.0;
+            if(remaining < cell->ponded_water_kilograms) {
+                from_pond = remaining;
+            } else {
+                from_pond = cell->ponded_water_kilograms;
+            }
             if(is_spin_up == 0) {
                 cell->ponded_water_kilograms = cell->ponded_water_kilograms - from_pond;
             }
@@ -17185,9 +19432,15 @@ double climate_take_evaporation(Planet *planet, Climate *C, size_t v, double dem
         if((remaining > 0.0) && (capacity > 0.0)) {
             double saturation = vertex->terrain_layer_water_saturation_fraction[0];
             double span = S->field_capacity - S->residual_saturation;
-            double beta = (span > 0.0) ? terrain_clamp((saturation - S->residual_saturation) / span, 0.0, 1.0) : 1.0;
+            double beta = 1.0;
+            if(span > 0.0) {
+                beta = terrain_clamp((saturation - S->residual_saturation) / span, 0.0, 1.0);
+            } else {
+                beta = 1.0;
+            }
             const double COVER = vertex->plant_cover_fraction;
-            const double ROOTS = terrain_clamp((saturation - PLANT_WILTING_SATURATION) / (PLANT_FIELD_SATURATION - PLANT_WILTING_SATURATION), 0.0, 1.0);
+            double root_wetness = (saturation - PLANT_WILTING_SATURATION) / (PLANT_FIELD_SATURATION - PLANT_WILTING_SATURATION);
+            const double ROOTS = terrain_clamp(root_wetness, 0.0, 1.0);
             const double TRANSPIRED = remaining * COVER * ROOTS * PLANT_TRANSPIRATION_FACTOR;
             double from_soil = (remaining * (1.0 - COVER) * beta) + TRANSPIRED;
             if(is_spin_up == 0) {
@@ -17195,7 +19448,11 @@ double climate_take_evaporation(Planet *planet, Climate *C, size_t v, double dem
             }
             double available = (saturation - S->residual_saturation) * capacity;
             if(from_soil > available) {
-                from_soil = (available > 0.0) ? available : 0.0;
+                if(available > 0.0) {
+                    from_soil = available;
+                } else {
+                    from_soil = 0.0;
+                }
             }
             if(is_spin_up == 0) {
                 vertex->terrain_layer_water_saturation_fraction[0] = saturation - (from_soil / capacity);
@@ -17213,8 +19470,18 @@ void climate_apply_temperatures(Planet *planet) {
     for(size_t v = 0; v < planet->vertices_length; v++) {
         Planet_Vertex *vertex = &planet->vertices[v];
         const WeatherCell *cell = &C->cells[v];
-        double freezing = (C->is_ocean[v] == 1) ? C->settings.sea_ice_kelvin : WEATHER_FRESH_FREEZING_KELVIN;
-        double water = (cell->surface_temperature_kelvin > freezing) ? cell->surface_temperature_kelvin : freezing;
+        double freezing = WEATHER_FRESH_FREEZING_KELVIN;
+        if(C->is_ocean[v] == 1) {
+            freezing = C->settings.sea_ice_kelvin;
+        } else {
+            freezing = WEATHER_FRESH_FREEZING_KELVIN;
+        }
+        double water = freezing;
+        if(cell->surface_temperature_kelvin > freezing) {
+            water = cell->surface_temperature_kelvin;
+        } else {
+            water = freezing;
+        }
         vertex->local_air_temperature_kelvin = cell->near_surface_temperature_kelvin;
         vertex->water_layer_temperature_kelvin[0] = water;
         if(vertex->water_layers_length == 0) {
@@ -17222,9 +19489,14 @@ void climate_apply_temperatures(Planet *planet) {
                 vertex->water_layer_temperature_kelvin[layer] = water;
             }
         }
-        const double BOTTOM = (vertex->water_layers_length > 0) ? vertex->water_layer_temperature_kelvin[vertex->water_layers_length - 1] : cell->surface_temperature_kelvin;
+        double bottom = cell->surface_temperature_kelvin;
+        if(vertex->water_layers_length > 0) {
+            bottom = vertex->water_layer_temperature_kelvin[vertex->water_layers_length - 1];
+        } else {
+            bottom = cell->surface_temperature_kelvin;
+        }
         for(size_t layer = 0; layer < TOTAL_TERRAIN_LAYERS; layer++) {
-            vertex->terrain_layer_temperature_kelvin[layer] = BOTTOM;
+            vertex->terrain_layer_temperature_kelvin[layer] = bottom;
         }
         area = area + vertex->area_square_metres;
         weighted = weighted + (vertex->area_square_metres * cell->near_surface_temperature_kelvin);
@@ -17237,7 +19509,10 @@ void climate_apply_temperatures(Planet *planet) {
 void climate_heap_push(double *keys, size_t *values, size_t *length, double key, size_t value) {
     size_t i = *length;
     *length = *length + 1;
-    while(i > 0) {
+    for(size_t level_index = 0; level_index < BITS_TOTAL_WORD_BITS; level_index++) {
+        if(i == 0) {
+            break;
+        }
         size_t parent = (i - 1) / 2;
         if((keys[parent] < key) || ((keys[parent] == key) && (values[parent] < value))) {
             break;
@@ -17256,12 +19531,18 @@ size_t climate_heap_pop(double *keys, size_t *values, size_t *length) {
     double key = keys[*length];
     size_t value = values[*length];
     size_t i = 0;
-    for(;;) {
+    for(size_t level_index = 0; level_index < BITS_TOTAL_WORD_BITS; level_index++) {
         size_t child = (2 * i) + 1;
         if(child >= *length) {
             break;
         }
-        if(((child + 1) < *length) && ((keys[child + 1] < keys[child]) || ((keys[child + 1] == keys[child]) && (values[child + 1] < values[child])))) {
+        uint8_t is_right_child_first = (uint8_t)((child + 1) < *length);
+        if(is_right_child_first == 1) {
+            double right_key = keys[child + 1];
+            double left_key = keys[child];
+            is_right_child_first = (uint8_t)((right_key < left_key) || ((right_key == left_key) && (values[child + 1] < values[child])));
+        }
+        if(is_right_child_first == 1) {
             child = child + 1;
         }
         if((key < keys[child]) || ((key == keys[child]) && (value < values[child]))) {
@@ -17284,7 +19565,10 @@ uint8_t climate_build_hydrology(Planet *planet, Climate *C) {
     size_t length = 0;
     C->total_depressions = 0;
     C->ocean_area_square_metres = 0.0;
-    for(size_t v = 0; (v < N) && (status == 0); v++) {
+    for(size_t v = 0; v < N; v++) {
+        if(status != 0) {
+            break;
+        }
         const Planet_Vertex *vertex = &planet->vertices[v];
         C->is_ocean[v] = vertex->is_ocean_water;
         if(C->is_ocean[v] == 1) {
@@ -17306,7 +19590,13 @@ uint8_t climate_build_hydrology(Planet *planet, Climate *C) {
         climate_heap_push(keys, values, &length, -vertex->elevation_metres, v);
     }
     size_t rank = 0;
-    while((status == 0) && (length > 0)) {
+    for(size_t pop_index = 0; pop_index < (N + 1); pop_index++) {
+        if(status != 0) {
+            break;
+        }
+        if(length == 0) {
+            break;
+        }
         size_t v = climate_heap_pop(keys, values, &length);
         C->downhill_order[rank] = v;
         C->flood_ranks[v] = rank;
@@ -17333,7 +19623,10 @@ uint8_t climate_rebalance_water(Planet *planet, Climate *C) {
     size_t *bodies = (size_t *)malloc(N * sizeof(size_t));
     size_t *members = (size_t *)malloc(N * sizeof(size_t));
     uint8_t status = (uint8_t)((heights == NULL) || (areas == NULL) || (water == NULL) || (levels == NULL) || (bodies == NULL) || (members == NULL));
-    for(size_t v = 0; (v < N) && (status == 0); v++) {
+    for(size_t v = 0; v < N; v++) {
+        if(status != 0) {
+            break;
+        }
         const Planet_Vertex *vertex = &planet->vertices[v];
         double depth = 0.0;
         for(size_t layer = 0; layer < vertex->water_layers_length; layer++) {
@@ -17350,13 +19643,21 @@ uint8_t climate_rebalance_water(Planet *planet, Climate *C) {
     if(status == 0) {
         const size_t OCEAN = hydrosphere_largest_body(N, areas, bodies);
         planet->ocean_body_index = OCEAN;
-        for(size_t v = 0; (v < N) && (status == 0); v++) {
+        for(size_t v = 0; v < N; v++) {
+            if(status != 0) {
+                break;
+            }
             Planet_Vertex *vertex = &planet->vertices[v];
-            const double DEPTH = (bodies[v] != SIZE_MAX) ? (levels[v] - heights[v]) : 0.0;
+            double depth = 0.0;
+            if(bodies[v] != SIZE_MAX) {
+                depth = levels[v] - heights[v];
+            } else {
+                depth = 0.0;
+            }
             const uint8_t IS_OCEAN = (uint8_t)((bodies[v] != SIZE_MAX) && (bodies[v] == OCEAN));
             if(vertex->water_layers_length > 0) {
-                if(DEPTH < S->lake_minimum_depth_metres) {
-                    C->cells[v].ponded_water_kilograms = C->cells[v].ponded_water_kilograms + (DEPTH * LITRES_PER_CUBIC_METRE);
+                if(depth < S->lake_minimum_depth_metres) {
+                    C->cells[v].ponded_water_kilograms = C->cells[v].ponded_water_kilograms + (depth * LITRES_PER_CUBIC_METRE);
                     status = planet_dry_vertex(planet, v);
                     C->total_lakes_dried = C->total_lakes_dried + 1;
                 } else {
@@ -17364,15 +19665,15 @@ uint8_t climate_rebalance_water(Planet *planet, Climate *C) {
                     for(size_t layer = 0; layer < vertex->water_layers_length; layer++) {
                         current = current + vertex->water_layer_thickness_metres[layer];
                     }
-                    if(((vertex->water_layer_thickness_metres[0] + (DEPTH - current)) < 1.0) && (vertex->water_layers_length > 1)) {
+                    if(((vertex->water_layer_thickness_metres[0] + (depth - current)) < 1.0) && (vertex->water_layers_length > 1)) {
                         status = planet_merge_top_water_layers(planet, v);
                     }
-                    vertex->water_layer_thickness_metres[0] = vertex->water_layer_thickness_metres[0] + (DEPTH - current);
+                    vertex->water_layer_thickness_metres[0] = vertex->water_layer_thickness_metres[0] + (depth - current);
                     if(vertex->water_layer_thickness_metres[0] < 0.001) {
                         vertex->water_layer_thickness_metres[0] = 0.001;
                     }
                 }
-            } else if((bodies[v] != SIZE_MAX) && (DEPTH >= S->lake_creation_depth_metres)) {
+            } else if((bodies[v] != SIZE_MAX) && (depth >= S->lake_creation_depth_metres)) {
                 size_t donor = SIZE_MAX;
                 for(size_t k = 0; k < planet->total_neighbors[v]; k++) {
                     size_t w = planet->neighbor_indices[(v * MAXIMUM_VERTEX_NEIGHBORS) + k];
@@ -17380,12 +19681,16 @@ uint8_t climate_rebalance_water(Planet *planet, Climate *C) {
                         donor = w;
                     }
                 }
-                status = planet_flood_vertex(planet, v, DEPTH, IS_OCEAN, donor);
+                status = planet_flood_vertex(planet, v, depth, IS_OCEAN, donor);
                 C->total_lakes_created = C->total_lakes_created + 1;
             } else {
-                C->cells[v].ponded_water_kilograms = C->cells[v].ponded_water_kilograms + (DEPTH * LITRES_PER_CUBIC_METRE);
+                C->cells[v].ponded_water_kilograms = C->cells[v].ponded_water_kilograms + (depth * LITRES_PER_CUBIC_METRE);
             }
-            vertex->water_body_index = (vertex->water_layers_length > 0) ? bodies[v] : SIZE_MAX;
+            if(vertex->water_layers_length > 0) {
+                vertex->water_body_index = bodies[v];
+            } else {
+                vertex->water_body_index = SIZE_MAX;
+            }
             vertex->is_ocean_water = (uint8_t)((vertex->water_layers_length > 0) && (IS_OCEAN == 1));
             C->is_ocean[v] = vertex->is_ocean_water;
         }
@@ -17395,25 +19700,27 @@ uint8_t climate_rebalance_water(Planet *planet, Climate *C) {
                 C->ocean_area_square_metres = C->ocean_area_square_metres + planet->vertices[v].area_square_metres;
             }
         }
-        for(size_t v = 0; (v < N) && (status == 0); v++) {
+        for(size_t v = 0; v < N; v++) {
+            if(status != 0) {
+                break;
+            }
             const size_t BODY = planet->vertices[v].water_body_index;
-            if((BODY == SIZE_MAX) || (planet->vertices[v].is_ocean_water == 1)) {
-                continue;
-            }
-            size_t count = 0;
-            uint8_t is_first = 1;
-            for(size_t w = 0; w < N; w++) {
-                if(planet->vertices[w].water_body_index == BODY) {
-                    if(w < v) {
-                        is_first = 0;
-                        break;
+            if((BODY != SIZE_MAX) && (planet->vertices[v].is_ocean_water != 1)) {
+                size_t count = 0;
+                uint8_t is_first = 1;
+                for(size_t w = 0; w < N; w++) {
+                    if(planet->vertices[w].water_body_index == BODY) {
+                        if(w < v) {
+                            is_first = 0;
+                            break;
+                        }
+                        members[count] = w;
+                        count = count + 1;
                     }
-                    members[count] = w;
-                    count = count + 1;
                 }
-            }
-            if((is_first == 1) && (count > 1)) {
-                status = planet_mix_water_body(planet, members, count);
+                if((is_first == 1) && (count > 1)) {
+                    status = planet_mix_water_body(planet, members, count);
+                }
             }
         }
     }
@@ -17444,7 +19751,8 @@ void climate_initialise_state(Planet *planet, Climate *C) {
         }
         mean = mean / (double)SAMPLES;
         double transmittance = 1.0 - (0.5 * S->cloud_albedo);
-        absorbed[v] = S->solar_constant_watts_per_square_metre * planet->relative_luminosity * mean * transmittance * (1.0 - planet_patch_albedo(planet, v));
+        double incoming = S->solar_constant_watts_per_square_metre * planet->relative_luminosity * mean * transmittance;
+        absorbed[v] = incoming * (1.0 - planet_patch_albedo(planet, v));
         C->next_air[v] = CELSIUS_OFFSET_KELVIN + ((absorbed[v] - S->outgoing_longwave_intercept) / S->outgoing_longwave_slope);
     }
     for(size_t iteration = 0; iteration < 200; iteration++) {
@@ -17499,71 +19807,86 @@ uint8_t climate_hydrology_step(Planet *planet, Climate *C, double dt_days) {
     if(C->terrain_version != planet->terrain_version) {
         status = climate_build_hydrology(planet, C);
     }
-    for(size_t v = 0; (v < N) && (status == 0); v++) {
+    for(size_t v = 0; v < N; v++) {
+        if(status != 0) {
+            break;
+        }
         Planet_Vertex *vertex = &planet->vertices[v];
         WeatherCell *cell = &C->cells[v];
         if(vertex->water_layers_length > 0) {
             climate_add_surface_water(planet, v, ((C->rain[v] + C->snow[v]) * vertex->area_square_metres) / LITRES_PER_CUBIC_METRE);
-            continue;
+        } else {
+            cell->snow_water_kilograms = cell->snow_water_kilograms + C->snow[v];
+            double warmth = cell->near_surface_temperature_kelvin - WEATHER_FRESH_FREEZING_KELVIN;
+            double melt = 0.0;
+            if(warmth > 0.0) {
+                melt = S->snow_melt_per_kelvin_day * warmth * dt_days;
+            } else {
+                melt = 0.0;
+            }
+            if(melt > cell->snow_water_kilograms) {
+                melt = cell->snow_water_kilograms;
+            }
+            cell->snow_water_kilograms = cell->snow_water_kilograms - melt;
+            double liquid = C->rain[v] + melt;
+            double capacity = climate_soil_capacity_kilograms(planet, v);
+            double surface = liquid;
+            double drained = 0.0;
+            if(capacity > 0.0) {
+                double water = vertex->terrain_layer_water_saturation_fraction[0] * capacity;
+                double room = capacity - water;
+                double soaked = liquid;
+                if(soaked > room) {
+                    if(room > 0.0) {
+                        soaked = room;
+                    } else {
+                        soaked = 0.0;
+                    }
+                }
+                if(soaked > (S->infiltration_per_day * dt_days)) {
+                    soaked = S->infiltration_per_day * dt_days;
+                }
+                surface = liquid - soaked;
+                water = water + soaked;
+                double field = S->field_capacity * capacity;
+                if(water > field) {
+                    drained = (water - field) * (1.0 - exponential_double(-S->drainage_per_day * dt_days));
+                }
+                if((drained > 0.0) && (C->receivers[v] != SIZE_MAX)) {
+                    location_set(&from, v, (uint8_t)LOCATION_TERRAIN, 0);
+                    climate_receiving_location(planet, C, C->receivers[v], &to);
+                    status = climate_move_solutes(planet, &from, &to, drained / water);
+                }
+                vertex->terrain_layer_water_saturation_fraction[0] = (water - drained) / capacity;
+            }
+            cell->river_water_kilograms = cell->river_water_kilograms + surface + drained;
         }
-        cell->snow_water_kilograms = cell->snow_water_kilograms + C->snow[v];
-        double warmth = cell->near_surface_temperature_kelvin - WEATHER_FRESH_FREEZING_KELVIN;
-        double melt = (warmth > 0.0) ? (S->snow_melt_per_kelvin_day * warmth * dt_days) : 0.0;
-        if(melt > cell->snow_water_kilograms) {
-            melt = cell->snow_water_kilograms;
-        }
-        cell->snow_water_kilograms = cell->snow_water_kilograms - melt;
-        double liquid = C->rain[v] + melt;
-        double capacity = climate_soil_capacity_kilograms(planet, v);
-        double surface = liquid;
-        double drained = 0.0;
-        if(capacity > 0.0) {
-            double water = vertex->terrain_layer_water_saturation_fraction[0] * capacity;
-            double room = capacity - water;
-            double soaked = liquid;
-            if(soaked > room) {
-                soaked = (room > 0.0) ? room : 0.0;
-            }
-            if(soaked > (S->infiltration_per_day * dt_days)) {
-                soaked = S->infiltration_per_day * dt_days;
-            }
-            surface = liquid - soaked;
-            water = water + soaked;
-            double field = S->field_capacity * capacity;
-            if(water > field) {
-                drained = (water - field) * (1.0 - exponential_double(-S->drainage_per_day * dt_days));
-            }
-            if((drained > 0.0) && (C->receivers[v] != SIZE_MAX)) {
-                location_set(&from, v, (uint8_t)LOCATION_TERRAIN, 0);
-                climate_receiving_location(planet, C, C->receivers[v], &to);
-                status = climate_move_solutes(planet, &from, &to, drained / water);
-            }
-            vertex->terrain_layer_water_saturation_fraction[0] = (water - drained) / capacity;
-        }
-        cell->river_water_kilograms = cell->river_water_kilograms + surface + drained;
     }
     const double REACH = S->river_speed_metres_per_second * SECONDS_PER_DAY * dt_days;
-    for(size_t i = 0; (i < N) && (status == 0); i++) {
+    for(size_t i = 0; i < N; i++) {
+        if(status != 0) {
+            break;
+        }
         const size_t V = C->downhill_order[i];
         Planet_Vertex *vertex = &planet->vertices[V];
         WeatherCell *cell = &C->cells[V];
         if(vertex->water_layers_length > 0) {
             cell->river_water_kilograms = 0.0;
-            continue;
+        } else {
+            const uint8_t IS_DRY = (uint8_t)(cell->river_water_kilograms <= 0.0);
+            if(IS_DRY == 0) {
+                const size_t R = C->receivers[V];
+                if(R == SIZE_MAX) {
+                    cell->ponded_water_kilograms = cell->ponded_water_kilograms + cell->river_water_kilograms;
+                    cell->river_water_kilograms = 0.0;
+                } else {
+                    const double SHARE = 1.0 - exponential_double(-REACH / C->receiver_distances[V]);
+                    const double OUT = cell->river_water_kilograms * SHARE;
+                    cell->river_water_kilograms = cell->river_water_kilograms - OUT;
+                    climate_deliver_water(planet, C, R, OUT * vertex->area_square_metres);
+                }
+            }
         }
-        if(cell->river_water_kilograms <= 0.0) {
-            continue;
-        }
-        const size_t R = C->receivers[V];
-        if(R == SIZE_MAX) {
-            cell->ponded_water_kilograms = cell->ponded_water_kilograms + cell->river_water_kilograms;
-            cell->river_water_kilograms = 0.0;
-            continue;
-        }
-        const double SHARE = 1.0 - exponential_double(-REACH / C->receiver_distances[V]);
-        const double OUT = cell->river_water_kilograms * SHARE;
-        cell->river_water_kilograms = cell->river_water_kilograms - OUT;
-        climate_deliver_water(planet, C, R, OUT * vertex->area_square_metres);
     }
     if(status == 0) {
         status = climate_rebalance_water(planet, C);
@@ -17582,6 +19905,7 @@ uint8_t climate_step(Planet *planet, double start_days, double dt_days, uint8_t 
     const double CONDUCTANCE = (S->heat_diffusion * C->radius_metres * C->radius_metres) / 1.7320508075688772;
     const double OLR_OFFSET = S->outgoing_longwave_intercept - (CELSIUS_OFFSET_KELVIN * S->outgoing_longwave_slope);
     const double SIXTH = 3.14159265358979323846 / 6.0;
+    const double LAST_BAND = (double)(WEATHER_TOTAL_LATITUDE_BANDS - 1);
     double band_sum[WEATHER_TOTAL_LATITUDE_BANDS];
     double band_area[WEATHER_TOTAL_LATITUDE_BANDS];
     uint8_t status = 0;
@@ -17590,13 +19914,17 @@ uint8_t climate_step(Planet *planet, double start_days, double dt_days, uint8_t 
         band_area[b] = 0.0;
     }
     for(size_t v = 0; v < N; v++) {
-        size_t b = (size_t)terrain_clamp(terrain_floor(0.5 * (planet->vertex_positions[v][2] + 1.0) * (double)WEATHER_TOTAL_LATITUDE_BANDS), 0.0,
-            (double)(WEATHER_TOTAL_LATITUDE_BANDS - 1));
+        double band_position = 0.5 * (planet->vertex_positions[v][2] + 1.0) * (double)WEATHER_TOTAL_LATITUDE_BANDS;
+        size_t b = (size_t)terrain_clamp(terrain_floor(band_position), 0.0, LAST_BAND);
         band_sum[b] = band_sum[b] + (planet->vertices[v].area_square_metres * C->cells[v].sea_level_air_temperature_kelvin);
         band_area[b] = band_area[b] + planet->vertices[v].area_square_metres;
     }
     for(size_t b = 0; b < WEATHER_TOTAL_LATITUDE_BANDS; b++) {
-        band_sum[b] = (band_area[b] > 0.0) ? (band_sum[b] / band_area[b]) : 0.0;
+        if(band_area[b] > 0.0) {
+            band_sum[b] = band_sum[b] / band_area[b];
+        } else {
+            band_sum[b] = 0.0;
+        }
     }
     for(size_t v = 0; v < N; v++) {
         const double *P = planet->vertex_positions[v];
@@ -17606,15 +19934,16 @@ uint8_t climate_step(Planet *planet, double start_days, double dt_days, uint8_t 
         double east = 0.0;
         double north = 0.0;
         weather_zonal_wind(S, LATITUDE - (S->itcz_shift_fraction * DECLINATION), &east, &north);
-        size_t band = (size_t)terrain_clamp(terrain_floor(0.5 * (P[2] + 1.0) * (double)WEATHER_TOTAL_LATITUDE_BANDS), 0.0, (double)(WEATHER_TOTAL_LATITUDE_BANDS - 1));
+        double band_position = 0.5 * (P[2] + 1.0) * (double)WEATHER_TOTAL_LATITUDE_BANDS;
+        size_t band = (size_t)terrain_clamp(terrain_floor(band_position), 0.0, LAST_BAND);
         double anomaly = cell->sea_level_air_temperature_kelvin - band_sum[band];
         double gradient[TOTAL_SPATIAL_AXES] = {0.0, 0.0, 0.0};
         size_t count = planet->total_neighbors[v];
         for(size_t k = 0; k < count; k++) {
             size_t w = planet->neighbor_indices[(v * MAXIMUM_VERTEX_NEIGHBORS) + k];
             if(w < N) {
-                size_t wb = (size_t)terrain_clamp(terrain_floor(0.5 * (planet->vertex_positions[w][2] + 1.0) * (double)WEATHER_TOTAL_LATITUDE_BANDS), 0.0,
-                    (double)(WEATHER_TOTAL_LATITUDE_BANDS - 1));
+                double neighbour_band_position = 0.5 * (planet->vertex_positions[w][2] + 1.0) * (double)WEATHER_TOTAL_LATITUDE_BANDS;
+                size_t wb = (size_t)terrain_clamp(terrain_floor(neighbour_band_position), 0.0, LAST_BAND);
                 double difference = (C->cells[w].sea_level_air_temperature_kelvin - band_sum[wb]) - anomaly;
                 double scale = (2.0 / (double)count) * difference / C->neighbour_distances[(v * MAXIMUM_VERTEX_NEIGHBORS) + k];
                 for(size_t axis = 0; axis < TOTAL_SPATIAL_AXES; axis++) {
@@ -17650,13 +19979,21 @@ uint8_t climate_step(Planet *planet, double start_days, double dt_days, uint8_t 
         } else {
             mu = weather_cos_zenith(S, P, MIDDLE);
         }
-        mu = (mu > 0.0) ? mu : 0.0;
+        const uint8_t IS_SUN_UP = (uint8_t)(mu > 0.0);
+        if(IS_SUN_UP == 0) {
+            mu = 0.0;
+        }
         double air = cell->sea_level_air_temperature_kelvin - LAPSE;
         double surface = cell->sea_level_surface_temperature_kelvin - LAPSE;
         double saturated = weather_saturation_column(S, air);
-        double humidity = (saturated > 0.0) ? terrain_clamp(cell->precipitable_water_kilograms / saturated, 0.0, 1.5) : 0.0;
-        double cloud = S->cloud_maximum_fraction * terrain_clamp(((humidity + (S->storm_humidity_swing * cell->storminess)) - S->cloud_clear_humidity)
-            / (1.0 - S->cloud_clear_humidity), 0.0, 1.0);
+        double humidity = 0.0;
+        if(saturated > 0.0) {
+            humidity = terrain_clamp(cell->precipitable_water_kilograms / saturated, 0.0, 1.5);
+        } else {
+            humidity = 0.0;
+        }
+        double cloud_excess = ((humidity + (S->storm_humidity_swing * cell->storminess)) - S->cloud_clear_humidity) / (1.0 - S->cloud_clear_humidity);
+        double cloud = S->cloud_maximum_fraction * terrain_clamp(cloud_excess, 0.0, 1.0);
         double albedo = planet_patch_albedo(planet, v);
         if((C->is_ocean[v] == 1) && (surface < S->sea_ice_kelvin)) {
             albedo = S->sea_ice_albedo;
@@ -17687,12 +20024,20 @@ uint8_t climate_step(Planet *planet, double start_days, double dt_days, uint8_t 
         const WeatherCell *b = &C->cells[w];
         double along = 0.0;
         for(size_t axis = 0; axis < TOTAL_SPATIAL_AXES; axis++) {
-            double wind = 0.5 * ((a->wind_east_metres_per_second * C->east[v][axis]) + (a->wind_north_metres_per_second * C->north[v][axis])
-                + (b->wind_east_metres_per_second * C->east[w][axis]) + (b->wind_north_metres_per_second * C->north[w][axis]));
+            double from_first = (a->wind_east_metres_per_second * C->east[v][axis]) + (a->wind_north_metres_per_second * C->north[v][axis]);
+            double with_second_east = from_first + (b->wind_east_metres_per_second * C->east[w][axis]);
+            double wind = 0.5 * (with_second_east + (b->wind_north_metres_per_second * C->north[w][axis]));
             along = along + (wind * C->edge_directions[e][axis]);
         }
-        double upwind = (along > 0.0) ? a->precipitable_water_kilograms : b->precipitable_water_kilograms;
-        double flux = ((along * (C->edge_lengths[e] / 1.7320508075688772) * upwind) + (DIFFUSION * (a->precipitable_water_kilograms - b->precipitable_water_kilograms))) * DT;
+        double upwind = 0.0;
+        if(along > 0.0) {
+            upwind = a->precipitable_water_kilograms;
+        } else {
+            upwind = b->precipitable_water_kilograms;
+        }
+        double advected = along * (C->edge_lengths[e] / 1.7320508075688772) * upwind;
+        double diffused = DIFFUSION * (a->precipitable_water_kilograms - b->precipitable_water_kilograms);
+        double flux = (advected + diffused) * DT;
         C->edge_flux[e] = flux;
         if(flux > 0.0) {
             C->outflow[v] = C->outflow[v] + flux;
@@ -17704,7 +20049,12 @@ uint8_t climate_step(Planet *planet, double start_days, double dt_days, uint8_t 
         size_t v = C->edges[e][0];
         size_t w = C->edges[e][1];
         double flux = C->edge_flux[e];
-        size_t donor = (flux > 0.0) ? v : w;
+        size_t donor = w;
+        if(flux > 0.0) {
+            donor = v;
+        } else {
+            donor = w;
+        }
         double limit = 0.5 * C->mass[donor];
         if((C->outflow[donor] > limit) && (C->outflow[donor] > 0.0)) {
             flux = flux * (limit / C->outflow[donor]);
@@ -17720,17 +20070,33 @@ uint8_t climate_step(Planet *planet, double start_days, double dt_days, uint8_t 
         WeatherCell *cell = &C->cells[v];
         const double LAPSE = S->lapse_rate_kelvin_per_metre * climate_elevation(planet, v);
         double water = C->mass[v] / planet->vertices[v].area_square_metres;
-        water = (water > 0.0) ? water : 0.0;
+        const uint8_t IS_WET = (uint8_t)(water > 0.0);
+        if(IS_WET == 0) {
+            water = 0.0;
+        }
         double air = cell->sea_level_air_temperature_kelvin - LAPSE;
         double threshold = (S->condensation_humidity - (S->storm_humidity_swing * cell->storminess)) * weather_saturation_column(S, air);
-        double falling = (water > threshold) ? ((water - threshold) * CONDENSE) : 0.0;
-        double near = (WEATHER_NEAR_SURFACE_SKIN_WEIGHT * (cell->sea_level_surface_temperature_kelvin - LAPSE))
-            + ((1.0 - WEATHER_NEAR_SURFACE_SKIN_WEIGHT) * air);
+        double falling = 0.0;
+        if(water > threshold) {
+            falling = (water - threshold) * CONDENSE;
+        } else {
+            falling = 0.0;
+        }
+        double skin = WEATHER_NEAR_SURFACE_SKIN_WEIGHT * (cell->sea_level_surface_temperature_kelvin - LAPSE);
+        double near = skin + ((1.0 - WEATHER_NEAR_SURFACE_SKIN_WEIGHT) * air);
         double snowy = terrain_clamp(((S->rain_snow_kelvin + S->rain_snow_band_kelvin) - near) / (2.0 * S->rain_snow_band_kelvin), 0.0, 1.0);
         cell->precipitable_water_kilograms = water - falling;
         C->precipitation[v] = falling;
-        C->snow[v] = (is_spin_up == 0) ? (falling * snowy) : 0.0;
-        C->rain[v] = (is_spin_up == 0) ? (falling - C->snow[v]) : 0.0;
+        if(is_spin_up == 0) {
+            C->snow[v] = falling * snowy;
+        } else {
+            C->snow[v] = 0.0;
+        }
+        if(is_spin_up == 0) {
+            C->rain[v] = falling - C->snow[v];
+        } else {
+            C->rain[v] = 0.0;
+        }
         cell->precipitation_per_day = falling / dt_days;
         cell->snowfall_per_day = (falling * snowy) / dt_days;
         cell->evaporation_per_day = C->evaporation[v] / dt_days;
@@ -17741,12 +20107,18 @@ uint8_t climate_step(Planet *planet, double start_days, double dt_days, uint8_t 
     }
     for(size_t v = 0; v < N; v++) {
         const WeatherCell *cell = &C->cells[v];
-        double capacity = (C->is_ocean[v] == 1) ? S->ocean_heat_capacity : S->land_heat_capacity;
+        double capacity = S->land_heat_capacity;
+        if(C->is_ocean[v] == 1) {
+            capacity = S->ocean_heat_capacity;
+        } else {
+            capacity = S->land_heat_capacity;
+        }
         double latent = (WEATHER_LATENT_HEAT_JOULES_PER_KILOGRAM * C->evaporation[v]) / DT;
         double inertia = capacity / DT;
-        C->next_surface[v] = ((inertia * cell->sea_level_surface_temperature_kelvin) + cell->absorbed_shortwave_watts - latent
-            - (S->surface_window_fraction * OLR_OFFSET) + (S->surface_air_coupling * cell->sea_level_air_temperature_kelvin))
-            / (inertia + (S->surface_window_fraction * S->outgoing_longwave_slope) + S->surface_air_coupling);
+        double gained = (inertia * cell->sea_level_surface_temperature_kelvin) + cell->absorbed_shortwave_watts - latent;
+        double numerator = gained - (S->surface_window_fraction * OLR_OFFSET) + (S->surface_air_coupling * cell->sea_level_air_temperature_kelvin);
+        double denominator = inertia + (S->surface_window_fraction * S->outgoing_longwave_slope) + S->surface_air_coupling;
+        C->next_surface[v] = numerator / denominator;
     }
     for(size_t v = 0; v < N; v++) {
         const WeatherCell *cell = &C->cells[v];
@@ -17762,9 +20134,10 @@ uint8_t climate_step(Planet *planet, double start_days, double dt_days, uint8_t 
         }
         double latent = (WEATHER_LATENT_HEAT_JOULES_PER_KILOGRAM * C->precipitation[v]) / DT;
         double inertia = S->atmosphere_heat_capacity / DT;
-        C->next_air[v] = ((inertia * cell->sea_level_air_temperature_kelvin) + (S->surface_air_coupling * C->next_surface[v]) + latent
-            - ((1.0 - S->surface_window_fraction) * OLR_OFFSET) + neighbours)
-            / (inertia + S->surface_air_coupling + ((1.0 - S->surface_window_fraction) * S->outgoing_longwave_slope) + weights);
+        double gained = (inertia * cell->sea_level_air_temperature_kelvin) + (S->surface_air_coupling * C->next_surface[v]) + latent;
+        double numerator = gained - ((1.0 - S->surface_window_fraction) * OLR_OFFSET) + neighbours;
+        double denominator = inertia + S->surface_air_coupling + ((1.0 - S->surface_window_fraction) * S->outgoing_longwave_slope) + weights;
+        C->next_air[v] = numerator / denominator;
     }
     for(size_t v = 0; v < N; v++) {
         WeatherCell *cell = &C->cells[v];
@@ -17773,8 +20146,8 @@ uint8_t climate_step(Planet *planet, double start_days, double dt_days, uint8_t 
         cell->sea_level_air_temperature_kelvin = C->next_air[v];
         cell->surface_temperature_kelvin = C->next_surface[v] - LAPSE;
         cell->air_temperature_kelvin = C->next_air[v] - LAPSE;
-        cell->near_surface_temperature_kelvin = (WEATHER_NEAR_SURFACE_SKIN_WEIGHT * cell->surface_temperature_kelvin)
-            + ((1.0 - WEATHER_NEAR_SURFACE_SKIN_WEIGHT) * cell->air_temperature_kelvin);
+        double skin = WEATHER_NEAR_SURFACE_SKIN_WEIGHT * cell->surface_temperature_kelvin;
+        cell->near_surface_temperature_kelvin = skin + ((1.0 - WEATHER_NEAR_SURFACE_SKIN_WEIGHT) * cell->air_temperature_kelvin);
     }
     if((is_spin_up == 0) && (S->is_hydrology_on == 1)) {
         status = climate_hydrology_step(planet, C, dt_days);
@@ -17790,6 +20163,10 @@ uint8_t climate_step(Planet *planet, double start_days, double dt_days, uint8_t 
     return status;
 }
 
+#define CLIMATE_NOISE_TABLE_LENGTH 256
+
+#define MAXIMUM_CLIMATE_SPIN_UP_STEPS 100000000
+
 uint8_t planet_climate_create(Planet *planet, const WeatherSettings *settings) {
     const size_t N = planet->vertices_length;
     if((settings->is_enabled == 0) || (N == 0) || (planet->vertex_positions == NULL)) {
@@ -17797,10 +20174,11 @@ uint8_t planet_climate_create(Planet *planet, const WeatherSettings *settings) {
     }
     climate_destroy(planet->climate);
     planet->climate = NULL;
-    Climate *C = (Climate *)calloc(1, sizeof(Climate));
+    Climate *C = (Climate *)malloc(sizeof(Climate));
     if(C == NULL) {
         return 1;
     }
+    bytes_clear((uint8_t *)C, sizeof(Climate));
     size_t edges = 0;
     for(size_t v = 0; v < N; v++) {
         for(size_t k = 0; k < planet->total_neighbors[v]; k++) {
@@ -17813,63 +20191,106 @@ uint8_t planet_climate_create(Planet *planet, const WeatherSettings *settings) {
     C->total_vertices = N;
     C->radius_metres = planet->radius_metres;
     C->total_edges = edges;
-    C->cells = (WeatherCell *)calloc(N, sizeof(WeatherCell));
-    C->latitudes = (double *)calloc(N, sizeof(double));
-    C->east = (double (*)[TOTAL_SPATIAL_AXES])calloc(N, sizeof(double[TOTAL_SPATIAL_AXES]));
-    C->north = (double (*)[TOTAL_SPATIAL_AXES])calloc(N, sizeof(double[TOTAL_SPATIAL_AXES]));
-    C->neighbour_distances = (double *)calloc(N * MAXIMUM_VERTEX_NEIGHBORS, sizeof(double));
-    C->neighbour_directions = (double (*)[TOTAL_SPATIAL_AXES])calloc(N * MAXIMUM_VERTEX_NEIGHBORS, sizeof(double[TOTAL_SPATIAL_AXES]));
-    C->edges = (size_t (*)[2])calloc((edges > 0) ? edges : 1, sizeof(size_t[2]));
-    C->edge_lengths = (double *)calloc((edges > 0) ? edges : 1, sizeof(double));
-    C->edge_directions = (double (*)[TOTAL_SPATIAL_AXES])calloc((edges > 0) ? edges : 1, sizeof(double[TOTAL_SPATIAL_AXES]));
-    C->edge_flux = (double *)calloc((edges > 0) ? edges : 1, sizeof(double));
-    C->is_ocean = (uint8_t *)calloc(N, sizeof(uint8_t));
-    C->flood_ranks = (size_t *)calloc(N, sizeof(size_t));
-    C->receivers = (size_t *)calloc(N, sizeof(size_t));
-    C->depressions = (size_t *)calloc(N, sizeof(size_t));
-    C->destinations = (size_t *)calloc(N, sizeof(size_t));
-    C->depression_sinks = (size_t *)calloc(N, sizeof(size_t));
-    C->depression_outlets = (size_t *)calloc(N, sizeof(size_t));
-    C->depression_destinations = (size_t *)calloc(N, sizeof(size_t));
-    C->depression_capacities_cubic_metres = (double *)calloc(N, sizeof(double));
-    C->downhill_order = (size_t *)calloc(N, sizeof(size_t));
-    C->receiver_distances = (double *)calloc(N, sizeof(double));
-    C->mass = (double *)calloc(N, sizeof(double));
-    C->outflow = (double *)calloc(N, sizeof(double));
-    C->evaporation = (double *)calloc(N, sizeof(double));
-    C->rain = (double *)calloc(N, sizeof(double));
-    C->snow = (double *)calloc(N, sizeof(double));
-    C->precipitation = (double *)calloc(N, sizeof(double));
-    C->next_surface = (double *)calloc(N, sizeof(double));
-    C->next_air = (double *)calloc(N, sizeof(double));
-    uint8_t status = (uint8_t)((C->cells == NULL) || (C->latitudes == NULL) || (C->east == NULL) || (C->north == NULL) || (C->neighbour_distances == NULL)
-        || (C->neighbour_directions == NULL) || (C->edges == NULL) || (C->edge_lengths == NULL) || (C->edge_directions == NULL) || (C->edge_flux == NULL)
-        || (C->is_ocean == NULL) || (C->flood_ranks == NULL) || (C->receivers == NULL) || (C->depressions == NULL) || (C->destinations == NULL)
-        || (C->depression_sinks == NULL) || (C->depression_outlets == NULL) || (C->depression_destinations == NULL)
-        || (C->depression_capacities_cubic_metres == NULL) || (C->downhill_order == NULL) || (C->receiver_distances == NULL) || (C->mass == NULL) || (C->outflow == NULL) || (C->evaporation == NULL) || (C->rain == NULL)
-        || (C->snow == NULL) || (C->precipitation == NULL) || (C->next_surface == NULL) || (C->next_air == NULL));
+    size_t edges_capacity = 1;
+    if(edges > 0) {
+        edges_capacity = edges;
+    } else {
+        edges_capacity = 1;
+    }
+    C->cells = (WeatherCell *)malloc(N * sizeof(WeatherCell));
+    C->latitudes = (double *)malloc(N * sizeof(double));
+    C->east = (double (*)[TOTAL_SPATIAL_AXES])malloc(N * TOTAL_SPATIAL_AXES * sizeof(double));
+    C->north = (double (*)[TOTAL_SPATIAL_AXES])malloc(N * TOTAL_SPATIAL_AXES * sizeof(double));
+    C->neighbour_distances = (double *)malloc(N * MAXIMUM_VERTEX_NEIGHBORS * sizeof(double));
+    C->neighbour_directions = (double (*)[TOTAL_SPATIAL_AXES])malloc(N * MAXIMUM_VERTEX_NEIGHBORS * TOTAL_SPATIAL_AXES * sizeof(double));
+    C->edges = (size_t (*)[2])malloc(edges_capacity * 2 * sizeof(size_t));
+    C->edge_lengths = (double *)malloc(edges_capacity * sizeof(double));
+    C->edge_directions = (double (*)[TOTAL_SPATIAL_AXES])malloc(edges_capacity * TOTAL_SPATIAL_AXES * sizeof(double));
+    C->edge_flux = (double *)malloc(edges_capacity * sizeof(double));
+    C->is_ocean = (uint8_t *)malloc(N * sizeof(uint8_t));
+    C->flood_ranks = (size_t *)malloc(N * sizeof(size_t));
+    C->receivers = (size_t *)malloc(N * sizeof(size_t));
+    C->depressions = (size_t *)malloc(N * sizeof(size_t));
+    C->destinations = (size_t *)malloc(N * sizeof(size_t));
+    C->depression_sinks = (size_t *)malloc(N * sizeof(size_t));
+    C->depression_outlets = (size_t *)malloc(N * sizeof(size_t));
+    C->depression_destinations = (size_t *)malloc(N * sizeof(size_t));
+    C->depression_capacities_cubic_metres = (double *)malloc(N * sizeof(double));
+    C->downhill_order = (size_t *)malloc(N * sizeof(size_t));
+    C->receiver_distances = (double *)malloc(N * sizeof(double));
+    C->mass = (double *)malloc(N * sizeof(double));
+    C->outflow = (double *)malloc(N * sizeof(double));
+    C->evaporation = (double *)malloc(N * sizeof(double));
+    C->rain = (double *)malloc(N * sizeof(double));
+    C->snow = (double *)malloc(N * sizeof(double));
+    C->precipitation = (double *)malloc(N * sizeof(double));
+    C->next_surface = (double *)malloc(N * sizeof(double));
+    C->next_air = (double *)malloc(N * sizeof(double));
+    uint8_t is_missing = (uint8_t)((C->cells == NULL) || (C->latitudes == NULL) || (C->east == NULL) || (C->north == NULL));
+    is_missing = (uint8_t)((is_missing == 1) || (C->neighbour_distances == NULL) || (C->neighbour_directions == NULL) || (C->edges == NULL));
+    is_missing = (uint8_t)((is_missing == 1) || (C->edge_lengths == NULL) || (C->edge_directions == NULL) || (C->edge_flux == NULL));
+    is_missing = (uint8_t)((is_missing == 1) || (C->is_ocean == NULL) || (C->flood_ranks == NULL) || (C->receivers == NULL));
+    is_missing = (uint8_t)((is_missing == 1) || (C->depressions == NULL) || (C->destinations == NULL) || (C->depression_sinks == NULL));
+    is_missing = (uint8_t)((is_missing == 1) || (C->depression_outlets == NULL) || (C->depression_destinations == NULL));
+    is_missing = (uint8_t)((is_missing == 1) || (C->depression_capacities_cubic_metres == NULL) || (C->downhill_order == NULL));
+    is_missing = (uint8_t)((is_missing == 1) || (C->receiver_distances == NULL) || (C->mass == NULL) || (C->outflow == NULL));
+    is_missing = (uint8_t)((is_missing == 1) || (C->evaporation == NULL) || (C->rain == NULL) || (C->snow == NULL));
+    is_missing = (uint8_t)((is_missing == 1) || (C->precipitation == NULL) || (C->next_surface == NULL) || (C->next_air == NULL));
+    uint8_t status = is_missing;
     if(status != 0) {
         climate_destroy(C);
         return 1;
     }
+    bytes_clear((uint8_t *)C->cells, N * sizeof(WeatherCell));
+    bytes_clear((uint8_t *)C->latitudes, N * sizeof(double));
+    bytes_clear((uint8_t *)C->east, N * TOTAL_SPATIAL_AXES * sizeof(double));
+    bytes_clear((uint8_t *)C->north, N * TOTAL_SPATIAL_AXES * sizeof(double));
+    bytes_clear((uint8_t *)C->neighbour_distances, N * MAXIMUM_VERTEX_NEIGHBORS * sizeof(double));
+    bytes_clear((uint8_t *)C->neighbour_directions, N * MAXIMUM_VERTEX_NEIGHBORS * TOTAL_SPATIAL_AXES * sizeof(double));
+    bytes_clear((uint8_t *)C->edges, edges_capacity * 2 * sizeof(size_t));
+    bytes_clear((uint8_t *)C->edge_lengths, edges_capacity * sizeof(double));
+    bytes_clear((uint8_t *)C->edge_directions, edges_capacity * TOTAL_SPATIAL_AXES * sizeof(double));
+    bytes_clear((uint8_t *)C->edge_flux, edges_capacity * sizeof(double));
+    bytes_clear((uint8_t *)C->is_ocean, N * sizeof(uint8_t));
+    bytes_clear((uint8_t *)C->flood_ranks, N * sizeof(size_t));
+    bytes_clear((uint8_t *)C->receivers, N * sizeof(size_t));
+    bytes_clear((uint8_t *)C->depressions, N * sizeof(size_t));
+    bytes_clear((uint8_t *)C->destinations, N * sizeof(size_t));
+    bytes_clear((uint8_t *)C->depression_sinks, N * sizeof(size_t));
+    bytes_clear((uint8_t *)C->depression_outlets, N * sizeof(size_t));
+    bytes_clear((uint8_t *)C->depression_destinations, N * sizeof(size_t));
+    bytes_clear((uint8_t *)C->depression_capacities_cubic_metres, N * sizeof(double));
+    bytes_clear((uint8_t *)C->downhill_order, N * sizeof(size_t));
+    bytes_clear((uint8_t *)C->receiver_distances, N * sizeof(double));
+    bytes_clear((uint8_t *)C->mass, N * sizeof(double));
+    bytes_clear((uint8_t *)C->outflow, N * sizeof(double));
+    bytes_clear((uint8_t *)C->evaporation, N * sizeof(double));
+    bytes_clear((uint8_t *)C->rain, N * sizeof(double));
+    bytes_clear((uint8_t *)C->snow, N * sizeof(double));
+    bytes_clear((uint8_t *)C->precipitation, N * sizeof(double));
+    bytes_clear((uint8_t *)C->next_surface, N * sizeof(double));
+    bytes_clear((uint8_t *)C->next_air, N * sizeof(double));
     if(C->settings.seed == 0) {
-        C->settings.seed = geology_hash(planet->seed, GEOLOGY_KIND_WEATHER_SEED, 0, 0, 0) | UINT64_C(1);
+        uint64_t hash = geology_hash(planet->seed, GEOLOGY_KIND_WEATHER_SEED, 0, 0, 0);
+        C->settings.seed = bits_or(hash, 1);
     }
     uint8_t table[256];
     for(size_t i = 0; i < 256; i++) {
         table[i] = (uint8_t)i;
     }
-    for(size_t i = 255; i > 0; i--) {
-        size_t j = (size_t)(geology_uniform(geology_hash(C->settings.seed, GEOLOGY_KIND_WEATHER_NOISE, i, 0, 0)) * (double)(i + 1));
-        if(j > i) {
-            j = i;
+    for(size_t lower_index = 255; lower_index-- > 0;) {
+        size_t upper_index = lower_index + 1;
+        uint64_t noise_hash = geology_hash(C->settings.seed, GEOLOGY_KIND_WEATHER_NOISE, upper_index, 0, 0);
+        size_t j = (size_t)(geology_uniform(noise_hash) * (double)(upper_index + 1));
+        if(j > upper_index) {
+            j = upper_index;
         }
-        uint8_t swap = table[i];
-        table[i] = table[j];
+        uint8_t swap = table[upper_index];
+        table[upper_index] = table[j];
         table[j] = swap;
     }
     for(size_t i = 0; i < TERRAIN_PERMUTATION_LENGTH; i++) {
-        C->permutation[i] = table[i & 255];
+        C->permutation[i] = table[i % CLIMATE_NOISE_TABLE_LENGTH];
     }
     size_t edge = 0;
     for(size_t v = 0; v < N; v++) {
@@ -17890,54 +20311,65 @@ uint8_t planet_climate_create(Planet *planet, const WeatherSettings *settings) {
         C->north[v][2] = (P[0] * C->east[v][1]) - (P[1] * C->east[v][0]);
         for(size_t k = 0; k < planet->total_neighbors[v]; k++) {
             size_t w = planet->neighbor_indices[(v * MAXIMUM_VERTEX_NEIGHBORS) + k];
-            if(w >= N) {
-                continue;
-            }
-            const double *Q = planet->vertex_positions[w];
-            double direction[TOTAL_SPATIAL_AXES];
-            double radial = 0.0;
-            for(size_t axis = 0; axis < TOTAL_SPATIAL_AXES; axis++) {
-                direction[axis] = Q[axis] - P[axis];
-                radial = radial + (direction[axis] * P[axis]);
-            }
-            double norm = 0.0;
-            for(size_t axis = 0; axis < TOTAL_SPATIAL_AXES; axis++) {
-                direction[axis] = direction[axis] - (radial * P[axis]);
-                norm = norm + (direction[axis] * direction[axis]);
-            }
-            norm = square_root_double(norm);
-            for(size_t axis = 0; axis < TOTAL_SPATIAL_AXES; axis++) {
-                C->neighbour_directions[(v * MAXIMUM_VERTEX_NEIGHBORS) + k][axis] = (norm > 0.0) ? (direction[axis] / norm) : 0.0;
-            }
-            double distance = terrain_angle(P, Q) * planet->radius_metres;
-            C->neighbour_distances[(v * MAXIMUM_VERTEX_NEIGHBORS) + k] = (distance > 0.0) ? distance : 1.0;
-            if(w > v) {
-                double middle[TOTAL_SPATIAL_AXES];
-                double length = 0.0;
+            if(w < N) {
+                const double *Q = planet->vertex_positions[w];
+                double direction[TOTAL_SPATIAL_AXES];
+                double radial = 0.0;
                 for(size_t axis = 0; axis < TOTAL_SPATIAL_AXES; axis++) {
-                    middle[axis] = P[axis] + Q[axis];
-                    length = length + (middle[axis] * middle[axis]);
-                }
-                length = square_root_double(length);
-                double along = 0.0;
-                for(size_t axis = 0; axis < TOTAL_SPATIAL_AXES; axis++) {
-                    middle[axis] = middle[axis] / length;
                     direction[axis] = Q[axis] - P[axis];
-                    along = along + (direction[axis] * middle[axis]);
+                    radial = radial + (direction[axis] * P[axis]);
                 }
-                double size = 0.0;
+                double norm = 0.0;
                 for(size_t axis = 0; axis < TOTAL_SPATIAL_AXES; axis++) {
-                    direction[axis] = direction[axis] - (along * middle[axis]);
-                    size = size + (direction[axis] * direction[axis]);
+                    direction[axis] = direction[axis] - (radial * P[axis]);
+                    norm = norm + (direction[axis] * direction[axis]);
                 }
-                size = square_root_double(size);
-                C->edges[edge][0] = v;
-                C->edges[edge][1] = w;
-                C->edge_lengths[edge] = C->neighbour_distances[(v * MAXIMUM_VERTEX_NEIGHBORS) + k];
+                norm = square_root_double(norm);
                 for(size_t axis = 0; axis < TOTAL_SPATIAL_AXES; axis++) {
-                    C->edge_directions[edge][axis] = (size > 0.0) ? (direction[axis] / size) : 0.0;
+                    if(norm > 0.0) {
+                        C->neighbour_directions[(v * MAXIMUM_VERTEX_NEIGHBORS) + k][axis] = direction[axis] / norm;
+                    } else {
+                        C->neighbour_directions[(v * MAXIMUM_VERTEX_NEIGHBORS) + k][axis] = 0.0;
+                    }
                 }
-                edge = edge + 1;
+                double distance = terrain_angle(P, Q) * planet->radius_metres;
+                if(distance > 0.0) {
+                    C->neighbour_distances[(v * MAXIMUM_VERTEX_NEIGHBORS) + k] = distance;
+                } else {
+                    C->neighbour_distances[(v * MAXIMUM_VERTEX_NEIGHBORS) + k] = 1.0;
+                }
+                if(w > v) {
+                    double middle[TOTAL_SPATIAL_AXES];
+                    double length = 0.0;
+                    for(size_t axis = 0; axis < TOTAL_SPATIAL_AXES; axis++) {
+                        middle[axis] = P[axis] + Q[axis];
+                        length = length + (middle[axis] * middle[axis]);
+                    }
+                    length = square_root_double(length);
+                    double along = 0.0;
+                    for(size_t axis = 0; axis < TOTAL_SPATIAL_AXES; axis++) {
+                        middle[axis] = middle[axis] / length;
+                        direction[axis] = Q[axis] - P[axis];
+                        along = along + (direction[axis] * middle[axis]);
+                    }
+                    double size = 0.0;
+                    for(size_t axis = 0; axis < TOTAL_SPATIAL_AXES; axis++) {
+                        direction[axis] = direction[axis] - (along * middle[axis]);
+                        size = size + (direction[axis] * direction[axis]);
+                    }
+                    size = square_root_double(size);
+                    C->edges[edge][0] = v;
+                    C->edges[edge][1] = w;
+                    C->edge_lengths[edge] = C->neighbour_distances[(v * MAXIMUM_VERTEX_NEIGHBORS) + k];
+                    for(size_t axis = 0; axis < TOTAL_SPATIAL_AXES; axis++) {
+                        if(size > 0.0) {
+                            C->edge_directions[edge][axis] = direction[axis] / size;
+                        } else {
+                            C->edge_directions[edge][axis] = 0.0;
+                        }
+                    }
+                    edge = edge + 1;
+                }
             }
         }
     }
@@ -17947,8 +20379,14 @@ uint8_t planet_climate_create(Planet *planet, const WeatherSettings *settings) {
         climate_initialise_state(planet, C);
         double step = C->settings.spin_up_step_days;
         if(step > 0.0) {
-            for(double t = -C->settings.spin_up_days; (t < -1e-9) && (status == 0); t = t + step) {
+            double t = -C->settings.spin_up_days;
+            for(size_t step_index = 0; step_index < MAXIMUM_CLIMATE_SPIN_UP_STEPS; step_index++) {
+                const uint8_t IS_SPINNING_UP = (uint8_t)((t < -1e-9) && (status == 0));
+                if(IS_SPINNING_UP == 0) {
+                    break;
+                }
                 status = climate_step(planet, planet->current_time_days + t, step, 1);
+                t = t + step;
             }
         }
     }
@@ -17966,6 +20404,8 @@ uint8_t planet_climate_create(Planet *planet, const WeatherSettings *settings) {
     return status;
 }
 
+#define MAXIMUM_CLIMATE_ADVANCE_STEPS 100000000
+
 uint8_t planet_climate_advance(Planet *planet, double until) {
     Climate *C = planet->climate;
     uint8_t status = 0;
@@ -17973,7 +20413,14 @@ uint8_t planet_climate_advance(Planet *planet, double until) {
     if(C == NULL) {
         return 0;
     }
-    while((status == 0) && ((C->time_days + C->settings.step_days) <= (until + 1e-9))) {
+    for(size_t step_index = 0; step_index < MAXIMUM_CLIMATE_ADVANCE_STEPS; step_index++) {
+        if(status != 0) {
+            break;
+        }
+        const uint8_t IS_DUE = (uint8_t)((C->time_days + C->settings.step_days) <= (until + 1e-9));
+        if(IS_DUE == 0) {
+            break;
+        }
         status = climate_step(planet, C->time_days, C->settings.step_days, 0);
         C->time_days = C->time_days + C->settings.step_days;
         has_stepped = 1;
@@ -17996,7 +20443,9 @@ double planet_water_inventory_kilograms(const Planet *planet) {
         }
         if(planet->climate != NULL) {
             const WeatherCell *cell = &planet->climate->cells[v];
-            total = total + (vertex->area_square_metres * (cell->precipitable_water_kilograms + cell->snow_water_kilograms + cell->ponded_water_kilograms + cell->river_water_kilograms));
+            double vapour_and_snow = cell->precipitable_water_kilograms + cell->snow_water_kilograms;
+            double column = vapour_and_snow + cell->ponded_water_kilograms + cell->river_water_kilograms;
+            total = total + (vertex->area_square_metres * column);
         }
     }
     if(planet->climate != NULL) {
@@ -18013,7 +20462,12 @@ void planet_climate_report(const Planet *planet, FILE *stream) {
         return;
     }
     const size_t BANDS = 9;
-    double area[9] = {0}, temperature[9] = {0}, rain[9] = {0}, east[9] = {0}, snow[9] = {0}, cloud[9] = {0};
+    double area[9] = {0};
+    double temperature[9] = {0};
+    double rain[9] = {0};
+    double east[9] = {0};
+    double snow[9] = {0};
+    double cloud[9] = {0};
     size_t lakes = 0;
     for(size_t v = 0; v < planet->vertices_length; v++) {
         const WeatherCell *cell = &C->cells[v];
@@ -18029,15 +20483,42 @@ void planet_climate_report(const Planet *planet, FILE *stream) {
             lakes = lakes + 1;
         }
     }
-    fprintf(stream, "day %.2f  lakes %zu  basins %zu\n", C->time_days, lakes, C->total_depressions);
+    fprintf(stream, "day %.2f  lakes %lu  basins %lu\n", C->time_days, (unsigned long)lakes, (unsigned long)C->total_depressions);
     fprintf(stream, "  latitude      T_C   precip_mm_d   wind_east_m_s   snow_kg_m2   cloud\n");
     for(size_t b = BANDS; b-- > 0;) {
         if(area[b] > 0.0) {
-            fprintf(stream, "  %4.0f..%-4.0f %7.1f %13.2f %15.1f %12.1f %7.2f\n", (20.0 * (double)b) - 90.0, (20.0 * (double)b) - 70.0,
-                (temperature[b] / area[b]) - CELSIUS_OFFSET_KELVIN, rain[b] / area[b], east[b] / area[b], snow[b] / area[b], cloud[b] / area[b]);
+            double lowest_degrees = (20.0 * (double)b) - 90.0;
+            double highest_degrees = (20.0 * (double)b) - 70.0;
+            double celsius = (temperature[b] / area[b]) - CELSIUS_OFFSET_KELVIN;
+            double mean_rain = rain[b] / area[b];
+            double mean_east = east[b] / area[b];
+            double mean_snow = snow[b] / area[b];
+            double mean_cloud = cloud[b] / area[b];
+            fprintf(stream, "  %4.0f..%-4.0f", lowest_degrees, highest_degrees);
+            fprintf(stream, " %7.1f %13.2f %15.1f %12.1f %7.2f\n", celsius, mean_rain, mean_east, mean_snow, mean_cloud);
         }
     }
 }
+
+
+/*
+ * ToC02100 AnimalsAndPlants
+ *
+ * Purpose:    Animal cohorts of eleven aquatic and terrestrial types and the plant cohorts: feeding with a saturating
+ *             functional response, respiration, hazards, demography, plant production, resprouting and litter.
+ * Depends:    WorldEntities (plant tables, AnimalCohort, PlantCohort), Planet, pool transfers and CandidateList,
+ *             chemistry queries (planet_location_concentration, planet_location_ph), Physics temperatures.
+ * API:        animal_settings_create, planet_add_animal_cohort, planet_add_animal_candidates, planet_add_plant_candidates,
+ *             planet_remove_animal, planet_apply_animal_demography, plant_locations, the animal_biomass, animal_condition,
+ *             animal_hazard, animal_is_adult, animal_space and animal_net_change_mol_carbon_per_day queries, and the
+ *             transfer_add_*_oxidation helpers
+ * Ownership:  Cohorts live in planet->animals and planet->plants. planet_add_animal_cohort grows planet->animals by
+ *             doubling; the candidate functions only append transfers to the caller's CandidateList.
+ * Invariants: animals_length <= animals_capacity. Each candidate transfer books carbon, nitrogen, phosphorus,
+ *             sulfur and electrons removed from one pool into food, detritus, oxidation products or nutrients.
+ * Errors:     uint8_t status, 0 on success; non-zero when an allocation, a transfer or a candidate append fails.
+ *             planet_add_animal_cohort returns SIZE_MAX when planet->animals cannot grow.
+ */
 
 #define TOTAL_ANIMAL_TYPES 11
 #define TOTAL_ANIMAL_HAZARDS 8
@@ -18048,19 +20529,23 @@ void planet_climate_report(const Planet *planet, FILE *stream) {
 #define HABITAT_WATER 0
 #define HABITAT_LAND 1
 
-const uint8_t ANIMAL_HABITATS[TOTAL_ANIMAL_TYPES] = {HABITAT_WATER, HABITAT_WATER, HABITAT_WATER, HABITAT_WATER, HABITAT_WATER, HABITAT_WATER,
-    HABITAT_LAND, HABITAT_LAND, HABITAT_LAND, HABITAT_LAND, HABITAT_LAND};
+const uint8_t ANIMAL_HABITATS[TOTAL_ANIMAL_TYPES] = {
+    HABITAT_WATER, HABITAT_WATER, HABITAT_WATER, HABITAT_WATER, HABITAT_WATER, HABITAT_WATER,
+    HABITAT_LAND, HABITAT_LAND, HABITAT_LAND, HABITAT_LAND, HABITAT_LAND
+};
 const uint8_t ANIMAL_IS_ENDOTHERM[TOTAL_ANIMAL_TYPES] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1};
 const double ANIMAL_INDIVIDUAL_MASSES[TOTAL_ANIMAL_TYPES] = {4e-6, 4e-7, 8e-10, 8e-12, 0.1, 10.0, 5e-3, 1e-3, 3.0, 1500.0, 500.0};
-const double ANIMAL_CLEARANCES[TOTAL_ANIMAL_TYPES] = {0.096, 0.0024, 2.4e-5, 1e-6, 5000.0, 5e5, 0.02, 0.5, 200.0, 1e4, 1e5};
+const double ANIMAL_CLEARANCES[TOTAL_ANIMAL_TYPES] = {0.15, 0.0024, 2e-4, 1e-5, 5000.0, 5e5, 0.02, 0.5, 200.0, 1e4, 1e5};
 const double ANIMAL_MAXIMUM_INGESTIONS[TOTAL_ANIMAL_TYPES] = {1.5, 2.0, 4.0, 6.0, 0.15, 0.08, 0.5, 1.0, 0.3, 0.05, 0.08};
-const double ANIMAL_RESPIRATIONS[TOTAL_ANIMAL_TYPES] = {0.15, 0.25, 0.5, 1.0, 0.04, 0.02, 0.05, 0.1, 0.08, 0.02, 0.025};
+const double ANIMAL_RESPIRATIONS[TOTAL_ANIMAL_TYPES] = {0.08, 0.25, 0.15, 0.3, 0.04, 0.02, 0.05, 0.1, 0.08, 0.02, 0.025};
 const double ANIMAL_FEEDING_CENTRES[TOTAL_ANIMAL_TYPES] = {-12.0, -12.5, -14.7, -14.7, -5.4, -1.0, -11.0, -3.0, -3.0, 3.2, 3.2};
 const double ANIMAL_FEEDING_WIDTHS[TOTAL_ANIMAL_TYPES] = {1.5, 1.5, 1.0, 1.0, 1.0, 0.8, 1.0, 1.0, 1.0, 1.0, 0.5};
-const double ANIMAL_BACKGROUND_MORTALITIES[TOTAL_ANIMAL_TYPES] = {0.02, 0.03, 0.1, 0.1, 0.002, 0.0005, 0.005, 0.02, 0.003, 0.0003, 0.0003};
+const double ANIMAL_BACKGROUND_MORTALITIES[TOTAL_ANIMAL_TYPES] = {0.02, 0.03, 0.05, 0.05, 0.002, 0.0005, 0.005, 0.02, 0.003, 0.0003, 0.0003};
 const double ANIMAL_CHITIN_SHEDDING[TOTAL_ANIMAL_TYPES] = {0.01, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.005, 0.0, 0.0, 0.0};
 const uint8_t ANIMAL_MAKES_RESTING_EGGS[TOTAL_ANIMAL_TYPES] = {1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-const size_t ANIMAL_RESTING_CLASSES[TOTAL_ANIMAL_TYPES] = {ORGANIC_PARTICULATE_RESTING_STAGES, ORGANIC_PARTICULATE_RESTING_STAGES_SMALL, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+const size_t ANIMAL_RESTING_CLASSES[TOTAL_ANIMAL_TYPES] = {
+    ORGANIC_PARTICULATE_RESTING_STAGES, ORGANIC_PARTICULATE_RESTING_STAGES_SMALL, 0, 0, 0, 0, 0, 0, 0, 0, 0
+};
 const double HATCHING_RATE_PER_DAY = 0.05;
 const double HATCHING_FOOD_HALF_SATURATION = 1e-6;
 const double HATCHING_LOWEST_KELVIN = 278.15;
@@ -18111,10 +20596,12 @@ typedef struct {
     double hazard_h0;
     double hazard_k;
     double q10;
+    uint8_t is_hazard_onset_smooth;
 } AnimalSettings;
 
 void animal_settings_create(AnimalSettings *settings) {
-    settings->hazard_h0 = 0.5;
+    settings->hazard_h0 = 0.05;
+    settings->is_hazard_onset_smooth = 1;
     settings->hazard_k = 5.0;
     settings->q10 = 2.0;
 }
@@ -18235,7 +20722,13 @@ double animal_hazard(const Planet *planet, const AnimalCohort *animal, const Ani
     const double TEMPERATURE = animal_temperature_kelvin(planet, &location, T);
     const double COLD = ANIMAL_LOWEST_KELVIN[T] - TEMPERATURE;
     const double HEAT = TEMPERATURE - ANIMAL_HIGHEST_KELVIN[T];
-    excesses[ANIMAL_HAZARD_TEMPERATURE] = ((COLD > HEAT) ? COLD : HEAT) / ANIMAL_TEMPERATURE_HAZARD_SCALE_KELVIN;
+    double worst = HEAT;
+    if(COLD > HEAT) {
+        worst = COLD;
+    } else {
+        worst = HEAT;
+    }
+    excesses[ANIMAL_HAZARD_TEMPERATURE] = worst / ANIMAL_TEMPERATURE_HAZARD_SCALE_KELVIN;
     excesses[ANIMAL_HAZARD_STARVATION] = (ANIMAL_STARVATION_CONDITION - animal_condition(animal)) / ANIMAL_STARVATION_SCALE;
     if((ANIMAL_HABITATS[T] == HABITAT_LAND) && (planet->vertices[animal->vertex_index].water_layers_length > 0)) {
         excesses[ANIMAL_HAZARD_STARVATION] = 1.0;
@@ -18246,14 +20739,25 @@ double animal_hazard(const Planet *planet, const AnimalCohort *animal, const Ani
     for(size_t i = 1; i < TOTAL_ANIMAL_HAZARDS; i++) {
         hazards[i] = 0.0;
         if(excesses[i] > 0.0) {
-            hazards[i] = settings->hazard_h0 * exponential_double(settings->hazard_k * excesses[i]);
+            const double GROWTH = exponential_double(settings->hazard_k * excesses[i]);
+            hazards[i] = settings->hazard_h0 * GROWTH;
+            if(settings->is_hazard_onset_smooth == 1) {
+                hazards[i] = settings->hazard_h0 * (GROWTH - 1.0);
+            }
         }
         total = total + hazards[i];
         if(hazards[i] > hazards[*cause]) {
             *cause = (uint8_t)i;
         }
     }
-    if((*cause == ANIMAL_HAZARD_BACKGROUND) && ((animal->food_shortage_days > STARVATION_DAYS_FOR_RESTING_EGGS) || (animal_condition(animal) < ANIMAL_STARVATION_CONDITION))) {
+    uint8_t is_starving = (uint8_t)(*cause == ANIMAL_HAZARD_BACKGROUND);
+    if(is_starving == 1) {
+        is_starving = (uint8_t)(animal->food_shortage_days > STARVATION_DAYS_FOR_RESTING_EGGS);
+        if(is_starving == 0) {
+            is_starving = (uint8_t)(animal_condition(animal) < ANIMAL_STARVATION_CONDITION);
+        }
+    }
+    if(is_starving == 1) {
         *cause = (uint8_t)ANIMAL_HAZARD_STARVATION;
     }
     return total;
@@ -18277,16 +20781,14 @@ uint8_t transfer_add_air_oxidation(Transfer *transfer, const Location *location,
     return (uint8_t)(status != 0);
 }
 
-uint8_t transfer_add_animal_oxidation(Transfer *transfer, const Location *location, size_t type, double carbon, double nitrogen, double phosphorus, double sulfur,
-    double electrons) {
+uint8_t transfer_add_animal_oxidation(Transfer *transfer, const Location *location, size_t type, double carbon, double nitrogen, double phosphorus, double sulfur, double electrons) {
     if(ANIMAL_HABITATS[type] == HABITAT_LAND) {
         return transfer_add_air_oxidation(transfer, location, carbon, nitrogen, phosphorus, sulfur, electrons);
     }
     return transfer_add_body_oxidation(transfer, location, carbon, nitrogen, phosphorus, sulfur, electrons);
 }
 
-uint8_t animal_add_eating(const Planet *planet, CandidateList *list, size_t animal_index, uint8_t prey_kind, size_t prey_index, double ingestion, size_t process,
-    double *surplus, double *grown) {
+uint8_t animal_add_eating(const Planet *planet, CandidateList *list, size_t animal_index, uint8_t prey_kind, size_t prey_index, double ingestion, size_t process, double *surplus, double *grown) {
     const AnimalCohort *animal = &planet->animals[animal_index];
     const double *B = animal->composition;
     const double *P = NULL;
@@ -18323,9 +20825,13 @@ uint8_t animal_add_eating(const Planet *planet, CandidateList *list, size_t anim
     *grown = *grown + growth;
     transfer_add_organic(&transfer, &location, ORGANIC_PARTICULATE_FAECAL_PELLETS, ingestion - ASSIMILATED, P);
     transfer_add_animal(&transfer, animal_index, growth, B);
-    transfer_add_animal_oxidation(&transfer, &location, animal->animal_type_index, ASSIMILATED - growth,
-        (ASSIMILATED * P[COMPONENT_NITROGEN]) - (growth * B[COMPONENT_NITROGEN]), (ASSIMILATED * P[COMPONENT_PHOSPHORUS]) - (growth * B[COMPONENT_PHOSPHORUS]),
-        (ASSIMILATED * P[COMPONENT_SULFUR]) - (growth * B[COMPONENT_SULFUR]), (ASSIMILATED * P[COMPONENT_ELECTRON]) - (growth * B[COMPONENT_ELECTRON]));
+    double excess_nitrogen = (ASSIMILATED * P[COMPONENT_NITROGEN]) - (growth * B[COMPONENT_NITROGEN]);
+    double excess_phosphorus = (ASSIMILATED * P[COMPONENT_PHOSPHORUS]) - (growth * B[COMPONENT_PHOSPHORUS]);
+    double excess_sulfur = (ASSIMILATED * P[COMPONENT_SULFUR]) - (growth * B[COMPONENT_SULFUR]);
+    double excess_electrons = (ASSIMILATED * P[COMPONENT_ELECTRON]) - (growth * B[COMPONENT_ELECTRON]);
+    double excess_carbon = ASSIMILATED - growth;
+    size_t type = animal->animal_type_index;
+    transfer_add_animal_oxidation(&transfer, &location, type, excess_carbon, excess_nitrogen, excess_phosphorus, excess_sulfur, excess_electrons);
     return candidate_list_append(list, &transfer);
 }
 
@@ -18342,11 +20848,17 @@ uint8_t animal_add_body_losses(const Planet *planet, CandidateList *list, size_t
     double burned = respiration * BIOMASS;
     transfer_create(&transfer, process);
     transfer_add_animal(&transfer, animal_index, -(burned + SHED + ((hazard + resting) * BIOMASS)), NULL);
-    transfer_add_animal_oxidation(&transfer, &location, T, burned, burned * B[COMPONENT_NITROGEN], burned * B[COMPONENT_PHOSPHORUS], burned * B[COMPONENT_SULFUR],
-        burned * B[COMPONENT_ELECTRON]);
+    double burned_nitrogen = burned * B[COMPONENT_NITROGEN];
+    double burned_phosphorus = burned * B[COMPONENT_PHOSPHORUS];
+    double burned_sulfur = burned * B[COMPONENT_SULFUR];
+    double burned_electrons = burned * B[COMPONENT_ELECTRON];
+    transfer_add_animal_oxidation(&transfer, &location, T, burned, burned_nitrogen, burned_phosphorus, burned_sulfur, burned_electrons);
     transfer_add_organic(&transfer, &location, ORGANIC_PARTICULATE_CHITIN, SHED, CHITIN);
-    transfer_add_animal_oxidation(&transfer, &location, T, 0.0, SHED * (B[COMPONENT_NITROGEN] - CHITIN[COMPONENT_NITROGEN]), SHED * B[COMPONENT_PHOSPHORUS],
-        SHED * B[COMPONENT_SULFUR], SHED * (B[COMPONENT_ELECTRON] - CHITIN[COMPONENT_ELECTRON]));
+    double shed_nitrogen = SHED * (B[COMPONENT_NITROGEN] - CHITIN[COMPONENT_NITROGEN]);
+    double shed_phosphorus = SHED * B[COMPONENT_PHOSPHORUS];
+    double shed_sulfur = SHED * B[COMPONENT_SULFUR];
+    double shed_electrons = SHED * (B[COMPONENT_ELECTRON] - CHITIN[COMPONENT_ELECTRON]);
+    transfer_add_animal_oxidation(&transfer, &location, T, 0.0, shed_nitrogen, shed_phosphorus, shed_sulfur, shed_electrons);
     transfer_add_organic(&transfer, &location, ORGANIC_PARTICULATE_LABILE_DETRITUS, hazard * BIOMASS, B);
     transfer_add_organic(&transfer, &location, ANIMAL_RESTING_CLASSES[T], resting * BIOMASS, B);
     return candidate_list_append(list, &transfer);
@@ -18365,7 +20877,13 @@ uint8_t animal_can_reach_plant(const Planet *planet, const AnimalCohort *animal,
     if((ANIMAL_HABITATS[T] != HABITAT_WATER) || (animal->location_kind != LOCATION_WATER) || (LAYERS == 0)) {
         return 0;
     }
-    return (uint8_t)((TYPE == PLANT_KELP) ? (animal->layer_index == 0) : ((animal->layer_index + 1) == LAYERS));
+    uint8_t is_reachable = 0;
+    if(TYPE == PLANT_KELP) {
+        is_reachable = (uint8_t)(animal->layer_index == 0);
+    } else {
+        is_reachable = (uint8_t)((animal->layer_index + 1) == LAYERS);
+    }
+    return is_reachable;
 }
 
 double animal_prey_kernel(const AnimalCohort *animal, double prey_mass) {
@@ -18378,8 +20896,9 @@ double animal_type_density(const Planet *planet, const Location *location, size_
     double total = 0.0;
     for(size_t a = 0; a < planet->animals_length; a++) {
         const AnimalCohort *OTHER = &planet->animals[a];
-        if((OTHER->animal_type_index == type_index) && (OTHER->vertex_index == location->vertex_index) && (OTHER->location_kind == location->kind)
-            && (OTHER->layer_index == location->layer_index)) {
+        uint8_t is_same = (uint8_t)((OTHER->animal_type_index == type_index) && (OTHER->vertex_index == location->vertex_index));
+        is_same = (uint8_t)((is_same == 1) && (OTHER->location_kind == location->kind) && (OTHER->layer_index == location->layer_index));
+        if(is_same == 1) {
             total = total + OTHER->individual_count;
         }
     }
@@ -18387,8 +20906,9 @@ double animal_type_density(const Planet *planet, const Location *location, size_
 }
 
 uint8_t animal_is_prey(const AnimalCohort *animal, const AnimalCohort *prey) {
-    return (uint8_t)((prey != animal) && (prey->vertex_index == animal->vertex_index) && (prey->location_kind == animal->location_kind)
-        && (prey->layer_index == animal->layer_index) && (animal_biomass(prey) > 0.0));
+    uint8_t is_prey = (uint8_t)((prey != animal) && (prey->vertex_index == animal->vertex_index) && (prey->location_kind == animal->location_kind));
+    is_prey = (uint8_t)((is_prey == 1) && (prey->layer_index == animal->layer_index) && (animal_biomass(prey) > 0.0));
+    return is_prey;
 }
 
 double animal_food_weight(const Planet *planet, const AnimalCohort *animal, uint8_t prey_kind, size_t prey_index) {
@@ -18403,7 +20923,11 @@ double animal_food_weight(const Planet *planet, const AnimalCohort *animal, uint
             weight = weight * ANIMAL_CANNIBALISM[T];
         }
     } else if((prey_kind == 2) && (DETRITUS_PARTICLE_MASSES_MOL_CARBON[prey_index] > 0.0)) {
-        weight = (ANIMAL_HABITATS[T] == HABITAT_LAND) ? ANIMAL_DETRITUS_PREFERENCES[T] : animal_prey_kernel(animal, DETRITUS_PARTICLE_MASSES_MOL_CARBON[prey_index]);
+        if(ANIMAL_HABITATS[T] == HABITAT_LAND) {
+            weight = ANIMAL_DETRITUS_PREFERENCES[T];
+        } else {
+            weight = animal_prey_kernel(animal, DETRITUS_PARTICLE_MASSES_MOL_CARBON[prey_index]);
+        }
     } else if((prey_kind == 3) && (animal_can_reach_plant(planet, animal, &planet->plants[prey_index]) == 1)) {
         weight = ANIMAL_PLANT_PREFERENCES[T][planet->plants[prey_index].plant_type_index];
     }
@@ -18413,15 +20937,28 @@ double animal_food_weight(const Planet *planet, const AnimalCohort *animal, uint
 size_t animal_food_items(const Planet *planet, const AnimalCohort *animal, const Location *location, uint8_t *kinds, size_t *indices, double *amounts, size_t capacity) {
     const size_t T = animal->animal_type_index;
     size_t count = 0;
-    for(size_t c = 0; (c < planet->cohorts_length) && (ANIMAL_MICROBE_PREFERENCES[T] > 0.0); c++) {
-        if((cohort_is_at(&planet->cohorts[c], location) == 1) && (count < capacity)) {
+    const uint8_t IS_EATING_MICROBES = (uint8_t)(ANIMAL_MICROBE_PREFERENCES[T] > 0.0);
+    size_t cohort_index = COHORT_LOCATION_NONE;
+    if(IS_EATING_MICROBES == 1) {
+        cohort_index = planet_cohort_at_first(planet, location);
+    }
+    for(size_t visit = 0; visit < planet->cohorts_length; visit++) {
+        if(cohort_index == COHORT_LOCATION_NONE) {
+            break;
+        }
+        if(count < capacity) {
             kinds[count] = 0;
-            indices[count] = c;
-            amounts[count] = cohort_grazeable_biomass(&planet->cohorts[c]);
+            indices[count] = cohort_index;
+            amounts[count] = cohort_grazeable_biomass(&planet->cohorts[cohort_index]);
             count = count + 1;
         }
+        cohort_index = planet_cohort_at_next(planet, location, cohort_index);
     }
-    for(size_t p = 0; (p < planet->animals_length) && (ANIMAL_ANIMAL_PREFERENCES[T] > 0.0); p++) {
+    for(size_t p = 0; p < planet->animals_length; p++) {
+        const uint8_t IS_EATING_ANIMALS = (uint8_t)(ANIMAL_ANIMAL_PREFERENCES[T] > 0.0);
+        if(IS_EATING_ANIMALS == 0) {
+            break;
+        }
         if((animal_is_prey(animal, &planet->animals[p]) == 1) && (count < capacity)) {
             kinds[count] = 1;
             indices[count] = p;
@@ -18465,7 +21002,10 @@ uint8_t planet_add_animal_candidates(Planet *planet, CandidateList *list, const 
     for(size_t a = 0; a < planet->animals_length; a++) {
         planet->animals[a].predation_loss_mol_carbon_per_day = 0.0;
     }
-    for(size_t a = 0; (a < planet->animals_length) && (status == 0); a++) {
+    for(size_t a = 0; a < planet->animals_length; a++) {
+        if(status != 0) {
+            break;
+        }
         AnimalCohort *animal = &planet->animals[a];
         const size_t T = animal->animal_type_index;
         const double BIOMASS = animal_biomass(animal);
@@ -18473,10 +21013,20 @@ uint8_t planet_add_animal_candidates(Planet *planet, CandidateList *list, const 
         if((BIOMASS > 0.0) && (planet_location_is_valid(planet, &location) == 1)) {
             const double FACTOR = animal_rate_factor(planet, &location, T, settings->q10);
             const double SPACE = animal_space(planet, &location, T);
-            const double COUNT = (animal->individual_count > 0.0) ? animal->individual_count : (BIOMASS / animal->individual_mass_mol_carbon);
+            double count = 0.0;
+            if(animal->individual_count > 0.0) {
+                count = animal->individual_count;
+            } else {
+                count = BIOMASS / animal->individual_mass_mol_carbon;
+            }
             const double CONDITION = animal_condition(animal);
-            const double SATIETY = (CONDITION > 1.0) ? clamp_double((ANIMAL_MAXIMUM_CONDITION - CONDITION) / (ANIMAL_MAXIMUM_CONDITION - 1.0), 0.0, 1.0) : 1.0;
-            const double CLEARANCE = ANIMAL_CLEARANCES[T] * FACTOR * animal->feeding_effort * SATIETY;
+            double satiety = 1.0;
+            if(CONDITION > 1.0) {
+                satiety = clamp_double((ANIMAL_MAXIMUM_CONDITION - CONDITION) / (ANIMAL_MAXIMUM_CONDITION - 1.0), 0.0, 1.0);
+            } else {
+                satiety = 1.0;
+            }
+            const double CLEARANCE = ANIMAL_CLEARANCES[T] * FACTOR * animal->feeding_effort * satiety;
             const double HANDLING = 1.0 / (ANIMAL_MAXIMUM_INGESTIONS[T] * animal->structural_mass_mol_carbon * FACTOR);
             const double DENSITY = animal_type_density(planet, &location, T) / SPACE;
             const size_t ITEMS = animal_food_items(planet, animal, &location, kinds, indices, amounts, CAPACITY);
@@ -18489,24 +21039,38 @@ uint8_t planet_add_animal_candidates(Planet *planet, CandidateList *list, const 
             double surplus = 0.0;
             double grown = 0.0;
             double ingested = 0.0;
-            for(size_t i = 0; (i < ITEMS) && (status == 0) && (DENOMINATOR > 0.0); i++) {
-                const double RATE = (COUNT * CLEARANCE * weights[i] * (amounts[i] / SPACE)) / DENOMINATOR;
+            for(size_t i = 0; i < ITEMS; i++) {
+                if(status != 0) {
+                    break;
+                }
+                const uint8_t IS_FEEDING = (uint8_t)(DENOMINATOR > 0.0);
+                if(IS_FEEDING == 0) {
+                    break;
+                }
+                const double RATE = (count * CLEARANCE * weights[i] * (amounts[i] / SPACE)) / DENOMINATOR;
                 if(RATE > 0.0) {
                     status = animal_add_eating(planet, list, a, kinds[i], indices[i], RATE, feeding, &surplus, &grown);
                     ingested = ingested + RATE;
                     if(kinds[i] == 1) {
-                        planet->animals[indices[i]].predation_loss_mol_carbon_per_day += RATE;
+                        AnimalCohort *prey = &planet->animals[indices[i]];
+                        prey->predation_loss_mol_carbon_per_day = prey->predation_loss_mol_carbon_per_day + RATE;
                     }
                 }
             }
             uint8_t cause = 0;
-            const double DEMAND = ANIMAL_RESPIRATIONS[T] * FACTOR * animal_thermoregulation_factor(planet, &location, T) * animal->respiration_multiplier * BIOMASS;
-            const double FROM_BODY = (DEMAND > surplus) ? (DEMAND - surplus) : 0.0;
+            double regulated_demand = ANIMAL_RESPIRATIONS[T] * FACTOR * animal_thermoregulation_factor(planet, &location, T);
+            const double DEMAND = regulated_demand * animal->respiration_multiplier * BIOMASS;
+            double from_body = 0.0;
+            if(DEMAND > surplus) {
+                from_body = DEMAND - surplus;
+            } else {
+                from_body = 0.0;
+            }
             double hazard = animal_hazard(planet, animal, settings, &cause);
             animal->death_rate_per_day = hazard;
-            animal->last_net_production_mol_carbon_per_day = grown - FROM_BODY;
+            animal->last_net_production_mol_carbon_per_day = grown - from_body;
             animal->last_ingestion_mol_carbon_per_day = ingested;
-            status = (uint8_t)(status + animal_add_body_losses(planet, list, a, FROM_BODY / BIOMASS, hazard, 0.0, losses));
+            status = (uint8_t)(status + animal_add_body_losses(planet, list, a, from_body / BIOMASS, hazard, 0.0, losses));
         }
     }
     free(kinds);
@@ -18520,11 +21084,16 @@ double plant_location_value(const Planet *planet, const Location *location, size
     return planet_location_concentration(planet, location, species);
 }
 
-uint8_t plant_take_nutrients(const Planet *planet, Transfer *transfer, const Location *nutrients, const Location *water, uint8_t is_aquatic, double carbon,
-    double nitrogen, double phosphorus, double sulfur, double electrons) {
+uint8_t plant_take_nutrients(const Planet *planet, Transfer *transfer, const Location *nutrients, const Location *water, uint8_t is_aquatic, double carbon, double nitrogen, double phosphorus, double sulfur, double electrons) {
     const double AMMONIUM = plant_location_value(planet, nutrients, DISSOLVED_TOTAL_AMMONIA);
     const double NITRATE = plant_location_value(planet, nutrients, DISSOLVED_NITRATE);
-    const double FROM_AMMONIUM = ((AMMONIUM + NITRATE) > 0.0) ? (nitrogen * (AMMONIUM / (AMMONIUM + NITRATE))) : nitrogen;
+    double from_ammonium = nitrogen;
+    if((AMMONIUM + NITRATE) > 0.0) {
+        from_ammonium = nitrogen * (AMMONIUM / (AMMONIUM + NITRATE));
+    } else {
+        from_ammonium = nitrogen;
+    }
+    const double FROM_AMMONIUM = from_ammonium;
     uint8_t status = 0;
     if(is_aquatic == 1) {
         status = transfer_accumulate_species(transfer, water, DISSOLVED_INORGANIC_CARBON, 0, -carbon);
@@ -18542,13 +21111,20 @@ uint8_t plant_take_nutrients(const Planet *planet, Transfer *transfer, const Loc
 
 uint8_t plant_add_oxidation(Transfer *transfer, const Location *nutrients, const Location *water, uint8_t is_aquatic, double carbon, const double *composition) {
     if(is_aquatic == 1) {
-        uint8_t status = transfer_add_body_oxidation(transfer, water, carbon, 0.0, 0.0, 0.0, carbon * (composition[COMPONENT_ELECTRON] - (8.0 * composition[COMPONENT_NITROGEN])));
-        status = (uint8_t)(status + transfer_add_body_oxidation(transfer, nutrients, 0.0, carbon * composition[COMPONENT_NITROGEN], carbon * composition[COMPONENT_PHOSPHORUS],
-            carbon * composition[COMPONENT_SULFUR], 8.0 * carbon * composition[COMPONENT_NITROGEN]));
+        double carbon_electrons = carbon * (composition[COMPONENT_ELECTRON] - (8.0 * composition[COMPONENT_NITROGEN]));
+        uint8_t status = transfer_add_body_oxidation(transfer, water, carbon, 0.0, 0.0, 0.0, carbon_electrons);
+        double nitrogen = carbon * composition[COMPONENT_NITROGEN];
+        double phosphorus = carbon * composition[COMPONENT_PHOSPHORUS];
+        double sulfur = carbon * composition[COMPONENT_SULFUR];
+        double nitrogen_electrons = 8.0 * carbon * composition[COMPONENT_NITROGEN];
+        status = (uint8_t)(status + transfer_add_body_oxidation(transfer, nutrients, 0.0, nitrogen, phosphorus, sulfur, nitrogen_electrons));
         return (uint8_t)(status != 0);
     }
-    return transfer_add_air_oxidation(transfer, nutrients, carbon, carbon * composition[COMPONENT_NITROGEN], carbon * composition[COMPONENT_PHOSPHORUS],
-        carbon * composition[COMPONENT_SULFUR], carbon * composition[COMPONENT_ELECTRON]);
+    double nitrogen = carbon * composition[COMPONENT_NITROGEN];
+    double phosphorus = carbon * composition[COMPONENT_PHOSPHORUS];
+    double sulfur = carbon * composition[COMPONENT_SULFUR];
+    double electrons = carbon * composition[COMPONENT_ELECTRON];
+    return transfer_add_air_oxidation(transfer, nutrients, carbon, nitrogen, phosphorus, sulfur, electrons);
 }
 
 void plant_locations(const Planet *planet, const PlantCohort *plant, Location *nutrients, Location *water) {
@@ -18571,10 +21147,23 @@ uint8_t planet_add_plant_candidates(Planet *planet, CandidateList *list, const A
     Location water;
     double leaf_composition[TOTAL_CONSERVED_COMPONENTS];
     double wood_composition[TOTAL_CONSERVED_COMPONENTS];
-    const double CARBON_DIOXIDE = planet->atmosphere_gas_amounts_mol[GAS_CARBON_DIOXIDE] + planet->atmosphere_gas_compensation_mol[GAS_CARBON_DIOXIDE];
+    const double CARBON_DIOXIDE_AMOUNT = planet->atmosphere_gas_amounts_mol[GAS_CARBON_DIOXIDE];
+    const double CARBON_DIOXIDE = CARBON_DIOXIDE_AMOUNT + planet->atmosphere_gas_compensation_mol[GAS_CARBON_DIOXIDE];
     const double AIR = planet_gas_amount_for_partial_pressure(planet, GAS_CARBON_DIOXIDE, PASCALS_PER_ATMOSPHERE);
-    const double PARTIAL = (AIR > 0.0) ? ((CARBON_DIOXIDE > 0.0) ? (CARBON_DIOXIDE / AIR) : 0.0) : 0.0;
-    for(size_t p = 0; (p < planet->plants_length) && (status == 0); p++) {
+    double partial = 0.0;
+    if(AIR > 0.0) {
+        if(CARBON_DIOXIDE > 0.0) {
+            partial = CARBON_DIOXIDE / AIR;
+        } else {
+            partial = 0.0;
+        }
+    } else {
+        partial = 0.0;
+    }
+    for(size_t p = 0; p < planet->plants_length; p++) {
+        if(status != 0) {
+            break;
+        }
         PlantCohort *plant = &planet->plants[p];
         const Planet_Vertex *VERTEX = &planet->vertices[plant->vertex_index];
         const size_t TYPE = plant->plant_type_index;
@@ -18584,99 +21173,141 @@ uint8_t planet_add_plant_candidates(Planet *planet, CandidateList *list, const A
         const double BIOMASS = LEAF + WOOD;
         Transfer transfer;
         plant->last_net_production_mol_carbon_per_day = 0.0;
-        if((VERTEX->terrain_layers_length == 0) || (BIOMASS <= 0.0)) {
-            continue;
-        }
-        if((IS_AQUATIC == 1) && (VERTEX->water_layers_length == 0)) {
-            continue;
-        }
-        plant_locations(planet, plant, &nutrients, &water);
-        plant_tissue_composition(TYPE, PLANT_ORGAN_LEAF, leaf_composition);
-        plant_tissue_composition(TYPE, PLANT_ORGAN_WOOD, wood_composition);
-        const uint8_t CAN_GROW = plant_can_grow_at(planet, TYPE, plant->vertex_index);
-        const double TEMPERATURE = (IS_AQUATIC == 1) ? planet_location_temperature(planet, &water) : planet_location_temperature(planet, &nutrients);
-        const double OFFSET = (TEMPERATURE - PLANT_OPTIMUM_KELVIN[TYPE]) / PLANT_TEMPERATURE_WIDTH_KELVIN;
-        const double THERMAL = (TEMPERATURE <= PLANT_FREEZING_KELVIN) ? 0.0 : exponential_double(-(OFFSET * OFFSET));
-        double wetness = 1.0;
-        if(IS_AQUATIC == 0) {
-            wetness = (VERTEX->terrain_layer_water_saturation_fraction[0] - PLANT_WILTING_SATURATION) / (PLANT_FIELD_SATURATION - PLANT_WILTING_SATURATION);
-            wetness = clamp_double(wetness, 0.0, 1.0);
-        }
-        if(CAN_GROW == 0) {
-            wetness = 0.0;
-        }
-        const double AMMONIUM = planet_location_concentration(planet, &nutrients, DISSOLVED_TOTAL_AMMONIA);
-        const double NITRATE = planet_location_concentration(planet, &nutrients, DISSOLVED_NITRATE);
-        const double PHOSPHATE = planet_location_concentration(planet, &nutrients, DISSOLVED_TOTAL_PHOSPHATE);
-        const double NITROGEN_LIMIT = (AMMONIUM + NITRATE) / (AMMONIUM + NITRATE + PLANT_NITROGEN_HALF_SATURATION_MOL_PER_LITRE);
-        const double PHOSPHORUS_LIMIT = PHOSPHATE / (PHOSPHATE + PLANT_PHOSPHORUS_HALF_SATURATION_MOL_PER_LITRE);
-        const double NUTRIENT_LIMIT = (NITROGEN_LIMIT < PHOSPHORUS_LIMIT) ? NITROGEN_LIMIT : PHOSPHORUS_LIMIT;
-        double carbon_limit = PARTIAL / (PARTIAL + PLANT_CARBON_DIOXIDE_HALF_SATURATION_ATMOSPHERES);
-        if(IS_AQUATIC == 1) {
-            const double DIC = planet_location_concentration(planet, &water, DISSOLVED_INORGANIC_CARBON);
-            carbon_limit = DIC / (DIC + PLANT_DISSOLVED_CARBON_HALF_SATURATION_MOL_PER_LITRE);
-        }
-        const double PRODUCTION = PLANT_LIGHT_USE_EFFICIENCIES[TYPE] * plant->absorbed_photons_mol_per_day * THERMAL * wetness * NUTRIENT_LIMIT * carbon_limit;
-        const double LEAF_FRACTION = (BIOMASS > 0.0) ? (LEAF / BIOMASS) : 0.0;
-        if(PRODUCTION > 0.0) {
-            double allocation = PLANT_LEAF_ALLOCATIONS[TYPE];
-            if(LEAF_FRACTION > 0.0) {
-                allocation = allocation * (PLANT_TARGET_LEAF_FRACTIONS[TYPE] / LEAF_FRACTION);
+        uint8_t is_skipped = (uint8_t)((VERTEX->terrain_layers_length == 0) || (BIOMASS <= 0.0));
+        is_skipped = (uint8_t)((is_skipped == 1) || ((IS_AQUATIC == 1) && (VERTEX->water_layers_length == 0)));
+        if(is_skipped == 0) {
+            plant_locations(planet, plant, &nutrients, &water);
+            plant_tissue_composition(TYPE, PLANT_ORGAN_LEAF, leaf_composition);
+            plant_tissue_composition(TYPE, PLANT_ORGAN_WOOD, wood_composition);
+            const uint8_t CAN_GROW = plant_can_grow_at(planet, TYPE, plant->vertex_index);
+            double temperature = 0.0;
+            if(IS_AQUATIC == 1) {
+                temperature = planet_location_temperature(planet, &water);
             } else {
-                allocation = 0.95;
+                temperature = planet_location_temperature(planet, &nutrients);
             }
-            allocation = clamp_double(allocation, 0.05, 0.95);
-            const double TO_LEAF = allocation * PRODUCTION;
-            const double TO_WOOD = PRODUCTION - TO_LEAF;
-            transfer_create(&transfer, PROCESS_PLANT_GROWTH);
-            transfer_add_plant(&transfer, p, PLANT_ORGAN_LEAF, TO_LEAF, leaf_composition);
-            transfer_add_plant(&transfer, p, PLANT_ORGAN_WOOD, TO_WOOD, wood_composition);
-            plant_take_nutrients(planet, &transfer, &nutrients, &water, IS_AQUATIC, PRODUCTION,
-                (TO_LEAF * leaf_composition[COMPONENT_NITROGEN]) + (TO_WOOD * wood_composition[COMPONENT_NITROGEN]),
-                (TO_LEAF * leaf_composition[COMPONENT_PHOSPHORUS]) + (TO_WOOD * wood_composition[COMPONENT_PHOSPHORUS]),
-                (TO_LEAF * leaf_composition[COMPONENT_SULFUR]) + (TO_WOOD * wood_composition[COMPONENT_SULFUR]),
-                (TO_LEAF * leaf_composition[COMPONENT_ELECTRON]) + (TO_WOOD * wood_composition[COMPONENT_ELECTRON]));
-            status = candidate_list_append(list, &transfer);
-        }
-        if((status == 0) && (CAN_GROW == 1) && (WOOD > 0.0) && (LEAF_FRACTION < (0.5 * PLANT_TARGET_LEAF_FRACTIONS[TYPE])) && (THERMAL > 0.0)) {
-            const double DEFICIT = 1.0 - (LEAF_FRACTION / (0.5 * PLANT_TARGET_LEAF_FRACTIONS[TYPE]));
-            const double MOVED = PLANT_RESPROUT_RATE_PER_DAY * DEFICIT * THERMAL * wetness * NUTRIENT_LIMIT * WOOD;
-            if(MOVED > 0.0) {
-                transfer_create(&transfer, PROCESS_PLANT_GROWTH);
-                transfer_add_plant(&transfer, p, PLANT_ORGAN_WOOD, -MOVED, NULL);
-                transfer_add_plant(&transfer, p, PLANT_ORGAN_LEAF, MOVED, leaf_composition);
-                plant_take_nutrients(planet, &transfer, &nutrients, &water, IS_AQUATIC, 0.0,
-                    MOVED * (leaf_composition[COMPONENT_NITROGEN] - plant->compositions[PLANT_ORGAN_WOOD][COMPONENT_NITROGEN]),
-                    MOVED * (leaf_composition[COMPONENT_PHOSPHORUS] - plant->compositions[PLANT_ORGAN_WOOD][COMPONENT_PHOSPHORUS]),
-                    MOVED * (leaf_composition[COMPONENT_SULFUR] - plant->compositions[PLANT_ORGAN_WOOD][COMPONENT_SULFUR]),
-                    MOVED * (leaf_composition[COMPONENT_ELECTRON] - plant->compositions[PLANT_ORGAN_WOOD][COMPONENT_ELECTRON]));
-                status = candidate_list_append(list, &transfer);
+            const double TEMPERATURE = temperature;
+            const double OFFSET = (TEMPERATURE - PLANT_OPTIMUM_KELVIN[TYPE]) / PLANT_TEMPERATURE_WIDTH_KELVIN;
+            double thermal = 0.0;
+            if(TEMPERATURE <= PLANT_FREEZING_KELVIN) {
+                thermal = 0.0;
+            } else {
+                thermal = exponential_double(-(OFFSET * OFFSET));
             }
-        }
-        const double STRESS = ((TEMPERATURE <= PLANT_FREEZING_KELVIN) || (CAN_GROW == 0)) ? 1.0 : (1.0 - wetness);
-        const double FACTOR = temperature_factor(settings->q10, TEMPERATURE);
-        double respired_total = 0.0;
-        const Location *LITTER_AT = (PLANT_IS_AQUATIC[TYPE] == 1) ? &nutrients : &nutrients;
-        for(size_t organ = 0; (organ < TOTAL_PLANT_ORGANS) && (status == 0); organ++) {
-            const double AMOUNT = plant_organ(plant, organ);
-            const double *C = plant->compositions[organ];
-            const double RESPIRED = PLANT_MAINTENANCE_RESPIRATIONS[TYPE][organ] * FACTOR * AMOUNT;
-            const double LITTER = PLANT_TURNOVERS[TYPE][organ] * (1.0 + (PLANT_STRESS_TURNOVER * STRESS)) * AMOUNT;
-            respired_total = respired_total + RESPIRED;
-            if((RESPIRED + LITTER) > 0.0) {
-                double copy[TOTAL_CONSERVED_COMPONENTS];
-                for(size_t i = 0; i < TOTAL_CONSERVED_COMPONENTS; i++) {
-                    copy[i] = C[i];
+            const double THERMAL = thermal;
+            double wetness = 1.0;
+            if(IS_AQUATIC == 0) {
+                double field_span = PLANT_FIELD_SATURATION - PLANT_WILTING_SATURATION;
+                wetness = (VERTEX->terrain_layer_water_saturation_fraction[0] - PLANT_WILTING_SATURATION) / field_span;
+                wetness = clamp_double(wetness, 0.0, 1.0);
+            }
+            if(CAN_GROW == 0) {
+                wetness = 0.0;
+            }
+            const double AMMONIUM = planet_location_concentration(planet, &nutrients, DISSOLVED_TOTAL_AMMONIA);
+            const double NITRATE = planet_location_concentration(planet, &nutrients, DISSOLVED_NITRATE);
+            const double PHOSPHATE = planet_location_concentration(planet, &nutrients, DISSOLVED_TOTAL_PHOSPHATE);
+            const double NITROGEN_LIMIT = (AMMONIUM + NITRATE) / (AMMONIUM + NITRATE + PLANT_NITROGEN_HALF_SATURATION_MOL_PER_LITRE);
+            const double PHOSPHORUS_LIMIT = PHOSPHATE / (PHOSPHATE + PLANT_PHOSPHORUS_HALF_SATURATION_MOL_PER_LITRE);
+            double nutrient_limit = PHOSPHORUS_LIMIT;
+            if(NITROGEN_LIMIT < PHOSPHORUS_LIMIT) {
+                nutrient_limit = NITROGEN_LIMIT;
+            } else {
+                nutrient_limit = PHOSPHORUS_LIMIT;
+            }
+            const double NUTRIENT_LIMIT = nutrient_limit;
+            double carbon_limit = partial / (partial + PLANT_CARBON_DIOXIDE_HALF_SATURATION_ATMOSPHERES);
+            if(IS_AQUATIC == 1) {
+                const double DIC = planet_location_concentration(planet, &water, DISSOLVED_INORGANIC_CARBON);
+                carbon_limit = DIC / (DIC + PLANT_DISSOLVED_CARBON_HALF_SATURATION_MOL_PER_LITRE);
+            }
+            double light_production = PLANT_LIGHT_USE_EFFICIENCIES[TYPE] * plant->absorbed_photons_mol_per_day * THERMAL;
+            const double PRODUCTION = light_production * wetness * NUTRIENT_LIMIT * carbon_limit;
+            double leaf_fraction = 0.0;
+            if(BIOMASS > 0.0) {
+                leaf_fraction = LEAF / BIOMASS;
+            } else {
+                leaf_fraction = 0.0;
+            }
+            const double LEAF_FRACTION = leaf_fraction;
+            if(PRODUCTION > 0.0) {
+                double allocation = PLANT_LEAF_ALLOCATIONS[TYPE];
+                if(LEAF_FRACTION > 0.0) {
+                    allocation = allocation * (PLANT_TARGET_LEAF_FRACTIONS[TYPE] / LEAF_FRACTION);
+                } else {
+                    allocation = 0.95;
                 }
-                transfer_create(&transfer, PROCESS_PLANT_LOSSES);
-                transfer_add_plant(&transfer, p, organ, -(RESPIRED + LITTER), NULL);
-                plant_add_oxidation(&transfer, &nutrients, &water, IS_AQUATIC, RESPIRED, copy);
-                transfer_add_organic(&transfer, LITTER_AT, ORGANIC_PARTICULATE_LABILE_DETRITUS, PLANT_LABILE_LITTER_SHARES[organ] * LITTER, copy);
-                transfer_add_organic(&transfer, LITTER_AT, ORGANIC_PARTICULATE_REFRACTORY_DETRITUS, (1.0 - PLANT_LABILE_LITTER_SHARES[organ]) * LITTER, copy);
+                allocation = clamp_double(allocation, 0.05, 0.95);
+                const double TO_LEAF = allocation * PRODUCTION;
+                const double TO_WOOD = PRODUCTION - TO_LEAF;
+                transfer_create(&transfer, PROCESS_PLANT_GROWTH);
+                transfer_add_plant(&transfer, p, PLANT_ORGAN_LEAF, TO_LEAF, leaf_composition);
+                transfer_add_plant(&transfer, p, PLANT_ORGAN_WOOD, TO_WOOD, wood_composition);
+                double nitrogen = (TO_LEAF * leaf_composition[COMPONENT_NITROGEN]) + (TO_WOOD * wood_composition[COMPONENT_NITROGEN]);
+                double phosphorus = (TO_LEAF * leaf_composition[COMPONENT_PHOSPHORUS]) + (TO_WOOD * wood_composition[COMPONENT_PHOSPHORUS]);
+                double sulfur = (TO_LEAF * leaf_composition[COMPONENT_SULFUR]) + (TO_WOOD * wood_composition[COMPONENT_SULFUR]);
+                double electrons = (TO_LEAF * leaf_composition[COMPONENT_ELECTRON]) + (TO_WOOD * wood_composition[COMPONENT_ELECTRON]);
+                plant_take_nutrients(planet, &transfer, &nutrients, &water, IS_AQUATIC, PRODUCTION, nitrogen, phosphorus, sulfur, electrons);
                 status = candidate_list_append(list, &transfer);
             }
+            uint8_t is_resprouting = (uint8_t)((status == 0) && (CAN_GROW == 1) && (WOOD > 0.0));
+            is_resprouting = (uint8_t)((is_resprouting == 1) && (LEAF_FRACTION < (0.5 * PLANT_TARGET_LEAF_FRACTIONS[TYPE])) && (THERMAL > 0.0));
+            if(is_resprouting == 1) {
+                const double DEFICIT = 1.0 - (LEAF_FRACTION / (0.5 * PLANT_TARGET_LEAF_FRACTIONS[TYPE]));
+                const double MOVED = PLANT_RESPROUT_RATE_PER_DAY * DEFICIT * THERMAL * wetness * NUTRIENT_LIMIT * WOOD;
+                if(MOVED > 0.0) {
+                    transfer_create(&transfer, PROCESS_PLANT_GROWTH);
+                    transfer_add_plant(&transfer, p, PLANT_ORGAN_WOOD, -MOVED, NULL);
+                    transfer_add_plant(&transfer, p, PLANT_ORGAN_LEAF, MOVED, leaf_composition);
+                    const double *OLD_WOOD = plant->compositions[PLANT_ORGAN_WOOD];
+                    double nitrogen = MOVED * (leaf_composition[COMPONENT_NITROGEN] - OLD_WOOD[COMPONENT_NITROGEN]);
+                    double phosphorus = MOVED * (leaf_composition[COMPONENT_PHOSPHORUS] - OLD_WOOD[COMPONENT_PHOSPHORUS]);
+                    double sulfur = MOVED * (leaf_composition[COMPONENT_SULFUR] - OLD_WOOD[COMPONENT_SULFUR]);
+                    double electrons = MOVED * (leaf_composition[COMPONENT_ELECTRON] - OLD_WOOD[COMPONENT_ELECTRON]);
+                    plant_take_nutrients(planet, &transfer, &nutrients, &water, IS_AQUATIC, 0.0, nitrogen, phosphorus, sulfur, electrons);
+                    status = candidate_list_append(list, &transfer);
+                }
+            }
+            double stress = 1.0;
+            if((TEMPERATURE <= PLANT_FREEZING_KELVIN) || (CAN_GROW == 0)) {
+                stress = 1.0;
+            } else {
+                stress = 1.0 - wetness;
+            }
+            const double FACTOR = temperature_factor(settings->q10, TEMPERATURE);
+            double respired_total = 0.0;
+            const Location *litter_at = &nutrients;
+            if(PLANT_IS_AQUATIC[TYPE] == 1) {
+                litter_at = &nutrients;
+            } else {
+                litter_at = &nutrients;
+            }
+            for(size_t organ = 0; organ < TOTAL_PLANT_ORGANS; organ++) {
+                if(status != 0) {
+                    break;
+                }
+                const double AMOUNT = plant_organ(plant, organ);
+                const double *C = plant->compositions[organ];
+                const double RESPIRED = PLANT_MAINTENANCE_RESPIRATIONS[TYPE][organ] * FACTOR * AMOUNT;
+                const double LITTER = PLANT_TURNOVERS[TYPE][organ] * (1.0 + (PLANT_STRESS_TURNOVER * stress)) * AMOUNT;
+                respired_total = respired_total + RESPIRED;
+                if((RESPIRED + LITTER) > 0.0) {
+                    double copy[TOTAL_CONSERVED_COMPONENTS];
+                    for(size_t i = 0; i < TOTAL_CONSERVED_COMPONENTS; i++) {
+                        copy[i] = C[i];
+                    }
+                    transfer_create(&transfer, PROCESS_PLANT_LOSSES);
+                    transfer_add_plant(&transfer, p, organ, -(RESPIRED + LITTER), NULL);
+                    plant_add_oxidation(&transfer, &nutrients, &water, IS_AQUATIC, RESPIRED, copy);
+                    double labile_litter = PLANT_LABILE_LITTER_SHARES[organ] * LITTER;
+                    double refractory_litter = (1.0 - PLANT_LABILE_LITTER_SHARES[organ]) * LITTER;
+                    transfer_add_organic(&transfer, litter_at, ORGANIC_PARTICULATE_LABILE_DETRITUS, labile_litter, copy);
+                    transfer_add_organic(&transfer, litter_at, ORGANIC_PARTICULATE_REFRACTORY_DETRITUS, refractory_litter, copy);
+                    status = candidate_list_append(list, &transfer);
+                }
+            }
+            plant->last_net_production_mol_carbon_per_day = PRODUCTION - respired_total;
         }
-        plant->last_net_production_mol_carbon_per_day = PRODUCTION - respired_total;
     }
     return status;
 }
@@ -18696,12 +21327,28 @@ uint8_t planet_remove_animal(Planet *planet, size_t index) {
         status = planet_apply_transfer(planet, &transfer);
     }
     if(status == 0) {
-        for(size_t a = index; (a + 1) < planet->animals_length; a++) {
-            animal_cohort_copy(&planet->animals[a], &planet->animals[a + 1]);
+        for(size_t offset = 0; offset < planet->animals_length; offset++) {
+            const size_t A = index + offset;
+            if((A + 1) >= planet->animals_length) {
+                break;
+            }
+            animal_cohort_copy(&planet->animals[A], &planet->animals[A + 1]);
         }
         planet->animals_length = planet->animals_length - 1;
     }
     return status;
+}
+
+/*
+ * animal_net_change_mol_carbon_per_day
+ * Returns the cohort's net carbon change per day: production after respiration minus what predators took.
+ * last_net_production alone leaves out predation, so it overstates how well a population is doing.
+ * Inputs: animal  not modified
+ * Output: mol carbon per day, negative when the cohort is shrinking
+ * Memory: none allocated or freed
+ */
+double animal_net_change_mol_carbon_per_day(const AnimalCohort *animal) {
+    return animal->last_net_production_mol_carbon_per_day - animal->predation_loss_mol_carbon_per_day;
 }
 
 void planet_apply_animal_demography(Planet *planet, double dt) {
@@ -18728,7 +21375,14 @@ void planet_apply_animal_demography(Planet *planet, double dt) {
             const double GROWN = BIOMASS / animal->individual_count;
             if(GROWN > animal->structural_mass_mol_carbon) {
                 const double ADULT = ANIMAL_INDIVIDUAL_MASSES[animal->animal_type_index];
-                animal->structural_mass_mol_carbon = (GROWN < ADULT) ? GROWN : ((animal->structural_mass_mol_carbon > ADULT) ? animal->structural_mass_mol_carbon : ADULT);
+                if(GROWN < ADULT) {
+                    animal->structural_mass_mol_carbon = GROWN;
+                } else {
+                    const uint8_t IS_ABOVE_ADULT = (uint8_t)(animal->structural_mass_mol_carbon > ADULT);
+                    if(IS_ABOVE_ADULT == 0) {
+                        animal->structural_mass_mol_carbon = ADULT;
+                    }
+                }
             }
             animal->individual_mass_mol_carbon = BIOMASS / animal->individual_count;
         }
@@ -18746,6 +21400,22 @@ void planet_apply_animal_demography(Planet *planet, double dt) {
     }
 }
 
+
+/*
+ * ToC02200 WaterBodies
+ *
+ * Purpose:    Removes, merges, drains and floods the stacked water layers of a vertex, moving their dissolved,
+ *             mineral and organic contents and resident organisms, and mixes the solutes of one water body.
+ * Depends:    Planet, pool transfers (boundary_flush), Weather (climate_move_solutes), AnimalsAndPlants
+ *             (planet_remove_animal), and the plant and pathogen functions declared ahead of use.
+ * API:        planet_move_location_matter, planet_dry_vertex, planet_flood_vertex, planet_merge_top_water_layers,
+ *             planet_mix_water_body
+ * Ownership:  Operates in place on planet->vertices and the organism arrays; allocates nothing.
+ * Invariants: water_layers_length never exceeds TOTAL_WATER_LAYERS. Organisms in a removed layer move to the
+ *             destination location and the layer index of every organism in a deeper layer drops by one.
+ * Errors:     uint8_t status, 0 on success; non-zero when a transfer cannot be applied or flushed.
+ */
+
 void vertex_copy_water_layer(Planet_Vertex *vertex, size_t to, size_t from) {
     vertex->water_layer_thickness_metres[to] = vertex->water_layer_thickness_metres[from];
     vertex->water_layer_temperature_kelvin[to] = vertex->water_layer_temperature_kelvin[from];
@@ -18762,7 +21432,8 @@ void vertex_copy_water_layer(Planet_Vertex *vertex, size_t to, size_t from) {
     }
     for(size_t k = 0; k < TOTAL_ORGANIC_PARTICULATE_CLASSES; k++) {
         vertex->water_layer_organic_particulate_amounts_mol_carbon[to][k] = vertex->water_layer_organic_particulate_amounts_mol_carbon[from][k];
-        vertex->water_layer_organic_particulate_compensation_mol_carbon[to][k] = vertex->water_layer_organic_particulate_compensation_mol_carbon[from][k];
+        double *to_compensation = vertex->water_layer_organic_particulate_compensation_mol_carbon[to];
+        to_compensation[k] = vertex->water_layer_organic_particulate_compensation_mol_carbon[from][k];
         for(size_t i = 0; i < TOTAL_CONSERVED_COMPONENTS; i++) {
             vertex->water_layer_organic_particulate_compositions[to][k][i] = vertex->water_layer_organic_particulate_compositions[from][k][i];
         }
@@ -18774,7 +21445,10 @@ uint8_t planet_move_location_matter(Planet *planet, const Location *from, const 
     Transfer transfer;
     transfer_create(&transfer, PROCESS_LATERAL_EXCHANGE);
     const double SHARE = terrain_clamp(fraction, 0.0, 1.0);
-    for(size_t i = 0; (i < TOTAL_DISSOLVED_SPECIES) && (status == 0); i++) {
+    for(size_t i = 0; i < TOTAL_DISSOLVED_SPECIES; i++) {
+        if(status != 0) {
+            break;
+        }
         double amount = SHARE * planet_location_concentration(planet, from, i) * planet_location_volume_litres(planet, from);
         if(amount > 0.0) {
             transfer_add_dissolved(&transfer, from, i, -amount);
@@ -18782,7 +21456,10 @@ uint8_t planet_move_location_matter(Planet *planet, const Location *from, const 
             status = boundary_flush(planet, &transfer, 0);
         }
     }
-    for(size_t m = 0; (m < TOTAL_MINERAL_TYPES) && (status == 0); m++) {
+    for(size_t m = 0; m < TOTAL_MINERAL_TYPES; m++) {
+        if(status != 0) {
+            break;
+        }
         double amount = SHARE * planet_location_mineral(planet, from, m);
         if(amount > 0.0) {
             transfer_add_mineral(&transfer, from, m, -amount);
@@ -18790,7 +21467,10 @@ uint8_t planet_move_location_matter(Planet *planet, const Location *from, const 
             status = boundary_flush(planet, &transfer, 0);
         }
     }
-    for(size_t k = 0; (k < TOTAL_ORGANIC_PARTICULATE_CLASSES) && (status == 0); k++) {
+    for(size_t k = 0; k < TOTAL_ORGANIC_PARTICULATE_CLASSES; k++) {
+        if(status != 0) {
+            break;
+        }
         const double *composition = NULL;
         double amount = SHARE * planet_location_organic(planet, from, k, &composition);
         if(amount > 0.0) {
@@ -18843,11 +21523,15 @@ uint8_t planet_remove_water_layer(Planet *planet, size_t v, size_t layer, const 
         }
     }
     if((TO_WATER == 1) && (destination->vertex_index == v) && (destination->layer_index < vertex->water_layers_length)) {
-        vertex->water_layer_thickness_metres[destination->layer_index] = vertex->water_layer_thickness_metres[destination->layer_index]
-            + vertex->water_layer_thickness_metres[layer];
+        double *receiving = &vertex->water_layer_thickness_metres[destination->layer_index];
+        *receiving = *receiving + vertex->water_layer_thickness_metres[layer];
     }
-    for(size_t l = layer; (l + 1) < vertex->water_layers_length; l++) {
-        vertex_copy_water_layer(vertex, l, l + 1);
+    for(size_t offset = 0; offset < vertex->water_layers_length; offset++) {
+        const size_t L = layer + offset;
+        if((L + 1) >= vertex->water_layers_length) {
+            break;
+        }
+        vertex_copy_water_layer(vertex, L, L + 1);
     }
     vertex->water_layers_length = vertex->water_layers_length - 1;
     for(size_t c = 0; c < planet->cohorts_length; c++) {
@@ -18879,7 +21563,8 @@ uint8_t planet_merge_top_water_layers(Planet *planet, size_t v) {
     }
     const double A = planet->vertices[v].water_layer_thickness_metres[0];
     const double B = planet->vertices[v].water_layer_thickness_metres[1];
-    const double MIXED = ((A * planet->vertices[v].water_layer_temperature_kelvin[0]) + (B * planet->vertices[v].water_layer_temperature_kelvin[1])) / (A + B);
+    double heat = (A * planet->vertices[v].water_layer_temperature_kelvin[0]) + (B * planet->vertices[v].water_layer_temperature_kelvin[1]);
+    const double MIXED = heat / (A + B);
     uint8_t status = planet_remove_water_layer(planet, v, 1, &destination);
     planet->vertices[v].water_layer_temperature_kelvin[0] = MIXED;
     return status;
@@ -18891,7 +21576,14 @@ uint8_t planet_dry_vertex(Planet *planet, size_t v) {
     uint8_t status = 0;
     location_set(&destination, v, (uint8_t)LOCATION_TERRAIN, 0);
     status = planet_plants_lose_water(planet, v);
-    while((vertex->water_layers_length > 0) && (status == 0)) {
+    const size_t TOTAL_LAYERS_TO_REMOVE = vertex->water_layers_length;
+    for(size_t removal_index = 0; removal_index < (TOTAL_LAYERS_TO_REMOVE + 1); removal_index++) {
+        if(vertex->water_layers_length == 0) {
+            break;
+        }
+        if(status != 0) {
+            break;
+        }
         status = planet_remove_water_layer(planet, v, vertex->water_layers_length - 1, &destination);
     }
     vertex->water_layers_length = 0;
@@ -18906,16 +21598,40 @@ uint8_t planet_dry_vertex(Planet *planet, size_t v) {
 uint8_t planet_flood_vertex(Planet *planet, size_t v, double depth, uint8_t is_ocean, size_t donor) {
     Planet_Vertex *vertex = &planet->vertices[v];
     uint8_t status = 0;
-    const double START = (donor != SIZE_MAX) ? planet->vertices[donor].water_layer_temperature_kelvin[0] : vertex->terrain_layer_temperature_kelvin[0];
+    double start = 0.0;
+    if(donor != SIZE_MAX) {
+        start = planet->vertices[donor].water_layer_temperature_kelvin[0];
+    } else {
+        start = vertex->terrain_layer_temperature_kelvin[0];
+    }
     planet_vertex_reset_water(vertex);
-    planet_layer_water_column(vertex, depth, (is_ocean == 1) ? planet->ocean_surface_layer_metres : planet->lake_surface_layer_metres, planet->maximum_water_layers);
+    double surface_layer_metres = 0.0;
+    if(is_ocean == 1) {
+        surface_layer_metres = planet->ocean_surface_layer_metres;
+    } else {
+        surface_layer_metres = planet->lake_surface_layer_metres;
+    }
+    planet_layer_water_column(vertex, depth, surface_layer_metres, planet->maximum_water_layers);
     for(size_t layer = 0; layer < TOTAL_WATER_LAYERS; layer++) {
-        vertex->water_layer_temperature_kelvin[layer] = (START > WATER_FREEZING_KELVIN) ? START : WATER_FREEZING_KELVIN;
+        if(start > WATER_FREEZING_KELVIN) {
+            vertex->water_layer_temperature_kelvin[layer] = start;
+        } else {
+            vertex->water_layer_temperature_kelvin[layer] = WATER_FREEZING_KELVIN;
+        }
     }
     if(donor != SIZE_MAX) {
         const Planet_Vertex *DONOR = &planet->vertices[donor];
-        for(size_t layer = 0; (layer < vertex->water_layers_length) && (status == 0); layer++) {
-            const size_t SOURCE = (layer < DONOR->water_layers_length) ? layer : (DONOR->water_layers_length - 1);
+        for(size_t layer = 0; layer < vertex->water_layers_length; layer++) {
+            if(status != 0) {
+                break;
+            }
+            size_t source = 0;
+            if(layer < DONOR->water_layers_length) {
+                source = layer;
+            } else {
+                source = DONOR->water_layers_length - 1;
+            }
+            const size_t SOURCE = source;
             Location from;
             Location to;
             location_set(&from, donor, (uint8_t)LOCATION_WATER, SOURCE);
@@ -18925,7 +21641,14 @@ uint8_t planet_flood_vertex(Planet *planet, size_t v, double depth, uint8_t is_o
             vertex->water_layer_temperature_kelvin[layer] = DONOR->water_layer_temperature_kelvin[SOURCE];
             Transfer transfer;
             transfer_create(&transfer, PROCESS_LATERAL_EXCHANGE);
-            for(size_t i = 0; (i < TOTAL_DISSOLVED_SPECIES) && (THEIRS > 0.0) && (status == 0); i++) {
+            for(size_t i = 0; i < TOTAL_DISSOLVED_SPECIES; i++) {
+                const uint8_t HAS_DONOR_WATER = (uint8_t)(THEIRS > 0.0);
+                if(HAS_DONOR_WATER == 0) {
+                    break;
+                }
+                if(status != 0) {
+                    break;
+                }
                 double amount = planet_location_concentration(planet, &from, i) * THEIRS * (MINE / (MINE + THEIRS));
                 if(amount > 0.0) {
                     transfer_add_dissolved(&transfer, &from, i, -amount);
@@ -18978,10 +21701,16 @@ uint8_t planet_mix_water_body(Planet *planet, const size_t *members, size_t coun
     location_set(&hub, members[0], (uint8_t)LOCATION_WATER, 0);
     Transfer transfer;
     transfer_create(&transfer, PROCESS_LATERAL_EXCHANGE);
-    for(size_t m = 1; (m < count) && (status == 0); m++) {
+    for(size_t m = 1; m < count; m++) {
+        if(status != 0) {
+            break;
+        }
         location_set(&other, members[m], (uint8_t)LOCATION_WATER, 0);
         const double VOLUME = planet_location_volume_litres(planet, &other);
-        for(size_t i = 0; (i < TOTAL_DISSOLVED_SPECIES) && (status == 0); i++) {
+        for(size_t i = 0; i < TOTAL_DISSOLVED_SPECIES; i++) {
+            if(status != 0) {
+                break;
+            }
             double excess = (planet_location_concentration(planet, &other, i) * VOLUME) - ((totals[i] / volume) * VOLUME);
             if(excess != 0.0) {
                 transfer_add_dissolved(&transfer, &other, i, -excess);
@@ -18995,6 +21724,22 @@ uint8_t planet_mix_water_body(Planet *planet, const size_t *members, size_t coun
     }
     return status;
 }
+
+
+/*
+ * ToC02300 WaterColumn
+ *
+ * Purpose:    Water density and stability between layers, heat mixing down each water column, the initial
+ *             thermocline profile, and wind-driven, Ekman-turned ocean currents along the climate edges.
+ * Depends:    Planet, Physics (water_density, planet_exchange_pair), Weather (Climate winds and edges), WaterBodies.
+ * API:        water_layer_stability_factor, planet_update_water_column_temperatures,
+ *             planet_initialise_water_column_temperatures, planet_apply_ocean_currents
+ * Ownership:  Operates in place on planet->vertices. planet_initialise_water_column_temperatures allocates two
+ *             scratch arrays and frees them before it returns.
+ * Invariants: The top water layer's temperature is left to the weather model. After an update every terrain layer
+ *             under water has the temperature of the bottom water layer.
+ * Errors:     planet_apply_ocean_currents returns uint8_t status, 0 on success; the other functions cannot fail.
+ */
 
 double water_layer_density(const Planet_Vertex *vertex, size_t layer) {
     if(vertex->is_ocean_water == 1) {
@@ -19019,16 +21764,16 @@ void planet_update_water_column_temperatures(Planet *planet, const PhysicsSettin
             const double UPPER = vertex->water_layer_thickness_metres[layer - 1];
             const double LOWER = vertex->water_layer_thickness_metres[layer];
             const double VELOCITY = settings->heat_mixing_velocity * water_layer_stability_factor(vertex, layer - 1);
-            if((UPPER <= 0.0) || (LOWER <= 0.0)) {
-                continue;
-            }
-            const double MIXED = ((UPPER * vertex->water_layer_temperature_kelvin[layer - 1]) + (LOWER * vertex->water_layer_temperature_kelvin[layer])) / (UPPER + LOWER);
-            const double SHARE = 1.0 - exponential_double(-VELOCITY * dt * ((1.0 / UPPER) + (1.0 / LOWER)));
-            vertex->water_layer_temperature_kelvin[layer] = vertex->water_layer_temperature_kelvin[layer]
-                + (SHARE * (MIXED - vertex->water_layer_temperature_kelvin[layer]));
-            if(layer > 1) {
-                vertex->water_layer_temperature_kelvin[layer - 1] = vertex->water_layer_temperature_kelvin[layer - 1]
-                    + (SHARE * (MIXED - vertex->water_layer_temperature_kelvin[layer - 1]));
+            const uint8_t IS_SKIPPED = (uint8_t)((UPPER <= 0.0) || (LOWER <= 0.0));
+            if(IS_SKIPPED == 0) {
+                double *lower_temperature = &vertex->water_layer_temperature_kelvin[layer];
+                double *upper_temperature = &vertex->water_layer_temperature_kelvin[layer - 1];
+                const double MIXED = ((UPPER * *upper_temperature) + (LOWER * *lower_temperature)) / (UPPER + LOWER);
+                const double SHARE = 1.0 - exponential_double(-VELOCITY * dt * ((1.0 / UPPER) + (1.0 / LOWER)));
+                *lower_temperature = *lower_temperature + (SHARE * (MIXED - *lower_temperature));
+                if(layer > 1) {
+                    *upper_temperature = *upper_temperature + (SHARE * (MIXED - *upper_temperature));
+                }
             }
         }
         if(vertex->water_layers_length > 0) {
@@ -19054,7 +21799,14 @@ void planet_initialise_water_column_temperatures(Planet *planet) {
         const Planet_Vertex *vertex = &planet->vertices[v];
         if((vertex->is_ocean_water == 1) && (vertex->water_layers_length > 0)) {
             size_t i = count;
-            while((i > 0) && (temperatures[i - 1] > vertex->water_layer_temperature_kelvin[0])) {
+            for(size_t shift_index = 0; shift_index < planet->vertices_length; shift_index++) {
+                uint8_t is_shifting = (uint8_t)(i > 0);
+                if(is_shifting == 1) {
+                    is_shifting = (uint8_t)(temperatures[i - 1] > vertex->water_layer_temperature_kelvin[0]);
+                }
+                if(is_shifting == 0) {
+                    break;
+                }
                 temperatures[i] = temperatures[i - 1];
                 weights[i] = weights[i - 1];
                 i = i - 1;
@@ -19069,7 +21821,11 @@ void planet_initialise_water_column_temperatures(Planet *planet) {
     if(count > 0) {
         double area = 0.0;
         double sum = 0.0;
-        for(size_t i = 0; (i < count) && (area < (OCEAN_DEEP_WATER_SOURCE_FRACTION * total_area)); i++) {
+        for(size_t i = 0; i < count; i++) {
+            const uint8_t IS_COLLECTING = (uint8_t)(area < (OCEAN_DEEP_WATER_SOURCE_FRACTION * total_area));
+            if(IS_COLLECTING == 0) {
+                break;
+            }
             area = area + weights[i];
             sum = sum + (weights[i] * temperatures[i]);
         }
@@ -19082,15 +21838,16 @@ void planet_initialise_water_column_temperatures(Planet *planet) {
         for(size_t layer = 0; layer < vertex->water_layers_length; layer++) {
             const double MIDDLE = top + (0.5 * vertex->water_layer_thickness_metres[layer]);
             top = top + vertex->water_layer_thickness_metres[layer];
-            if(layer == 0) {
-                continue;
-            }
-            if(vertex->is_ocean_water == 1) {
-                const double BELOW = MIDDLE - vertex->water_layer_thickness_metres[0];
-                vertex->water_layer_temperature_kelvin[layer] = deep + ((SURFACE - deep) * exponential_double(-BELOW / OCEAN_THERMOCLINE_METRES));
-            } else {
-                vertex->water_layer_temperature_kelvin[layer] = (SURFACE > FRESH_DENSEST_KELVIN)
-                    ? (FRESH_DENSEST_KELVIN + (LAKE_HYPOLIMNION_SHARE * (SURFACE - FRESH_DENSEST_KELVIN))) : FRESH_DENSEST_KELVIN;
+            if(layer != 0) {
+                if(vertex->is_ocean_water == 1) {
+                    const double BELOW = MIDDLE - vertex->water_layer_thickness_metres[0];
+                    vertex->water_layer_temperature_kelvin[layer] = deep + ((SURFACE - deep) * exponential_double(-BELOW / OCEAN_THERMOCLINE_METRES));
+                } else if(SURFACE > FRESH_DENSEST_KELVIN) {
+                    double warming = LAKE_HYPOLIMNION_SHARE * (SURFACE - FRESH_DENSEST_KELVIN);
+                    vertex->water_layer_temperature_kelvin[layer] = FRESH_DENSEST_KELVIN + warming;
+                } else {
+                    vertex->water_layer_temperature_kelvin[layer] = FRESH_DENSEST_KELVIN;
+                }
             }
         }
         if(vertex->water_layers_length > 0) {
@@ -19114,8 +21871,9 @@ uint8_t planet_move_water_between(Planet *planet, const Location *from, const Lo
     const double TARGET_VOLUME = planet_location_volume_litres(planet, to) / LITRES_PER_CUBIC_METRE;
     const double MOVED = SHARE * VOLUME;
     if(TARGET_VOLUME > 0.0) {
-        target->water_layer_temperature_kelvin[to->layer_index] = ((TARGET_VOLUME * target->water_layer_temperature_kelvin[to->layer_index])
-            + (MOVED * SOURCE->water_layer_temperature_kelvin[from->layer_index])) / (TARGET_VOLUME + MOVED);
+        double *target_temperature = &target->water_layer_temperature_kelvin[to->layer_index];
+        double heat = (TARGET_VOLUME * *target_temperature) + (MOVED * SOURCE->water_layer_temperature_kelvin[from->layer_index]);
+        *target_temperature = heat / (TARGET_VOLUME + MOVED);
     }
     return planet_move_location_matter(planet, from, to, SHARE);
 }
@@ -19126,49 +21884,90 @@ uint8_t planet_apply_ocean_currents(Planet *planet, double dt) {
     if(C == NULL) {
         return 0;
     }
-    for(size_t e = 0; (e < C->total_edges) && (status == 0); e++) {
+    for(size_t e = 0; e < C->total_edges; e++) {
+        if(status != 0) {
+            break;
+        }
         const size_t V = C->edges[e][0];
         const size_t W = C->edges[e][1];
         const Planet_Vertex *A = &planet->vertices[V];
         const Planet_Vertex *B = &planet->vertices[W];
-        if((A->is_ocean_water == 0) || (B->is_ocean_water == 0) || (A->water_layers_length == 0) || (B->water_layers_length == 0)) {
-            continue;
-        }
-        double along = 0.0;
-        const size_t ENDS[2] = {V, W};
-        for(size_t end = 0; end < 2; end++) {
-            const size_t X = ENDS[end];
-            const WeatherCell *cell = &C->cells[X];
-            const double TURN = (planet->vertex_positions[X][2] >= 0.0) ? -OCEAN_EKMAN_TURN_RADIANS : OCEAN_EKMAN_TURN_RADIANS;
-            const double EAST = OCEAN_WIND_DRIFT * ((cell->wind_east_metres_per_second * cosine_double(TURN)) - (cell->wind_north_metres_per_second * sine_double(TURN)));
-            const double NORTH = OCEAN_WIND_DRIFT * ((cell->wind_east_metres_per_second * sine_double(TURN)) + (cell->wind_north_metres_per_second * cosine_double(TURN)));
-            for(size_t axis = 0; axis < TOTAL_SPATIAL_AXES; axis++) {
-                along = along + (0.5 * ((EAST * C->east[X][axis]) + (NORTH * C->north[X][axis])) * C->edge_directions[e][axis]);
+        uint8_t is_skipped = (uint8_t)((A->is_ocean_water == 0) || (B->is_ocean_water == 0));
+        is_skipped = (uint8_t)((is_skipped == 1) || (A->water_layers_length == 0) || (B->water_layers_length == 0));
+        if(is_skipped == 0) {
+            double along = 0.0;
+            const size_t ENDS[2] = {V, W};
+            for(size_t end = 0; end < 2; end++) {
+                const size_t X = ENDS[end];
+                const WeatherCell *cell = &C->cells[X];
+                double turn = OCEAN_EKMAN_TURN_RADIANS;
+                if(planet->vertex_positions[X][2] >= 0.0) {
+                    turn = -OCEAN_EKMAN_TURN_RADIANS;
+                } else {
+                    turn = OCEAN_EKMAN_TURN_RADIANS;
+                }
+                double wind_east = cell->wind_east_metres_per_second;
+                double wind_north = cell->wind_north_metres_per_second;
+                double drift_east = (wind_east * cosine_double(turn)) - (wind_north * sine_double(turn));
+                double drift_north = (wind_east * sine_double(turn)) + (wind_north * cosine_double(turn));
+                const double EAST = OCEAN_WIND_DRIFT * drift_east;
+                const double NORTH = OCEAN_WIND_DRIFT * drift_north;
+                for(size_t axis = 0; axis < TOTAL_SPATIAL_AXES; axis++) {
+                    along = along + (0.5 * ((EAST * C->east[X][axis]) + (NORTH * C->north[X][axis])) * C->edge_directions[e][axis]);
+                }
             }
-        }
-        const size_t DONOR = (along > 0.0) ? V : W;
-        const size_t RECEIVER = (along > 0.0) ? W : V;
-        const double THICKNESS = 0.5 * (A->water_layer_thickness_metres[0] + B->water_layer_thickness_metres[0]);
-        const double FLOW = absolute_value_double(along) * THICKNESS * (C->edge_lengths[e] / 1.7320508075688772) * SECONDS_PER_DAY * dt;
-        Location d0;
-        Location d1;
-        Location r0;
-        Location r1;
-        location_set(&d0, DONOR, (uint8_t)LOCATION_WATER, 0);
-        location_set(&r0, RECEIVER, (uint8_t)LOCATION_WATER, 0);
-        if((planet->vertices[DONOR].water_layers_length > 1) && (planet->vertices[RECEIVER].water_layers_length > 1)) {
-            location_set(&d1, DONOR, (uint8_t)LOCATION_WATER, 1);
-            location_set(&r1, RECEIVER, (uint8_t)LOCATION_WATER, 1);
-            status = planet_move_water_between(planet, &d0, &r0, FLOW);
-            status = (uint8_t)(status + planet_move_water_between(planet, &r0, &r1, FLOW));
-            status = (uint8_t)(status + planet_move_water_between(planet, &r1, &d1, FLOW));
-            status = (uint8_t)(status + planet_move_water_between(planet, &d1, &d0, FLOW));
-        } else {
-            status = planet_exchange_pair(planet, &d0, &r0, FLOW * LITRES_PER_CUBIC_METRE / ((dt > 0.0) ? dt : 1.0), dt, PROCESS_LATERAL_EXCHANGE);
+            size_t donor = W;
+            size_t receiver = V;
+            if(along > 0.0) {
+                donor = V;
+                receiver = W;
+            } else {
+                donor = W;
+                receiver = V;
+            }
+            const double THICKNESS = 0.5 * (A->water_layer_thickness_metres[0] + B->water_layer_thickness_metres[0]);
+            const double FLOW = absolute_value_double(along) * THICKNESS * (C->edge_lengths[e] / 1.7320508075688772) * SECONDS_PER_DAY * dt;
+            Location d0;
+            Location d1;
+            Location r0;
+            Location r1;
+            location_set(&d0, donor, (uint8_t)LOCATION_WATER, 0);
+            location_set(&r0, receiver, (uint8_t)LOCATION_WATER, 0);
+            if((planet->vertices[donor].water_layers_length > 1) && (planet->vertices[receiver].water_layers_length > 1)) {
+                location_set(&d1, donor, (uint8_t)LOCATION_WATER, 1);
+                location_set(&r1, receiver, (uint8_t)LOCATION_WATER, 1);
+                status = planet_move_water_between(planet, &d0, &r0, FLOW);
+                status = (uint8_t)(status + planet_move_water_between(planet, &r0, &r1, FLOW));
+                status = (uint8_t)(status + planet_move_water_between(planet, &r1, &d1, FLOW));
+                status = (uint8_t)(status + planet_move_water_between(planet, &d1, &d0, FLOW));
+            } else {
+                double divisor = 1.0;
+                if(dt > 0.0) {
+                    divisor = dt;
+                } else {
+                    divisor = 1.0;
+                }
+                double litres_per_day = FLOW * LITRES_PER_CUBIC_METRE / divisor;
+                status = planet_exchange_pair(planet, &d0, &r0, litres_per_day, dt, PROCESS_LATERAL_EXCHANGE);
+            }
         }
     }
     return status;
 }
+
+
+/*
+ * ToC02400 GeologicalEvents
+ *
+ * Purpose:    Applies eruptions and earthquakes to the planet: volcanic carbon, sulfur, apatite and iron released
+ *             from the lithosphere, ash that kills a share of the local biota, and the per-interval geology step.
+ * Depends:    Geology (Eruption, Earthquake and their schedules), Planet, pool transfers, AnimalsAndPlants.
+ * API:        planet_kill_fraction, planet_apply_eruption, and the earthquake and geology-step functions after them
+ * Ownership:  Operates in place on the planet. Scratch event arrays are allocated and freed within one call.
+ * Invariants: Matter leaving the lithosphere is booked by a transfer with a matching gain elsewhere. Killed biomass
+ *             becomes labile detritus at the same vertex.
+ * Errors:     uint8_t status, 0 on success; non-zero counts transfers that could not be applied.
+ */
 
 const double VOLCANIC_CARBON_MOL_PER_CUBIC_METRE = 114.0;
 const double VOLCANIC_SULFUR_MOL_PER_CUBIC_METRE = 78.0;
@@ -19197,33 +21996,44 @@ uint8_t planet_kill_fraction(Planet *planet, size_t v, double fraction, uint8_t 
     if(VERTEX->terrain_layers_length == 0) {
         location_set(&litter, v, (uint8_t)LOCATION_WATER, 0);
     }
-    for(size_t p = 0; (p < planet->plants_length) && (status == 0); p++) {
-        const PlantCohort *PLANT = &planet->plants[p];
-        if((PLANT->vertex_index != v) || ((PLANT_IS_AQUATIC[PLANT->plant_type_index] == 1) && (is_eruption == 0))) {
-            continue;
+    for(size_t p = 0; p < planet->plants_length; p++) {
+        if(status != 0) {
+            break;
         }
-        transfer_create(&transfer, PROCESS_EXTINCTION);
-        for(size_t organ = 0; organ < TOTAL_PLANT_ORGANS; organ++) {
-            const double AMOUNT = SHARE * plant_organ(PLANT, organ);
-            if(AMOUNT > 0.0) {
-                double copy[TOTAL_CONSERVED_COMPONENTS];
-                for(size_t i = 0; i < TOTAL_CONSERVED_COMPONENTS; i++) {
-                    copy[i] = PLANT->compositions[organ][i];
+        const PlantCohort *PLANT = &planet->plants[p];
+        const uint8_t IS_SKIPPED = (uint8_t)((PLANT->vertex_index != v) || ((PLANT_IS_AQUATIC[PLANT->plant_type_index] == 1) && (is_eruption == 0)));
+        if(IS_SKIPPED == 0) {
+            transfer_create(&transfer, PROCESS_EXTINCTION);
+            for(size_t organ = 0; organ < TOTAL_PLANT_ORGANS; organ++) {
+                const double AMOUNT = SHARE * plant_organ(PLANT, organ);
+                if(AMOUNT > 0.0) {
+                    double copy[TOTAL_CONSERVED_COMPONENTS];
+                    for(size_t i = 0; i < TOTAL_CONSERVED_COMPONENTS; i++) {
+                        copy[i] = PLANT->compositions[organ][i];
+                    }
+                    transfer_add_plant(&transfer, p, organ, -AMOUNT, NULL);
+                    transfer_add_organic(&transfer, &litter, ORGANIC_PARTICULATE_LABILE_DETRITUS, AMOUNT, copy);
                 }
-                transfer_add_plant(&transfer, p, organ, -AMOUNT, NULL);
-                transfer_add_organic(&transfer, &litter, ORGANIC_PARTICULATE_LABILE_DETRITUS, AMOUNT, copy);
+            }
+            if(transfer.terms_length > 0) {
+                status = (uint8_t)(planet_apply_transfer(planet, &transfer) != TRANSFER_APPLIED);
             }
         }
-        if(transfer.terms_length > 0) {
-            status = (uint8_t)(planet_apply_transfer(planet, &transfer) != TRANSFER_APPLIED);
-        }
     }
-    for(size_t a = 0; (a < planet->animals_length) && (status == 0); a++) {
+    for(size_t a = 0; a < planet->animals_length; a++) {
+        if(status != 0) {
+            break;
+        }
         AnimalCohort *animal = &planet->animals[a];
-        const uint8_t IS_EXPOSED = (uint8_t)((animal->vertex_index == v) && ((animal->location_kind == LOCATION_TERRAIN)
-            || ((animal->location_kind == LOCATION_WATER) && (animal->layer_index == 0) && (is_eruption == 1))));
+        uint8_t is_exposed = (uint8_t)(animal->vertex_index == v);
+        if(is_exposed == 1) {
+            is_exposed = (uint8_t)(animal->location_kind == LOCATION_TERRAIN);
+            if(is_exposed == 0) {
+                is_exposed = (uint8_t)((animal->location_kind == LOCATION_WATER) && (animal->layer_index == 0) && (is_eruption == 1));
+            }
+        }
         const double AMOUNT = SHARE * animal_biomass(animal);
-        if((IS_EXPOSED == 1) && (AMOUNT > 0.0)) {
+        if((is_exposed == 1) && (AMOUNT > 0.0)) {
             Location at;
             location_set(&at, animal->vertex_index, animal->location_kind, animal->layer_index);
             transfer_create(&transfer, PROCESS_ANIMAL_LOSSES);
@@ -19234,12 +22044,15 @@ uint8_t planet_kill_fraction(Planet *planet, size_t v, double fraction, uint8_t 
             }
         }
     }
-    for(size_t c = 0; (c < planet->cohorts_length) && (status == 0); c++) {
+    for(size_t c = 0; c < planet->cohorts_length; c++) {
+        if(status != 0) {
+            break;
+        }
         const Cohort *COHORT = &planet->cohorts[c];
-        const uint8_t IS_EXPOSED = (uint8_t)((COHORT->vertex_index == v) && (COHORT->layer_index == 0)
-            && ((COHORT->location_kind == LOCATION_TERRAIN) || (is_eruption == 1)));
+        uint8_t is_exposed = (uint8_t)((COHORT->vertex_index == v) && (COHORT->layer_index == 0));
+        is_exposed = (uint8_t)((is_exposed == 1) && ((COHORT->location_kind == LOCATION_TERRAIN) || (is_eruption == 1)));
         const double AMOUNT = SHARE * cohort_biomass(COHORT);
-        if((IS_EXPOSED == 1) && (AMOUNT > 0.0)) {
+        if((is_exposed == 1) && (AMOUNT > 0.0)) {
             Location at;
             double copy[TOTAL_CONSERVED_COMPONENTS];
             for(size_t i = 0; i < TOTAL_CONSERVED_COMPONENTS; i++) {
@@ -19338,7 +22151,10 @@ uint8_t planet_apply_geology(Planet *planet, double start, double end) {
         Earthquake *quakes = (Earthquake *)malloc(QUAKES * sizeof(Earthquake));
         if(quakes != NULL) {
             const size_t FOUND = planet_earthquakes_between(planet, start, end, quakes, QUAKES);
-            for(size_t i = 0; (i < FOUND) && (i < QUAKES); i++) {
+            for(size_t i = 0; i < FOUND; i++) {
+                if(i >= QUAKES) {
+                    break;
+                }
                 status = (uint8_t)(status + planet_apply_earthquake(planet, &quakes[i]));
             }
         }
@@ -19349,7 +22165,10 @@ uint8_t planet_apply_geology(Planet *planet, double start, double end) {
         Eruption *eruptions = (Eruption *)malloc(ERUPTIONS * sizeof(Eruption));
         if(eruptions != NULL) {
             const size_t FOUND = planet_eruptions_between(planet, start, end, eruptions, ERUPTIONS);
-            for(size_t i = 0; (i < FOUND) && (i < ERUPTIONS); i++) {
+            for(size_t i = 0; i < FOUND; i++) {
+                if(i >= ERUPTIONS) {
+                    break;
+                }
                 status = (uint8_t)(status + planet_apply_eruption(planet, &eruptions[i]));
             }
         }
@@ -19362,10 +22181,11 @@ void planet_fill_lithosphere(Planet *planet) {
     for(size_t v = 0; v < planet->vertices_length; v++) {
         Planet_Vertex *vertex = &planet->vertices[v];
         const double AREA = vertex->area_square_metres;
-        vertex->lithosphere_mineral_amounts_mol[MINERAL_CALCITE] += LITHOSPHERE_CALCITE_MOL_PER_SQUARE_METRE * AREA;
-        vertex->lithosphere_mineral_amounts_mol[MINERAL_IRON_SULFIDE] += LITHOSPHERE_IRON_SULFIDE_MOL_PER_SQUARE_METRE * AREA;
-        vertex->lithosphere_mineral_amounts_mol[MINERAL_APATITE] += LITHOSPHERE_APATITE_MOL_PER_SQUARE_METRE * AREA;
-        vertex->lithosphere_mineral_amounts_mol[MINERAL_IRON_HYDROXIDE] += LITHOSPHERE_IRON_HYDROXIDE_MOL_PER_SQUARE_METRE * AREA;
+        double *lithosphere = vertex->lithosphere_mineral_amounts_mol;
+        lithosphere[MINERAL_CALCITE] = lithosphere[MINERAL_CALCITE] + (LITHOSPHERE_CALCITE_MOL_PER_SQUARE_METRE * AREA);
+        lithosphere[MINERAL_IRON_SULFIDE] = lithosphere[MINERAL_IRON_SULFIDE] + (LITHOSPHERE_IRON_SULFIDE_MOL_PER_SQUARE_METRE * AREA);
+        lithosphere[MINERAL_APATITE] = lithosphere[MINERAL_APATITE] + (LITHOSPHERE_APATITE_MOL_PER_SQUARE_METRE * AREA);
+        lithosphere[MINERAL_IRON_HYDROXIDE] = lithosphere[MINERAL_IRON_HYDROXIDE] + (LITHOSPHERE_IRON_HYDROXIDE_MOL_PER_SQUARE_METRE * AREA);
     }
 }
 
@@ -19381,6 +22201,22 @@ uint8_t planet_surface_location(const Planet *planet, size_t vertex_index, Locat
     }
     return has_surface;
 }
+
+
+/*
+ * ToC02500 Pathogens
+ *
+ * Purpose:    Viruses of microbial cohorts and spore-forming parasites of animal cohorts, kept as free,
+ *             infected and internal (lysogenic) carbon pools per location, with infection, release,
+ *             induction, decay, faecal and vertical routes, spore sinking, host death and mutation.
+ * Depends:    Planet, Cohort, AnimalCohort, Transfer, CandidateList, Location, PCG streams
+ * API:        pathogen_settings_create, pathogen_create, planet_add_pathogen, planet_add_pathogen_candidates,
+ *             planet_apply_pathogen_faecal_route, planet_apply_pathogen_vertical_route,
+ *             planet_apply_pathogen_sinking, planet_apply_pathogen_funnel, planet_apply_pathogen_demography
+ * Ownership:  Pathogens live in planet->pathogens, which planet_add_pathogen grows by doubling with realloc.
+ * Invariants: Every pathogen pool changes only through a Transfer. traits[] stay within +-LOCUS_LIMIT.
+ * Errors:     Functions return uint8_t status, 0 on success; planet_add_pathogen returns SIZE_MAX on failure.
+ */
 
 #define PATHOGEN_TRAIT_ADSORPTION 0
 #define PATHOGEN_TRAIT_VIRULENCE 1
@@ -19421,7 +22257,7 @@ const double PATHOGEN_HOST_RANGE_WIDTH = 1.0;
 #define PATHOGEN_MAXIMUM_MUTATIONS 8
 
 const double PATHOGEN_LYSOGENY_THRESHOLD = 0.5;
-const double PATHOGEN_MAXIMUM_INFECTED_SHARE = 0.5;
+const double PATHOGEN_MAXIMUM_INFECTED_SHARE = 0.05;
 const double PATHOGEN_BURST_BASE = 0.2;
 const double PATHOGEN_VIRULENCE_BASE = 0.5;
 const double PATHOGEN_LYSOGENY_BASE = 0.3;
@@ -19451,7 +22287,8 @@ void pathogen_settings_create(PathogenSettings *settings) {
 }
 
 double pathogen_burst_size(const Pathogen *pathogen) {
-    return PATHOGEN_MINIMUM_BURST + ((PATHOGEN_MAXIMUM_BURST - PATHOGEN_MINIMUM_BURST) * logistic_shift(PATHOGEN_BURST_BASE, pathogen->traits[PATHOGEN_TRAIT_BURST]));
+    const double SHIFT = logistic_shift(PATHOGEN_BURST_BASE, pathogen->traits[PATHOGEN_TRAIT_BURST]);
+    return PATHOGEN_MINIMUM_BURST + ((PATHOGEN_MAXIMUM_BURST - PATHOGEN_MINIMUM_BURST) * SHIFT);
 }
 
 double pathogen_virulence(const Pathogen *pathogen) {
@@ -19497,8 +22334,9 @@ double pathogen_internal_amount(const Pathogen *pathogen) {
 }
 
 uint8_t pathogen_is_at(const Pathogen *pathogen, const Location *location) {
-    return (uint8_t)((pathogen->vertex_index == location->vertex_index) && (pathogen->location_kind == location->kind)
-        && (pathogen->layer_index == location->layer_index));
+    uint8_t is_at = (uint8_t)((pathogen->vertex_index == location->vertex_index) && (pathogen->location_kind == location->kind));
+    is_at = (uint8_t)((is_at == 1) && (pathogen->layer_index == location->layer_index));
+    return is_at;
 }
 
 void pathogen_location(const Pathogen *pathogen, Location *location) {
@@ -19535,10 +22373,15 @@ void pathogen_create(Pathogen *pathogen, uint8_t is_parasite, size_t host_type_i
 
 size_t planet_find_pathogen(const Planet *planet, uint8_t is_parasite, size_t host_type_index, uint32_t lineage, const Location *location) {
     size_t found = SIZE_MAX;
-    for(size_t p = 0; (p < planet->pathogens_length) && (found == SIZE_MAX); p++) {
+    for(size_t p = 0; p < planet->pathogens_length; p++) {
+        if(found != SIZE_MAX) {
+            break;
+        }
         const Pathogen *pathogen = &planet->pathogens[p];
-        if((pathogen->is_parasite == is_parasite) && (pathogen->host_type_index == host_type_index) && (pathogen->lineage == lineage)
-            && (pathogen_is_at(pathogen, location) == 1)) {
+        uint8_t is_match = (uint8_t)((pathogen->is_parasite == is_parasite) && (pathogen->host_type_index == host_type_index));
+        is_match = (uint8_t)((is_match == 1) && (pathogen->lineage == lineage));
+        is_match = (uint8_t)((is_match == 1) && (pathogen_is_at(pathogen, location) == 1));
+        if(is_match == 1) {
             found = p;
         }
     }
@@ -19582,17 +22425,23 @@ double pathogen_host_density(const Planet *planet, const Pathogen *pathogen, con
     if(pathogen->is_parasite == 1) {
         for(size_t a = 0; a < planet->animals_length; a++) {
             const AnimalCohort *animal = &planet->animals[a];
-            if((animal->animal_type_index == pathogen->host_type_index) && (animal->vertex_index == location->vertex_index)
-                && (animal->location_kind == location->kind) && (animal->layer_index == location->layer_index)) {
+            uint8_t is_host = (uint8_t)((animal->animal_type_index == pathogen->host_type_index) && (animal->vertex_index == location->vertex_index));
+            is_host = (uint8_t)((is_host == 1) && (animal->location_kind == location->kind) && (animal->layer_index == location->layer_index));
+            if(is_host == 1) {
                 density = density + (animal_biomass(animal) / volume);
             }
         }
     } else {
-        for(size_t c = 0; c < planet->cohorts_length; c++) {
-            const Cohort *cohort = &planet->cohorts[c];
-            if((cohort_is_at(cohort, location) == 1) && (cohort->functional_type_index == pathogen->host_type_index) && (cohort->is_dormant == 0)) {
+        size_t cohort_index = planet_cohort_at_first(planet, location);
+        for(size_t visit = 0; visit < planet->cohorts_length; visit++) {
+            if(cohort_index == COHORT_LOCATION_NONE) {
+                break;
+            }
+            const Cohort *cohort = &planet->cohorts[cohort_index];
+            if((cohort->functional_type_index == pathogen->host_type_index) && (cohort->is_dormant == 0)) {
                 density = density + (cohort_biomass(cohort) / volume);
             }
+            cohort_index = planet_cohort_at_next(planet, location, cohort_index);
         }
     }
     return density;
@@ -19606,12 +22455,20 @@ uint8_t pathogen_add_microbial_infection(Planet *planet, CandidateList *list, si
     uint8_t status = 0;
     Transfer transfer;
     double lysogenized = 0.0;
-    for(size_t c = 0; (c < planet->cohorts_length) && (status == 0) && (FREE > 0.0); c++) {
-        const Cohort *cohort = &planet->cohorts[c];
+    size_t cohort_index = planet_cohort_at_first(planet, location);
+    for(size_t visit = 0; visit < planet->cohorts_length; visit++) {
+        uint8_t is_running = (uint8_t)((status == 0) && (FREE > 0.0));
+        is_running = (uint8_t)((is_running == 1) && (cohort_index != COHORT_LOCATION_NONE));
+        if(is_running == 0) {
+            break;
+        }
+        const Cohort *cohort = &planet->cohorts[cohort_index];
         const double BIOMASS = cohort_biomass(cohort);
-        if((cohort_is_at(cohort, location) == 1) && (cohort->functional_type_index == pathogen->host_type_index) && (BIOMASS > 0.0) && (cohort->is_dormant == 0)) {
-            const double MATCH = pathogen_host_match(pathogen, cohort->cell_mass_mol_carbon) * (1.0 - cohort_resistance(cohort))
-                * (1.0 - (BIOFILM_PHAGE_PROTECTION * cohort->attached_fraction));
+        uint8_t is_host = (uint8_t)(cohort->functional_type_index == pathogen->host_type_index);
+        is_host = (uint8_t)((is_host == 1) && (BIOMASS > 0.0) && (cohort->is_dormant == 0));
+        if(is_host == 1) {
+            const double SUSCEPTIBLE_MATCH = pathogen_host_match(pathogen, cohort->cell_mass_mol_carbon) * (1.0 - cohort_resistance(cohort));
+            const double MATCH = SUSCEPTIBLE_MATCH * (1.0 - (BIOFILM_PHAGE_PROTECTION * cohort->attached_fraction));
             const double PARTICLES = FREE / PATHOGEN_PARTICLE_MASS_MOL_CARBON;
             const double CELLS_PER_LITRE = BIOMASS / (cohort->cell_mass_mol_carbon * volume);
             const double CONTACTS = ADSORPTION * MATCH * PARTICLES * CELLS_PER_LITRE;
@@ -19628,10 +22485,10 @@ uint8_t pathogen_add_microbial_infection(Planet *planet, CandidateList *list, si
             if(SEIZED > 0.0) {
                 transfer_create(&transfer, PROCESS_INFECTION);
                 transfer_add_pathogen(&transfer, (uint8_t)POOL_PATHOGEN_FREE, pathogen_index, -ATTACHED, NULL);
-                transfer_add_cohort(&transfer, c, -SEIZED, NULL);
+                transfer_add_cohort(&transfer, cohort_index, -SEIZED, NULL);
                 if(LYSOGENY > PATHOGEN_LYSOGENY_THRESHOLD) {
                     transfer_add_pathogen(&transfer, (uint8_t)POOL_PATHOGEN_INTERNAL, pathogen_index, ATTACHED, pathogen->free_composition);
-                    transfer_add_cohort(&transfer, c, SEIZED, cohort->composition);
+                    transfer_add_cohort(&transfer, cohort_index, SEIZED, cohort->composition);
                     lysogenized = lysogenized + SEIZED;
                 } else {
                     transfer_add_pathogen(&transfer, (uint8_t)POOL_PATHOGEN_INFECTED, pathogen_index, SEIZED, cohort->composition);
@@ -19641,6 +22498,7 @@ uint8_t pathogen_add_microbial_infection(Planet *planet, CandidateList *list, si
                 status = candidate_list_append(list, &transfer);
             }
         }
+        cohort_index = planet_cohort_at_next(planet, location, cohort_index);
     }
     pathogen->last_lysogenized_mol_carbon_per_day = lysogenized;
     return status;
@@ -19652,12 +22510,17 @@ uint8_t pathogen_add_animal_infection(Planet *planet, CandidateList *list, size_
     const double SPORE = logistic_shift(PATHOGEN_SPORE_BASE, pathogen->traits[PATHOGEN_TRAIT_SPORE]);
     uint8_t status = 0;
     Transfer transfer;
-    for(size_t a = 0; (a < planet->animals_length) && (status == 0) && (FREE > 0.0); a++) {
+    for(size_t a = 0; a < planet->animals_length; a++) {
+        const uint8_t IS_RUNNING = (uint8_t)((status == 0) && (FREE > 0.0));
+        if(IS_RUNNING == 0) {
+            break;
+        }
         const AnimalCohort *animal = &planet->animals[a];
         const double BIOMASS = animal_biomass(animal);
-        if((animal->animal_type_index == pathogen->host_type_index) && (pathogen_is_at(pathogen, location) == 1)
-            && (animal->vertex_index == location->vertex_index) && (animal->location_kind == location->kind)
-            && (animal->layer_index == location->layer_index) && (BIOMASS > 0.0)) {
+        uint8_t is_host = (uint8_t)((animal->animal_type_index == pathogen->host_type_index) && (pathogen_is_at(pathogen, location) == 1));
+        is_host = (uint8_t)((is_host == 1) && (animal->vertex_index == location->vertex_index) && (animal->location_kind == location->kind));
+        is_host = (uint8_t)((is_host == 1) && (animal->layer_index == location->layer_index) && (BIOMASS > 0.0));
+        if(is_host == 1) {
             const double MATCH = pathogen_host_match(pathogen, animal->individual_mass_mol_carbon);
             const double COUNT = BIOMASS / animal->individual_mass_mol_carbon;
             const double PARTICLES = FREE / PATHOGEN_SPORE_MASS_MOL_CARBON;
@@ -19665,8 +22528,9 @@ uint8_t pathogen_add_animal_infection(Planet *planet, CandidateList *list, size_
             const double UPTAKE = PATHOGEN_SPORE_UPTAKE_LITRES_PER_DAY * exponential_double(pathogen->traits[PATHOGEN_TRAIT_ADSORPTION]) * factor;
             double encounters = UPTAKE * MATCH * PARTICLES * DENSITY * PATHOGEN_ROUTE_EFFICIENCIES[PATHOGEN_ROUTE_SPORE] * (1.0 + SPORE);
             const double INFECTIOUS = pathogen_infected_amount(pathogen) / animal->individual_mass_mol_carbon;
-            encounters = encounters + (PATHOGEN_CONTACT_LITRES_PER_DAY * MATCH * DENSITY * INFECTIOUS
-                * PATHOGEN_ROUTE_EFFICIENCIES[PATHOGEN_ROUTE_CONTACT]);
+            const double CONTACT_RATE = PATHOGEN_CONTACT_LITRES_PER_DAY * MATCH * DENSITY * INFECTIOUS;
+            const double CONTACT_ENCOUNTERS = CONTACT_RATE * PATHOGEN_ROUTE_EFFICIENCIES[PATHOGEN_ROUTE_CONTACT];
+            encounters = encounters + CONTACT_ENCOUNTERS;
             if(encounters > (PARTICLES / PATHOGEN_PARASITE_LATENT_DAYS)) {
                 encounters = PARTICLES / PATHOGEN_PARASITE_LATENT_DAYS;
             }
@@ -19695,7 +22559,12 @@ uint8_t pathogen_add_release(Planet *planet, CandidateList *list, size_t pathoge
     const double INFECTED = pathogen_infected_amount(pathogen);
     const double BURST = pathogen_burst_size(pathogen);
     const double LATENT = pathogen_latent_days(pathogen);
-    const double PARTICLE = (pathogen->is_parasite == 1) ? PATHOGEN_SPORE_MASS_MOL_CARBON : PATHOGEN_PARTICLE_MASS_MOL_CARBON;
+    double particle = 0.0;
+    if(pathogen->is_parasite == 1) {
+        particle = PATHOGEN_SPORE_MASS_MOL_CARBON;
+    } else {
+        particle = PATHOGEN_PARTICLE_MASS_MOL_CARBON;
+    }
     uint8_t status = 0;
     Transfer transfer;
     double released = 0.0;
@@ -19704,7 +22573,7 @@ uint8_t pathogen_add_release(Planet *planet, CandidateList *list, size_t pathoge
         const double *B = pathogen->infected_composition;
         double progeny = 0.0;
         if(pathogen->host_mass_mol_carbon > 0.0) {
-            progeny = BURST * PARTICLE * (RATE / pathogen->host_mass_mol_carbon);
+            progeny = BURST * particle * (RATE / pathogen->host_mass_mol_carbon);
         }
         if(progeny > RATE) {
             progeny = RATE;
@@ -19714,8 +22583,8 @@ uint8_t pathogen_add_release(Planet *planet, CandidateList *list, size_t pathoge
         transfer_add_pathogen(&transfer, (uint8_t)POOL_PATHOGEN_INFECTED, pathogen_index, -RATE, NULL);
         transfer_add_pathogen(&transfer, (uint8_t)POOL_PATHOGEN_FREE, pathogen_index, progeny, B);
         transfer_add_organic(&transfer, location, ORGANIC_PARTICULATE_LABILE_DETRITUS, (RATE - progeny) * PATHOGEN_LYSATE_PARTICULATE_SHARE, B);
-        transfer_add_organic_breakdown(&transfer, location, B, (RATE - progeny) * (1.0 - PATHOGEN_LYSATE_PARTICULATE_SHARE),
-            (uint8_t)BREAKDOWN_TO_DISSOLVED_ORGANICS);
+        const double DISSOLVED_LYSATE = (RATE - progeny) * (1.0 - PATHOGEN_LYSATE_PARTICULATE_SHARE);
+        transfer_add_organic_breakdown(&transfer, location, B, DISSOLVED_LYSATE, (uint8_t)BREAKDOWN_TO_DISSOLVED_ORGANICS);
         status = candidate_list_append(list, &transfer);
     }
     pathogen->last_production_mol_carbon_per_day = released;
@@ -19733,12 +22602,17 @@ uint8_t pathogen_add_induction(Planet *planet, CandidateList *list, size_t patho
         pathogen_location(pathogen, &location);
         double starvation = 0.0;
         double biomass = 0.0;
-        for(size_t c = 0; c < planet->cohorts_length; c++) {
-            const Cohort *cohort = &planet->cohorts[c];
-            if((cohort_is_at(cohort, &location) == 1) && (cohort->functional_type_index == pathogen->host_type_index) && (cohort->is_dormant == 0)) {
+        size_t cohort_index = planet_cohort_at_first(planet, &location);
+        for(size_t visit = 0; visit < planet->cohorts_length; visit++) {
+            if(cohort_index == COHORT_LOCATION_NONE) {
+                break;
+            }
+            const Cohort *cohort = &planet->cohorts[cohort_index];
+            if((cohort->functional_type_index == pathogen->host_type_index) && (cohort->is_dormant == 0)) {
                 biomass = biomass + cohort_biomass(cohort);
                 starvation = starvation + (cohort_biomass(cohort) / (1.0 + (cohort->last_growth_rate_per_day / cohort->maximum_growth_rate_per_day)));
             }
+            cohort_index = planet_cohort_at_next(planet, &location, cohort_index);
         }
         if(biomass > 0.0) {
             starvation = starvation / biomass;
@@ -19771,7 +22645,13 @@ uint8_t pathogen_add_decay(Planet *planet, CandidateList *list, size_t pathogen_
 uint8_t planet_add_pathogen_candidates(Planet *planet, CandidateList *list, const PathogenSettings *settings) {
     uint8_t status = 0;
     Location location;
-    for(size_t p = 0; (p < planet->pathogens_length) && (status == 0) && (settings->is_enabled == 1); p++) {
+    for(size_t p = 0; p < planet->pathogens_length; p++) {
+        if(status != 0) {
+            break;
+        }
+        if(settings->is_enabled != 1) {
+            break;
+        }
         pathogen_location(&planet->pathogens[p], &location);
         if(planet_location_is_valid(planet, &location) == 1) {
             const double VOLUME = planet_location_volume_litres(planet, &location);
@@ -19799,7 +22679,13 @@ uint8_t planet_apply_pathogen_faecal_route(Planet *planet, const PathogenSetting
     uint8_t status = 0;
     Location location;
     Transfer transfer;
-    for(size_t p = 0; (p < planet->pathogens_length) && (status == 0) && (settings->is_enabled == 1); p++) {
+    for(size_t p = 0; p < planet->pathogens_length; p++) {
+        if(status != 0) {
+            break;
+        }
+        if(settings->is_enabled != 1) {
+            break;
+        }
         Pathogen *pathogen = &planet->pathogens[p];
         const double INFECTED = pathogen_infected_amount(pathogen);
         pathogen_location(pathogen, &location);
@@ -19807,8 +22693,10 @@ uint8_t planet_apply_pathogen_faecal_route(Planet *planet, const PathogenSetting
             double shed = 0.0;
             for(size_t a = 0; a < planet->animals_length; a++) {
                 const AnimalCohort *animal = &planet->animals[a];
-                if((animal->vertex_index == location.vertex_index) && (animal->location_kind == location.kind)
-                    && (animal->layer_index == location.layer_index) && (animal->animal_type_index != pathogen->host_type_index)) {
+                uint8_t is_other_species = (uint8_t)((animal->vertex_index == location.vertex_index) && (animal->location_kind == location.kind));
+                is_other_species = (uint8_t)((is_other_species == 1) && (animal->layer_index == location.layer_index));
+                is_other_species = (uint8_t)((is_other_species == 1) && (animal->animal_type_index != pathogen->host_type_index));
+                if(is_other_species == 1) {
                     shed = shed + ANIMAL_BACKGROUND_MORTALITIES[animal->animal_type_index];
                 }
             }
@@ -19829,12 +22717,20 @@ uint8_t planet_apply_pathogen_vertical_route(Planet *planet, const PathogenSetti
     Location location;
     Location surface;
     Transfer transfer;
-    for(size_t p = 0; (p < planet->pathogens_length) && (status == 0) && (settings->is_enabled == 1); p++) {
+    for(size_t p = 0; p < planet->pathogens_length; p++) {
+        if(status != 0) {
+            break;
+        }
+        if(settings->is_enabled != 1) {
+            break;
+        }
         Pathogen *pathogen = &planet->pathogens[p];
         const double INFECTED = pathogen_infected_amount(pathogen);
         pathogen_location(pathogen, &location);
-        if((pathogen->is_parasite == 1) && (INFECTED > 0.0) && (planet_location_is_valid(planet, &location) == 1)
-            && (ANIMAL_MAKES_RESTING_EGGS[pathogen->host_type_index] == 1) && (planet_surface_location(planet, location.vertex_index, &surface) == 1)) {
+        uint8_t is_vertical = (uint8_t)((pathogen->is_parasite == 1) && (INFECTED > 0.0) && (planet_location_is_valid(planet, &location) == 1));
+        is_vertical = (uint8_t)((is_vertical == 1) && (ANIMAL_MAKES_RESTING_EGGS[pathogen->host_type_index] == 1));
+        is_vertical = (uint8_t)((is_vertical == 1) && (planet_surface_location(planet, location.vertex_index, &surface) == 1));
+        if(is_vertical == 1) {
             double resting = 0.0;
             for(size_t a = 0; a < planet->animals_length; a++) {
                 const AnimalCohort *animal = &planet->animals[a];
@@ -19842,8 +22738,8 @@ uint8_t planet_apply_pathogen_vertical_route(Planet *planet, const PathogenSetti
                     resting = animal->egg_laying_rate_per_day;
                 }
             }
-            const double MOVED = INFECTED * (1.0 - exponential_double(-resting * PATHOGEN_VERTICAL_FRACTION
-                * PATHOGEN_ROUTE_EFFICIENCIES[PATHOGEN_ROUTE_VERTICAL] * dt));
+            const double EXPONENT = -resting * PATHOGEN_VERTICAL_FRACTION * PATHOGEN_ROUTE_EFFICIENCIES[PATHOGEN_ROUTE_VERTICAL] * dt;
+            const double MOVED = INFECTED * (1.0 - exponential_double(EXPONENT));
             if(MOVED > 0.0) {
                 transfer_create(&transfer, PROCESS_PATHOGEN_RELEASE);
                 transfer_add_pathogen(&transfer, (uint8_t)POOL_PATHOGEN_INFECTED, p, -MOVED, NULL);
@@ -19860,12 +22756,19 @@ uint8_t planet_apply_pathogen_sinking(Planet *planet, const PathogenSettings *se
     Location location;
     Location below;
     Transfer transfer;
-    for(size_t p = 0; (p < planet->pathogens_length) && (status == 0) && (settings->is_enabled == 1); p++) {
+    for(size_t p = 0; p < planet->pathogens_length; p++) {
+        if(status != 0) {
+            break;
+        }
+        if(settings->is_enabled != 1) {
+            break;
+        }
         Pathogen *pathogen = &planet->pathogens[p];
         const double FREE = pathogen_free_amount(pathogen);
         pathogen_location(pathogen, &location);
-        if((pathogen->is_parasite == 1) && (FREE > 0.0) && (location.kind == LOCATION_WATER)
-            && (planet_location_is_valid(planet, &location) == 1)) {
+        uint8_t is_sinking = (uint8_t)((pathogen->is_parasite == 1) && (FREE > 0.0) && (location.kind == LOCATION_WATER));
+        is_sinking = (uint8_t)((is_sinking == 1) && (planet_location_is_valid(planet, &location) == 1));
+        if(is_sinking == 1) {
             const Planet_Vertex *vertex = &planet->vertices[location.vertex_index];
             const double THICKNESS = vertex->water_layer_thickness_metres[location.layer_index];
             uint8_t has_below = 0;
@@ -19894,10 +22797,18 @@ size_t planet_apply_pathogen_funnel(Planet *planet, PathogenSettings *settings, 
     size_t made = 0;
     Pathogen mutant;
     Transfer transfer;
-    for(size_t p = 0; (p < TOTAL) && (settings->is_enabled == 1); p++) {
+    for(size_t p = 0; p < TOTAL; p++) {
+        if(settings->is_enabled != 1) {
+            break;
+        }
         const Pathogen *parent = &planet->pathogens[p];
-        const double PARTICLE = (parent->is_parasite == 1) ? PATHOGEN_SPORE_MASS_MOL_CARBON : PATHOGEN_PARTICLE_MASS_MOL_CARBON;
-        const double BURSTS = (parent->last_production_mol_carbon_per_day * dt) / (PARTICLE * pathogen_burst_size(parent));
+        double particle = 0.0;
+        if(parent->is_parasite == 1) {
+            particle = PATHOGEN_SPORE_MASS_MOL_CARBON;
+        } else {
+            particle = PATHOGEN_PARTICLE_MASS_MOL_CARBON;
+        }
+        const double BURSTS = (parent->last_production_mol_carbon_per_day * dt) / (particle * pathogen_burst_size(parent));
         uint64_t total = 0;
         if((BURSTS > 0.0) && (planet->pathogens_length < settings->maximum_pathogens)) {
             total = stream_poisson(generator, settings->mutation_rate_per_burst * BURSTS);
@@ -19905,7 +22816,10 @@ size_t planet_apply_pathogen_funnel(Planet *planet, PathogenSettings *settings, 
         if(total > PATHOGEN_MAXIMUM_MUTATIONS) {
             total = PATHOGEN_MAXIMUM_MUTATIONS;
         }
-        for(uint64_t m = 0; (m < total) && (planet->pathogens_length < settings->maximum_pathogens); m++) {
+        for(uint64_t m = 0; m < total; m++) {
+            if(planet->pathogens_length >= settings->maximum_pathogens) {
+                break;
+            }
             Location location;
             pathogen_location(parent, &location);
             mutant = *parent;
@@ -19919,7 +22833,7 @@ size_t planet_apply_pathogen_funnel(Planet *planet, PathogenSettings *settings, 
             }
             mutant.traits[trait] = value;
             size_t index = planet_add_pathogen(planet, &mutant);
-            double seed = PARTICLE * PATHOGEN_MUTANT_SEED_PARTICLES;
+            double seed = particle * PATHOGEN_MUTANT_SEED_PARTICLES;
             if(seed > (0.5 * pathogen_free_amount(&planet->pathogens[p]))) {
                 seed = 0.5 * pathogen_free_amount(&planet->pathogens[p]);
             }
@@ -19968,11 +22882,31 @@ uint8_t planet_apply_pathogen_host_death(Planet *planet, size_t pathogen_index) 
 
 uint8_t planet_apply_pathogen_demography(Planet *planet, const PathogenSettings *settings) {
     uint8_t status = 0;
-    for(size_t p = 0; (p < planet->pathogens_length) && (settings->is_enabled == 1); p++) {
+    planet_build_cohort_location_index(planet);
+    for(size_t p = 0; p < planet->pathogens_length; p++) {
+        if(settings->is_enabled != 1) {
+            break;
+        }
         status = (uint8_t)(status + planet_apply_pathogen_host_death(planet, p));
     }
+    planet_invalidate_cohort_location_index(planet);
     return (uint8_t)(status != 0);
 }
+
+
+/*
+ * ToC02600 Microbiome
+ *
+ * Purpose:    Per-step microbial population processes: biofilm attachment, dormancy entry and
+ *             resuscitation, dispersal between locations, and horizontal gene transfer.
+ * Depends:    Planet, Cohort, MicrobialGenome, Transfer, Pathogens, PCG streams, Bits
+ * API:        planet_update_attachment, planet_apply_dormancy, planet_apply_dispersal, planet_apply_gene_transfer
+ * Ownership:  CohortIndex owns its slots array (cohort_index_build allocates, cohort_index_destroy frees).
+ *             Gene transfer allocates and frees its scratch arrays within the call.
+ * Invariants: CohortIndex capacity is a power of two at least twice the number of placed cohorts.
+ *             Biomass moves between cohorts only through planet_apply_transfer.
+ * Errors:     Allocation failure makes a process do nothing and return 0 events.
+ */
 
 const double DISPERSAL_SINKING_METRES_PER_DAY = 0.2;
 const double DISPERSAL_SINKING_REFERENCE_MASS = 1e-12;
@@ -19993,7 +22927,7 @@ const double TRANSDUCTION_SUCCESS = 0.1;
 const double CONJUGATION_LITRES_PER_DAY = 1e-13;
 const double BIOFILM_CONJUGATION_BOOST = 9.0;
 #define GENE_TRANSFER_MAXIMUM_EVENTS 4
-#define DISPERSAL_MAXIMUM_ROUTES (4 + MAXIMUM_VERTEX_NEIGHBORS)
+#define DISPERSAL_MAXIMUM_ROUTES 10
 
 typedef struct {
     size_t dispersal_moves;
@@ -20013,7 +22947,10 @@ typedef struct {
 } DispersalRoute;
 
 uint64_t hash_mix(uint64_t hash, uint64_t value) {
-    hash = hash ^ (value + UINT64_C(0x9e3779b97f4a7c15) + (hash << 6) + (hash >> 2));
+    const uint64_t SHIFTED_LEFT = hash * BITS_POWERS_OF_TWO[6];
+    const uint64_t SHIFTED_RIGHT = hash / BITS_POWERS_OF_TWO[2];
+    const uint64_t MIXED = ((value + UINT64_C(0x9e3779b97f4a7c15)) + SHIFTED_LEFT) + SHIFTED_RIGHT;
+    hash = bits_exclusive_or(hash, MIXED);
     return hash;
 }
 
@@ -20051,12 +22988,16 @@ uint64_t cohort_identity_hash(const Cohort *cohort, size_t vertex_index, uint8_t
 uint8_t cohort_identity_matches(const Cohort *cohort, const Cohort *pattern, size_t vertex_index, uint8_t kind, size_t layer_index, uint8_t is_dormant) {
     const MicrobialGenome *A = &cohort->genome;
     const MicrobialGenome *B = &pattern->genome;
-    uint8_t is_equal = (uint8_t)((cohort->functional_type_index == pattern->functional_type_index) && (cohort->vertex_index == vertex_index)
-        && (cohort->location_kind == kind) && (cohort->layer_index == layer_index) && (cohort->is_dormant == is_dormant));
+    uint8_t is_equal = (uint8_t)((cohort->functional_type_index == pattern->functional_type_index) && (cohort->vertex_index == vertex_index));
+    is_equal = (uint8_t)((is_equal == 1) && (cohort->location_kind == kind) && (cohort->layer_index == layer_index));
+    is_equal = (uint8_t)((is_equal == 1) && (cohort->is_dormant == is_dormant));
     is_equal = (uint8_t)(is_equal * (uint8_t)((A->total_potentiations == B->total_potentiations) && (A->is_actualised == B->is_actualised)));
     is_equal = (uint8_t)(is_equal * (uint8_t)((A->total_copies == B->total_copies) && (A->is_mutator == B->is_mutator)));
     is_equal = (uint8_t)(is_equal * (uint8_t)(A->total_passengers == B->total_passengers));
-    for(size_t i = 0; (i < TOTAL_MICROBIAL_LOCI) && (is_equal == 1); i++) {
+    for(size_t i = 0; i < TOTAL_MICROBIAL_LOCI; i++) {
+        if(is_equal != 1) {
+            break;
+        }
         is_equal = (uint8_t)(A->loci[i] == B->loci[i]);
     }
     return is_equal;
@@ -20064,9 +23005,13 @@ uint8_t cohort_identity_matches(const Cohort *cohort, const Cohort *pattern, siz
 
 void cohort_index_place(CohortIndex *index, const Planet *planet, size_t cohort_index) {
     const Cohort *C = &planet->cohorts[cohort_index];
-    size_t slot = (size_t)(cohort_identity_hash(C, C->vertex_index, C->location_kind, C->layer_index, C->is_dormant) & (uint64_t)(index->capacity - 1));
-    while(index->slots[slot] != SIZE_MAX) {
-        slot = (slot + 1) & (index->capacity - 1);
+    const uint64_t HASH = cohort_identity_hash(C, C->vertex_index, C->location_kind, C->layer_index, C->is_dormant);
+    size_t slot = (size_t)(HASH % (uint64_t)index->capacity);
+    for(size_t i = 0; i < index->capacity; i++) {
+        if(index->slots[slot] == SIZE_MAX) {
+            break;
+        }
+        slot = (slot + 1) % index->capacity;
     }
     index->slots[slot] = cohort_index;
     index->count = index->count + 1;
@@ -20074,7 +23019,10 @@ void cohort_index_place(CohortIndex *index, const Planet *planet, size_t cohort_
 
 uint8_t cohort_index_build(CohortIndex *index, const Planet *planet, size_t minimum_capacity) {
     size_t capacity = 64;
-    while(capacity < (4 * (minimum_capacity + 16))) {
+    for(size_t i = 0; i < BITS_TOTAL_WORD_BITS; i++) {
+        if(capacity >= (4 * (minimum_capacity + 16))) {
+            break;
+        }
         capacity = capacity * 2;
     }
     index->slots = (size_t *)malloc(capacity * sizeof(size_t));
@@ -20112,19 +23060,26 @@ void cohort_index_insert(CohortIndex *index, const Planet *planet, size_t cohort
 }
 
 size_t cohort_index_find(const CohortIndex *index, const Planet *planet, const Cohort *pattern, size_t vertex_index, uint8_t kind, size_t layer_index, uint8_t is_dormant) {
-    size_t slot = (size_t)(cohort_identity_hash(pattern, vertex_index, kind, layer_index, is_dormant) & (uint64_t)(index->capacity - 1));
-    while(index->slots[slot] != SIZE_MAX) {
+    const uint64_t HASH = cohort_identity_hash(pattern, vertex_index, kind, layer_index, is_dormant);
+    size_t slot = (size_t)(HASH % (uint64_t)index->capacity);
+    size_t found = SIZE_MAX;
+    for(size_t i = 0; i < index->capacity; i++) {
+        if(index->slots[slot] == SIZE_MAX) {
+            break;
+        }
         const size_t C = index->slots[slot];
         if(cohort_identity_matches(&planet->cohorts[C], pattern, vertex_index, kind, layer_index, is_dormant) == 1) {
-            return C;
+            found = C;
+            break;
         }
-        slot = (slot + 1) & (index->capacity - 1);
+        slot = (slot + 1) % index->capacity;
     }
-    return SIZE_MAX;
+    return found;
 }
 
 size_t planet_find_or_create_like(Planet *planet, CohortIndex *index, size_t source, const Location *location, uint8_t is_dormant, const MetabolismSettings *settings) {
-    size_t found = cohort_index_find(index, planet, &planet->cohorts[source], location->vertex_index, location->kind, location->layer_index, is_dormant);
+    const Cohort *PATTERN = &planet->cohorts[source];
+    size_t found = cohort_index_find(index, planet, PATTERN, location->vertex_index, location->kind, location->layer_index, is_dormant);
     if((found == SIZE_MAX) && (planet->cohorts_length < settings->maximum_cohorts)) {
         Cohort copy;
         cohort_copy(&copy, &planet->cohorts[source]);
@@ -20161,7 +23116,8 @@ uint8_t planet_move_cohort_biomass(Planet *planet, size_t from, size_t to, doubl
         for(size_t i = 0; i < TOTAL_CONSERVED_COMPONENTS; i++) {
             composition[i] = planet->cohorts[from].composition[i];
         }
-        const double CARRIER = (planet->cohorts[from].carrier_electrons_mol + planet->cohorts[from].carrier_compensation_electrons_mol) * (amount / FROM_BIOMASS);
+        const Cohort *SOURCE = &planet->cohorts[from];
+        const double CARRIER = (SOURCE->carrier_electrons_mol + SOURCE->carrier_compensation_electrons_mol) * (amount / FROM_BIOMASS);
         transfer_create(&transfer, PROCESS_MIXING);
         transfer_add_cohort(&transfer, from, -amount, NULL);
         transfer_add_cohort(&transfer, to, amount, composition);
@@ -20175,7 +23131,8 @@ uint8_t planet_move_cohort_biomass(Planet *planet, size_t from, size_t to, doubl
             if(LEFT > 0.0) {
                 planet->cohorts[from].attached_fraction = clamp_double(((FROM_ATTACHED * FROM_BIOMASS) - (moved_attached * amount)) / LEFT, 0.0, 1.0);
             }
-            planet->cohorts[to].attached_fraction = clamp_double(((TO_ATTACHED * TO_BIOMASS) + (moved_attached * amount)) / (TO_BIOMASS + amount), 0.0, 1.0);
+            const double TO_ATTACHED_SHARE = ((TO_ATTACHED * TO_BIOMASS) + (moved_attached * amount)) / (TO_BIOMASS + amount);
+            planet->cohorts[to].attached_fraction = clamp_double(TO_ATTACHED_SHARE, 0.0, 1.0);
         }
     }
     return status;
@@ -20205,28 +23162,28 @@ void planet_update_attachment(Planet *planet, const MetabolismSettings *settings
         Cohort *cohort = &planet->cohorts[c];
         if(settings->is_biofilm_on == 0) {
             cohort->attached_fraction = 0.0;
-            continue;
+        } else {
+            cohort_location(cohort, &location);
+            double base = BIOFILM_TERRAIN_ADHESION_BASE;
+            if(location.kind == LOCATION_WATER) {
+                const Planet_Vertex *V = &planet->vertices[location.vertex_index];
+                const double VOLUME = planet_location_volume_litres(planet, &location);
+                double particles = 0.0;
+                for(size_t k = 0; k < TOTAL_ORGANIC_PARTICULATE_CLASSES; k++) {
+                    particles = particles + V->water_layer_organic_particulate_amounts_mol_carbon[location.layer_index][k];
+                }
+                for(size_t m = 0; m < TOTAL_MINERAL_TYPES; m++) {
+                    particles = particles + V->water_layer_suspended_mineral_amounts_mol[location.layer_index][m];
+                }
+                double surface = 0.0;
+                if(VOLUME > 0.0) {
+                    surface = (particles / VOLUME) / ((particles / VOLUME) + BIOFILM_PARTICLE_HALF_SATURATION_MOL_PER_LITRE);
+                }
+                base = BIOFILM_WATER_ADHESION_BASE + ((BIOFILM_TERRAIN_ADHESION_BASE - BIOFILM_WATER_ADHESION_BASE) * surface);
+            }
+            const double TARGET = logistic_shift(base, (double)cohort->genome.loci[LOCUS_ADHESION]);
+            cohort->attached_fraction = clamp_double(cohort->attached_fraction + ((TARGET - cohort->attached_fraction) * RELAX), 0.0, 1.0);
         }
-        cohort_location(cohort, &location);
-        double base = BIOFILM_TERRAIN_ADHESION_BASE;
-        if(location.kind == LOCATION_WATER) {
-            const Planet_Vertex *V = &planet->vertices[location.vertex_index];
-            const double VOLUME = planet_location_volume_litres(planet, &location);
-            double particles = 0.0;
-            for(size_t k = 0; k < TOTAL_ORGANIC_PARTICULATE_CLASSES; k++) {
-                particles = particles + V->water_layer_organic_particulate_amounts_mol_carbon[location.layer_index][k];
-            }
-            for(size_t m = 0; m < TOTAL_MINERAL_TYPES; m++) {
-                particles = particles + V->water_layer_suspended_mineral_amounts_mol[location.layer_index][m];
-            }
-            double surface = 0.0;
-            if(VOLUME > 0.0) {
-                surface = (particles / VOLUME) / ((particles / VOLUME) + BIOFILM_PARTICLE_HALF_SATURATION_MOL_PER_LITRE);
-            }
-            base = BIOFILM_WATER_ADHESION_BASE + ((BIOFILM_TERRAIN_ADHESION_BASE - BIOFILM_WATER_ADHESION_BASE) * surface);
-        }
-        const double TARGET = logistic_shift(base, (double)cohort->genome.loci[LOCUS_ADHESION]);
-        cohort->attached_fraction = clamp_double(cohort->attached_fraction + ((TARGET - cohort->attached_fraction) * RELAX), 0.0, 1.0);
     }
 }
 
@@ -20244,44 +23201,44 @@ size_t planet_apply_dormancy(Planet *planet, const MetabolismSettings *settings,
     for(size_t c = 0; c < N0; c++) {
         Cohort *cohort = &planet->cohorts[c];
         const double BIOMASS = cohort_biomass(cohort);
-        if(BIOMASS <= 0.0) {
-            continue;
-        }
-        const double PROPENSITY = genome_performance_multiplier((double)cohort->genome.loci[LOCUS_DORMANCY]);
-        double rate = 0.0;
-        if(cohort->is_dormant == 0) {
-            cohort->last_potential_growth_rate_per_day = cohort->last_potential_growth_rate_per_day
-                + ((cohort->last_growth_rate_per_day - cohort->last_potential_growth_rate_per_day) * MEMORY);
-            double stress = 0.0;
-            if(cohort->mortality_rate_per_day > 0.0) {
-                stress = clamp_double(1.0 - (cohort->last_potential_growth_rate_per_day / cohort->mortality_rate_per_day), 0.0, 1.0);
+        const uint8_t IS_EMPTY = (uint8_t)(BIOMASS <= 0.0);
+        if(IS_EMPTY == 0) {
+            const double PROPENSITY = genome_performance_multiplier((double)cohort->genome.loci[LOCUS_DORMANCY]);
+            double rate = 0.0;
+            if(cohort->is_dormant == 0) {
+                const double GROWTH_GAP = cohort->last_growth_rate_per_day - cohort->last_potential_growth_rate_per_day;
+                cohort->last_potential_growth_rate_per_day = cohort->last_potential_growth_rate_per_day + (GROWTH_GAP * MEMORY);
+                double stress = 0.0;
+                if(cohort->mortality_rate_per_day > 0.0) {
+                    stress = clamp_double(1.0 - (cohort->last_potential_growth_rate_per_day / cohort->mortality_rate_per_day), 0.0, 1.0);
+                }
+                rate = PROPENSITY * ((DORMANCY_ENTRY_PER_DAY * stress) + DORMANCY_SPONTANEOUS_PER_DAY);
+            } else {
+                cohort_plan_build(planet, c, settings, &plan);
+                metabolism_solve_growth(&plan.problem, &solution);
+                cohort = &planet->cohorts[c];
+                cohort->last_potential_growth_rate_per_day = solution.growth_rate;
+                rate = RESUSCITATION_SCOUT_PER_DAY;
+                if(solution.growth_rate > cohort->mortality_rate_per_day) {
+                    rate = RESUSCITATION_PER_DAY;
+                }
             }
-            rate = PROPENSITY * ((DORMANCY_ENTRY_PER_DAY * stress) + DORMANCY_SPONTANEOUS_PER_DAY);
-        } else {
-            cohort_plan_build(planet, c, settings, &plan);
-            metabolism_solve_growth(&plan.problem, &solution);
-            cohort = &planet->cohorts[c];
-            cohort->last_potential_growth_rate_per_day = solution.growth_rate;
-            rate = RESUSCITATION_SCOUT_PER_DAY;
-            if(solution.growth_rate > cohort->mortality_rate_per_day) {
-                rate = RESUSCITATION_PER_DAY;
-            }
-        }
-        const double EXPECTED = BIOMASS * (1.0 - exponential_double(-rate * dt));
-        const double AMOUNT = stochastic_cell_amount(generator, cohort, EXPECTED, BIOMASS);
-        if(AMOUNT <= 0.0) {
-            continue;
-        }
-        cohort_location(cohort, &location);
-        const uint8_t TARGET_STATE = (uint8_t)(1 - cohort->is_dormant);
-        const double ATTACHED = cohort->attached_fraction;
-        const size_t TO = planet_find_or_create_like(planet, &index, c, &location, TARGET_STATE, settings);
-        if(TO != SIZE_MAX) {
-            if((TARGET_STATE == 0) && (cohort_biomass(&planet->cohorts[TO]) <= 0.0)) {
-                planet->cohorts[TO].last_potential_growth_rate_per_day = planet->cohorts[c].last_potential_growth_rate_per_day;
-            }
-            if(planet_move_cohort_biomass(planet, c, TO, AMOUNT, ATTACHED) == TRANSFER_APPLIED) {
-                transitions = transitions + 1;
+            const double EXPECTED = BIOMASS * (1.0 - exponential_double(-rate * dt));
+            const double AMOUNT = stochastic_cell_amount(generator, cohort, EXPECTED, BIOMASS);
+            const uint8_t IS_NOTHING_MOVED = (uint8_t)(AMOUNT <= 0.0);
+            if(IS_NOTHING_MOVED == 0) {
+                cohort_location(cohort, &location);
+                const uint8_t TARGET_STATE = (uint8_t)(1 - cohort->is_dormant);
+                const double ATTACHED = cohort->attached_fraction;
+                const size_t TO = planet_find_or_create_like(planet, &index, c, &location, TARGET_STATE, settings);
+                if(TO != SIZE_MAX) {
+                    if((TARGET_STATE == 0) && (cohort_biomass(&planet->cohorts[TO]) <= 0.0)) {
+                        planet->cohorts[TO].last_potential_growth_rate_per_day = planet->cohorts[c].last_potential_growth_rate_per_day;
+                    }
+                    if(planet_move_cohort_biomass(planet, c, TO, AMOUNT, ATTACHED) == TRANSFER_APPLIED) {
+                        transitions = transitions + 1;
+                    }
+                }
             }
         }
     }
@@ -20307,7 +23264,10 @@ size_t dispersal_add_aerial(const Planet *planet, size_t v, DispersalRoute *rout
         return n;
     }
     const double SHARE = DISPERSAL_AERIAL_PER_DAY / (double)planet->total_neighbors[v];
-    for(size_t k = 0; (k < planet->total_neighbors[v]) && (n < DISPERSAL_MAXIMUM_ROUTES); k++) {
+    for(size_t k = 0; k < planet->total_neighbors[v]; k++) {
+        if(n >= DISPERSAL_MAXIMUM_ROUTES) {
+            break;
+        }
         size_t w = planet->neighbor_indices[(v * MAXIMUM_VERTEX_NEIGHBORS) + k];
         if((w < planet->vertices_length) && (planet_top_location(planet, w, &routes[n].to) == 1)) {
             routes[n].rate = SHARE;
@@ -20331,16 +23291,32 @@ size_t dispersal_routes(const Planet *planet, const PhysicsSettings *physics, co
     }
     if(here.kind == LOCATION_WATER) {
         for(size_t side = 0; side < 2; side++) {
-            const uint8_t HAS = (side == 0) ? (uint8_t)(L > 0) : (uint8_t)((L + 1) < vertex->water_layers_length);
-            if(HAS == 1) {
-                const size_t OTHER = (side == 0) ? (L - 1) : (L + 1);
-                const size_t UPPER = (side == 0) ? OTHER : L;
-                double step = water_density(vertex->water_layer_temperature_kelvin[UPPER + 1]) - water_density(vertex->water_layer_temperature_kelvin[UPPER]);
+            uint8_t has_neighbour_layer = 0;
+            if(side == 0) {
+                has_neighbour_layer = (uint8_t)(L > 0);
+            } else {
+                has_neighbour_layer = (uint8_t)((L + 1) < vertex->water_layers_length);
+            }
+            if(has_neighbour_layer == 1) {
+                size_t other_layer = 0;
+                if(side == 0) {
+                    other_layer = L - 1;
+                } else {
+                    other_layer = L + 1;
+                }
+                size_t upper_layer = 0;
+                if(side == 0) {
+                    upper_layer = other_layer;
+                } else {
+                    upper_layer = L;
+                }
+                const double *TEMPERATURES = vertex->water_layer_temperature_kelvin;
+                double step = water_density(TEMPERATURES[upper_layer + 1]) - water_density(TEMPERATURES[upper_layer]);
                 double factor = 1.0;
                 if(step > 0.0) {
                     factor = exponential_double(-step / DENSITY_STABILITY_SCALE);
                 }
-                location_set(&routes[n].to, v, (uint8_t)LOCATION_WATER, OTHER);
+                location_set(&routes[n].to, v, (uint8_t)LOCATION_WATER, other_layer);
                 routes[n].rate = (physics->mixing_velocity * factor * AREA_LITRES) / VOLUME;
                 n = n + 1;
             }
@@ -20366,7 +23342,10 @@ size_t dispersal_routes(const Planet *planet, const PhysicsSettings *physics, co
             }
         }
         if((L == 0) && (is_lateral_on == 1) && (planet->neighbor_indices != NULL)) {
-            for(size_t k = 0; (k < planet->total_neighbors[v]) && (n < DISPERSAL_MAXIMUM_ROUTES); k++) {
+            for(size_t k = 0; k < planet->total_neighbors[v]; k++) {
+                if(n >= DISPERSAL_MAXIMUM_ROUTES) {
+                    break;
+                }
                 size_t w = planet->neighbor_indices[(v * MAXIMUM_VERTEX_NEIGHBORS) + k];
                 if((w < planet->vertices_length) && (planet->vertices[w].water_layers_length > 0)) {
                     location_set(&routes[n].to, w, (uint8_t)LOCATION_WATER, 0);
@@ -20405,8 +23384,7 @@ size_t dispersal_routes(const Planet *planet, const PhysicsSettings *physics, co
     return n;
 }
 
-size_t planet_apply_dispersal(Planet *planet, const PhysicsSettings *physics, const MetabolismSettings *settings, uint8_t is_lateral_on, double lateral_rate,
-    PCG *generator, double dt) {
+size_t planet_apply_dispersal(Planet *planet, const PhysicsSettings *physics, const MetabolismSettings *settings, uint8_t is_lateral_on, double lateral_rate, PCG *generator, double dt) {
     const size_t N0 = planet->cohorts_length;
     DispersalRoute routes[DISPERSAL_MAXIMUM_ROUTES];
     size_t moves = 0;
@@ -20415,33 +23393,34 @@ size_t planet_apply_dispersal(Planet *planet, const PhysicsSettings *physics, co
         return 0;
     }
     for(size_t c = 0; c < N0; c++) {
-        if(cohort_biomass(&planet->cohorts[c]) <= 0.0) {
-            continue;
-        }
-        const size_t COUNT = dispersal_routes(planet, physics, &planet->cohorts[c], is_lateral_on, lateral_rate, routes);
-        double total_rate = 0.0;
-        for(size_t r = 0; r < COUNT; r++) {
-            total_rate = total_rate + routes[r].rate;
-        }
-        if(total_rate <= 0.0) {
-            continue;
-        }
-        double out = 1.0 - exponential_double(-total_rate * dt);
-        if(out > DISPERSAL_MAXIMUM_FRACTION) {
-            out = DISPERSAL_MAXIMUM_FRACTION;
-        }
-        const double FREE_AT_START = cohort_biomass(&planet->cohorts[c]) * (1.0 - planet->cohorts[c].attached_fraction);
-        for(size_t r = 0; r < COUNT; r++) {
-            const Cohort *SOURCE = &planet->cohorts[c];
-            const double FREE_NOW = cohort_biomass(SOURCE) * (1.0 - SOURCE->attached_fraction);
-            const double EXPECTED = FREE_AT_START * out * (routes[r].rate / total_rate);
-            const double AMOUNT = stochastic_cell_amount(generator, SOURCE, EXPECTED, FREE_NOW);
-            if(AMOUNT <= 0.0) {
-                continue;
+        const uint8_t IS_EMPTY = (uint8_t)(cohort_biomass(&planet->cohorts[c]) <= 0.0);
+        if(IS_EMPTY == 0) {
+            const size_t COUNT = dispersal_routes(planet, physics, &planet->cohorts[c], is_lateral_on, lateral_rate, routes);
+            double total_rate = 0.0;
+            for(size_t r = 0; r < COUNT; r++) {
+                total_rate = total_rate + routes[r].rate;
             }
-            const size_t TO = planet_find_or_create_like(planet, &index, c, &routes[r].to, planet->cohorts[c].is_dormant, settings);
-            if((TO != SIZE_MAX) && (planet_move_cohort_biomass(planet, c, TO, AMOUNT, 0.0) == TRANSFER_APPLIED)) {
-                moves = moves + 1;
+            const uint8_t IS_STILL = (uint8_t)(total_rate <= 0.0);
+            if(IS_STILL == 0) {
+                double out = 1.0 - exponential_double(-total_rate * dt);
+                if(out > DISPERSAL_MAXIMUM_FRACTION) {
+                    out = DISPERSAL_MAXIMUM_FRACTION;
+                }
+                const double FREE_AT_START = cohort_biomass(&planet->cohorts[c]) * (1.0 - planet->cohorts[c].attached_fraction);
+                for(size_t r = 0; r < COUNT; r++) {
+                    const Cohort *SOURCE = &planet->cohorts[c];
+                    const double FREE_NOW = cohort_biomass(SOURCE) * (1.0 - SOURCE->attached_fraction);
+                    const double EXPECTED = FREE_AT_START * out * (routes[r].rate / total_rate);
+                    const double AMOUNT = stochastic_cell_amount(generator, SOURCE, EXPECTED, FREE_NOW);
+                    const uint8_t IS_NOTHING_MOVED = (uint8_t)(AMOUNT <= 0.0);
+                    if(IS_NOTHING_MOVED == 0) {
+                        const uint8_t IS_DORMANT = planet->cohorts[c].is_dormant;
+                        const size_t TO = planet_find_or_create_like(planet, &index, c, &routes[r].to, IS_DORMANT, settings);
+                        if((TO != SIZE_MAX) && (planet_move_cohort_biomass(planet, c, TO, AMOUNT, 0.0) == TRANSFER_APPLIED)) {
+                            moves = moves + 1;
+                        }
+                    }
+                }
             }
         }
     }
@@ -20454,13 +23433,63 @@ typedef struct {
     size_t index;
 } LocatedCohort;
 
-int located_cohort_compare(const void *a, const void *b) {
-    const LocatedCohort *A = (const LocatedCohort *)a;
-    const LocatedCohort *B = (const LocatedCohort *)b;
-    if(A->key != B->key) {
-        return (A->key < B->key) ? -1 : 1;
+uint8_t located_cohort_is_before(const LocatedCohort *first, const LocatedCohort *second) {
+    uint8_t is_before = 0;
+    if(first->key != second->key) {
+        is_before = (uint8_t)(first->key < second->key);
+    } else {
+        is_before = (uint8_t)(first->index < second->index);
     }
-    return (A->index < B->index) ? -1 : ((A->index > B->index) ? 1 : 0);
+    return is_before;
+}
+
+void located_cohort_sort(LocatedCohort *order, LocatedCohort *scratch, size_t total) {
+    LocatedCohort *source = order;
+    LocatedCohort *target = scratch;
+    size_t width = 1;
+    for(size_t pass = 0; pass < BITS_TOTAL_WORD_BITS; pass++) {
+        if(width >= total) {
+            break;
+        }
+        const size_t RUN_PAIR_LENGTH = 2 * width;
+        const size_t TOTAL_RUN_PAIRS = ((total - 1) / RUN_PAIR_LENGTH) + 1;
+        for(size_t pair_index = 0; pair_index < TOTAL_RUN_PAIRS; pair_index++) {
+            const size_t LEFT = pair_index * RUN_PAIR_LENGTH;
+            size_t middle = LEFT + width;
+            if(middle > total) {
+                middle = total;
+            }
+            size_t right = LEFT + RUN_PAIR_LENGTH;
+            if(right > total) {
+                right = total;
+            }
+            size_t left_index = LEFT;
+            size_t right_index = middle;
+            const size_t MERGED_LENGTH = right - LEFT;
+            for(size_t i = 0; i < MERGED_LENGTH; i++) {
+                uint8_t is_left_taken = 0;
+                if(right_index >= right) {
+                    is_left_taken = 1;
+                } else if(left_index < middle) {
+                    is_left_taken = (uint8_t)(located_cohort_is_before(&source[right_index], &source[left_index]) == 0);
+                }
+                if(is_left_taken == 1) {
+                    target[LEFT + i] = source[left_index];
+                    left_index++;
+                } else {
+                    target[LEFT + i] = source[right_index];
+                    right_index++;
+                }
+            }
+        }
+        LocatedCohort *finished = target;
+        target = source;
+        source = finished;
+        width = width * 2;
+    }
+    if(source != order) {
+        bytes_copy((uint8_t *)order, (const uint8_t *)source, total * sizeof(LocatedCohort));
+    }
 }
 
 double cohort_cells(const Cohort *cohort) {
@@ -20512,139 +23541,183 @@ size_t planet_apply_gene_transfer(Planet *planet, MetabolismSettings *settings, 
         return 0;
     }
     LocatedCohort *order = (LocatedCohort *)malloc(N0 * sizeof(LocatedCohort));
+    LocatedCohort *order_scratch = (LocatedCohort *)malloc(N0 * sizeof(LocatedCohort));
     size_t *candidates = (size_t *)malloc(N0 * sizeof(size_t));
     double *weights = (double *)malloc(N0 * sizeof(double));
-    if((order == NULL) || (candidates == NULL) || (weights == NULL)) {
+    uint8_t is_missing = (uint8_t)((order == NULL) || (order_scratch == NULL));
+    is_missing = (uint8_t)((is_missing == 1) || (candidates == NULL) || (weights == NULL));
+    if(is_missing == 1) {
         free(order);
+        free(order_scratch);
         free(candidates);
         free(weights);
         return 0;
     }
     for(size_t c = 0; c < N0; c++) {
         const Cohort *C = &planet->cohorts[c];
-        order[c].key = ((uint64_t)C->vertex_index << 24) | ((uint64_t)C->location_kind << 16) | (uint64_t)C->layer_index;
+        const uint64_t VERTEX_BITS = (uint64_t)C->vertex_index * BITS_POWERS_OF_TWO[24];
+        const uint64_t KIND_BITS = (uint64_t)C->location_kind * BITS_POWERS_OF_TWO[16];
+        order[c].key = bits_or(bits_or(VERTEX_BITS, KIND_BITS), (uint64_t)C->layer_index);
         order[c].index = c;
     }
-    qsort(order, N0, sizeof(LocatedCohort), located_cohort_compare);
+    located_cohort_sort(order, order_scratch, N0);
     size_t start = 0;
-    while(start < N0) {
+    for(size_t group_index = 0; group_index < N0; group_index++) {
+        if(start >= N0) {
+            break;
+        }
         size_t end = start + 1;
-        while((end < N0) && (order[end].key == order[start].key)) {
+        for(size_t scan_index = 0; scan_index < N0; scan_index++) {
+            if(end >= N0) {
+                break;
+            }
+            if(order[end].key != order[start].key) {
+                break;
+            }
             end = end + 1;
         }
+        const LocatedCohort *members = &order[start];
+        const size_t TOTAL_MEMBERS = end - start;
         Location location;
-        cohort_location(&planet->cohorts[order[start].index], &location);
+        cohort_location(&planet->cohorts[members[0].index], &location);
         const double VOLUME = planet_location_volume_litres(planet, &location);
-        for(size_t i = start; (i < end) && (VOLUME > 0.0); i++) {
-            const size_t R = order[i].index;
-            if((planet->cohorts[R].is_dormant == 1) || (cohort_cells(&planet->cohorts[R]) < 1.0)) {
-                continue;
+        for(size_t member_index = 0; member_index < TOTAL_MEMBERS; member_index++) {
+            const uint8_t HAS_VOLUME = (uint8_t)(VOLUME > 0.0);
+            if(HAS_VOLUME == 0) {
+                break;
             }
-            const size_t TYPE = planet->cohorts[R].functional_type_index;
-            const double CELLS = cohort_cells(&planet->cohorts[R]);
-            const uint8_t HAS_MODULE = (uint8_t)((planet->cohorts[R].genome.is_actualised == 1) && (planet->cohorts[R].genome.total_copies > 0));
-            double edna = 0.0;
-            double type_active_cells = 0.0;
-            double module_cells = 0.0;
-            for(size_t j = start; j < end; j++) {
-                const Cohort *D = &planet->cohorts[order[j].index];
-                const double D_CELLS = cohort_cells(D);
-                if(D->functional_type_index == TYPE) {
-                    edna = edna + (D_CELLS * cohort_effective_mortality(D) * EDNA_LIFETIME_DAYS);
-                    if(D->is_dormant == 0) {
-                        type_active_cells = type_active_cells + D_CELLS;
-                    }
-                }
-                if((D->is_dormant == 0) && (D->genome.is_actualised == 1) && (D->genome.total_copies > 0)) {
-                    module_cells = module_cells + D_CELLS;
-                }
-            }
-            double transducing = 0.0;
-            for(size_t p = 0; p < planet->pathogens_length; p++) {
-                const Pathogen *P = &planet->pathogens[p];
-                if((P->is_parasite == 0) && (P->host_type_index == TYPE) && (pathogen_is_at(P, &location) == 1)) {
-                    transducing = transducing + ((P->last_production_mol_carbon_per_day / PATHOGEN_PARTICLE_MASS_MOL_CARBON) * TRANSDUCING_FRACTION);
-                }
-            }
-            double expected_homologous = TRANSFORMATION_LITRES_PER_DAY * (edna / VOLUME) * CELLS * dt;
-            if(type_active_cells > 0.0) {
-                expected_homologous = expected_homologous + (TRANSDUCTION_SUCCESS * transducing * (CELLS / type_active_cells) * dt);
-            }
-            double expected_conjugation = 0.0;
-            if(HAS_MODULE == 0) {
-                expected_conjugation = CONJUGATION_LITRES_PER_DAY * (module_cells / VOLUME) * CELLS * (1.0 + (BIOFILM_CONJUGATION_BOOST * planet->cohorts[R].attached_fraction)) * dt;
-            }
-            uint64_t homologous = stream_poisson(generator, expected_homologous);
-            uint64_t conjugations = stream_poisson(generator, expected_conjugation);
-            if(homologous > GENE_TRANSFER_MAXIMUM_EVENTS) {
-                homologous = GENE_TRANSFER_MAXIMUM_EVENTS;
-            }
-            if(conjugations > 1) {
-                conjugations = 1;
-            }
-            double parent_growth = -1.0;
-            for(uint64_t e = 0; e < homologous; e++) {
-                size_t count = 0;
-                for(size_t j = start; j < end; j++) {
-                    const Cohort *D = &planet->cohorts[order[j].index];
-                    if((D->functional_type_index == TYPE) && (order[j].index != R)) {
-                        candidates[count] = order[j].index;
-                        weights[count] = cohort_cells(D) * cohort_effective_mortality(D);
+            const size_t R = members[member_index].index;
+            const uint8_t IS_SKIPPED = (uint8_t)((planet->cohorts[R].is_dormant == 1) || (cohort_cells(&planet->cohorts[R]) < 1.0));
+            if(IS_SKIPPED == 0) {
+                const size_t TYPE = planet->cohorts[R].functional_type_index;
+                const double CELLS = cohort_cells(&planet->cohorts[R]);
+                const uint8_t HAS_MODULE = (uint8_t)((planet->cohorts[R].genome.is_actualised == 1) && (planet->cohorts[R].genome.total_copies > 0));
+                double edna = 0.0;
+                double type_active_cells = 0.0;
+                double module_cells = 0.0;
+                for(size_t j = 0; j < TOTAL_MEMBERS; j++) {
+                    const Cohort *D = &planet->cohorts[members[j].index];
+                    const double D_CELLS = cohort_cells(D);
+                    if(D->functional_type_index == TYPE) {
+                        edna = edna + (D_CELLS * cohort_effective_mortality(D) * EDNA_LIFETIME_DAYS);
                         if(D->is_dormant == 0) {
-                            weights[count] = weights[count] + (cohort_cells(D) * (1.0 - cohort_resistance(D)) * (transducing / (type_active_cells + 1.0)));
+                            type_active_cells = type_active_cells + D_CELLS;
                         }
-                        count = count + 1;
                     }
-                }
-                const size_t DONOR = weighted_pick(generator, candidates, weights, count);
-                if(DONOR == SIZE_MAX) {
-                    break;
-                }
-                const size_t LOCUS = (size_t)uniform_uint32_generator(generator, 0, TOTAL_MICROBIAL_LOCI - 1);
-                if(planet->cohorts[DONOR].genome.loci[LOCUS] == planet->cohorts[R].genome.loci[LOCUS]) {
-                    continue;
-                }
-                MicrobialGenome genome;
-                microbial_genome_copy(&genome, &planet->cohorts[R].genome);
-                genome.loci[LOCUS] = planet->cohorts[DONOR].genome.loci[LOCUS];
-                if(parent_growth < 0.0) {
-                    parent_growth = cohort_trial_growth(planet, R, &planet->cohorts[R], settings);
-                }
-                events = events + planet_try_recombinant(planet, R, &genome, parent_growth, settings, generator);
-            }
-            for(uint64_t e = 0; e < conjugations; e++) {
-                size_t count = 0;
-                for(size_t j = start; j < end; j++) {
-                    const Cohort *D = &planet->cohorts[order[j].index];
                     if((D->is_dormant == 0) && (D->genome.is_actualised == 1) && (D->genome.total_copies > 0)) {
-                        candidates[count] = order[j].index;
-                        weights[count] = cohort_cells(D);
-                        count = count + 1;
+                        module_cells = module_cells + D_CELLS;
                     }
                 }
-                const size_t DONOR = weighted_pick(generator, candidates, weights, count);
-                if(DONOR == SIZE_MAX) {
-                    break;
+                double transducing = 0.0;
+                for(size_t p = 0; p < planet->pathogens_length; p++) {
+                    const Pathogen *P = &planet->pathogens[p];
+                    if((P->is_parasite == 0) && (P->host_type_index == TYPE) && (pathogen_is_at(P, &location) == 1)) {
+                        const double PARTICLES_PER_DAY = P->last_production_mol_carbon_per_day / PATHOGEN_PARTICLE_MASS_MOL_CARBON;
+                        transducing = transducing + (PARTICLES_PER_DAY * TRANSDUCING_FRACTION);
+                    }
                 }
-                MicrobialGenome genome;
-                microbial_genome_copy(&genome, &planet->cohorts[R].genome);
-                genome.is_actualised = 1;
-                genome.total_copies = 1;
-                if(planet->cohorts[DONOR].genome.total_potentiations > genome.total_potentiations) {
-                    genome.total_potentiations = planet->cohorts[DONOR].genome.total_potentiations;
+                double expected_homologous = TRANSFORMATION_LITRES_PER_DAY * (edna / VOLUME) * CELLS * dt;
+                if(type_active_cells > 0.0) {
+                    expected_homologous = expected_homologous + (TRANSDUCTION_SUCCESS * transducing * (CELLS / type_active_cells) * dt);
                 }
-                events = events + planet_instantiate_mutant(planet, R, &genome, 1.0, settings);
+                double expected_conjugation = 0.0;
+                if(HAS_MODULE == 0) {
+                    const double BIOFILM_FACTOR = 1.0 + (BIOFILM_CONJUGATION_BOOST * planet->cohorts[R].attached_fraction);
+                    expected_conjugation = CONJUGATION_LITRES_PER_DAY * (module_cells / VOLUME) * CELLS * BIOFILM_FACTOR * dt;
+                }
+                uint64_t homologous = stream_poisson(generator, expected_homologous);
+                uint64_t conjugations = stream_poisson(generator, expected_conjugation);
+                if(homologous > GENE_TRANSFER_MAXIMUM_EVENTS) {
+                    homologous = GENE_TRANSFER_MAXIMUM_EVENTS;
+                }
+                if(conjugations > 1) {
+                    conjugations = 1;
+                }
+                double parent_growth = -1.0;
+                for(uint64_t e = 0; e < homologous; e++) {
+                    size_t count = 0;
+                    for(size_t j = 0; j < TOTAL_MEMBERS; j++) {
+                        const Cohort *D = &planet->cohorts[members[j].index];
+                        if((D->functional_type_index == TYPE) && (members[j].index != R)) {
+                            candidates[count] = members[j].index;
+                            weights[count] = cohort_cells(D) * cohort_effective_mortality(D);
+                            if(D->is_dormant == 0) {
+                                const double SUSCEPTIBLE_CELLS = cohort_cells(D) * (1.0 - cohort_resistance(D));
+                                const double TRANSDUCED_WEIGHT = SUSCEPTIBLE_CELLS * (transducing / (type_active_cells + 1.0));
+                                weights[count] = weights[count] + TRANSDUCED_WEIGHT;
+                            }
+                            count = count + 1;
+                        }
+                    }
+                    const size_t DONOR = weighted_pick(generator, candidates, weights, count);
+                    if(DONOR == SIZE_MAX) {
+                        break;
+                    }
+                    const size_t LOCUS = (size_t)uniform_uint32_generator(generator, 0, TOTAL_MICROBIAL_LOCI - 1);
+                    const uint8_t IS_SAME_ALLELE = (uint8_t)(planet->cohorts[DONOR].genome.loci[LOCUS] == planet->cohorts[R].genome.loci[LOCUS]);
+                    if(IS_SAME_ALLELE == 0) {
+                        MicrobialGenome genome;
+                        microbial_genome_copy(&genome, &planet->cohorts[R].genome);
+                        genome.loci[LOCUS] = planet->cohorts[DONOR].genome.loci[LOCUS];
+                        if(parent_growth < 0.0) {
+                            parent_growth = cohort_trial_growth(planet, R, &planet->cohorts[R], settings);
+                        }
+                        events = events + planet_try_recombinant(planet, R, &genome, parent_growth, settings, generator);
+                    }
+                }
+                for(uint64_t e = 0; e < conjugations; e++) {
+                    size_t count = 0;
+                    for(size_t j = 0; j < TOTAL_MEMBERS; j++) {
+                        const Cohort *D = &planet->cohorts[members[j].index];
+                        if((D->is_dormant == 0) && (D->genome.is_actualised == 1) && (D->genome.total_copies > 0)) {
+                            candidates[count] = members[j].index;
+                            weights[count] = cohort_cells(D);
+                            count = count + 1;
+                        }
+                    }
+                    const size_t DONOR = weighted_pick(generator, candidates, weights, count);
+                    if(DONOR == SIZE_MAX) {
+                        break;
+                    }
+                    MicrobialGenome genome;
+                    microbial_genome_copy(&genome, &planet->cohorts[R].genome);
+                    genome.is_actualised = 1;
+                    genome.total_copies = 1;
+                    if(planet->cohorts[DONOR].genome.total_potentiations > genome.total_potentiations) {
+                        genome.total_potentiations = planet->cohorts[DONOR].genome.total_potentiations;
+                    }
+                    events = events + planet_instantiate_mutant(planet, R, &genome, 1.0, settings);
+                }
             }
         }
         start = end;
     }
     free(order);
+    free(order_scratch);
     free(candidates);
     free(weights);
     return events;
 }
 
+
+/*
+ * ToC02700 Simulation
+ *
+ * Purpose:    Builds a world from WorldSettings (planet, chemistry, microbes, animals, plants, pathogens)
+ *             and advances it with adaptive Heun steps followed by operator-split demography, dispersal,
+ *             hatching, pathogen routes and geology.
+ * Depends:    Planet, Physics, Chemistry, Metabolism, Animals, Plants, Pathogens, Microbiome, Geology, Weather
+ * API:        world_settings_create, world_settings_sample_planet, simulation_create, simulation_destroy,
+ *             simulation_step, simulation_copy (with climate_copy and planet_copy)
+ * Ownership:  The caller owns the Simulation storage. simulation_create and simulation_copy allocate the planet,
+ *             candidate lists and saved states; simulation_destroy frees them. Plants grow by doubling with realloc.
+ * Invariants: minimum_step_days <= step_days <= maximum_step_days after every step.
+ * Errors:     simulation_create returns nonzero if the world or climate could not be built;
+ *             simulation_step returns has_failed, which stays 1 after any failed step.
+ */
+
 #define MAXIMUM_STEP_ATTEMPTS 40
+#define COHORTS_PER_VERTEX 100
 
 const double SEDIMENT_IRON_HYDROXIDE_MOL_PER_LITRE = 1e-3;
 
@@ -20676,6 +23749,9 @@ typedef struct {
     double error_target;
     double absolute_tolerance_mol;
     double absolute_tolerance_fraction;
+    uint8_t is_limiter_halving_on;
+    double phototroph_seed_bank_fraction;
+    size_t cohorts_per_vertex;
     PhysicsSettings physics;
     ChemistrySettings chemistry;
     MetabolismSettings metabolism;
@@ -20686,8 +23762,13 @@ typedef struct {
     WeatherSettings weather;
 } WorldSettings;
 
+const double HETEROTROPH_MOL_CARBON_PER_LITRE = 1e-7;
+const double PHOTOTROPH_MOL_CARBON_PER_LITRE = 5e-9;
+const double DISSOLVED_ORGANIC_SEED_MOL_PER_LITRE = 5e-6;
+const double PHOTOTROPH_SEED_BANK_FRACTION = 1e-3;
+
 void world_settings_create(WorldSettings *settings) {
-    const double ANIMAL_DENSITIES[TOTAL_ANIMAL_TYPES] = {30.0, 0.0, 500.0, 5000.0, 1e-4, 1e-6, 100.0, 10.0, 0.01, 1e-5, 1e-7};
+    const double ANIMAL_DENSITIES[TOTAL_ANIMAL_TYPES] = {1.0, 1.0, 500.0, 5000.0, 1e-5, 1e-8, 100.0, 10.0, 0.01, 1e-5, 1e-7};
     const double PLANTS[TOTAL_PLANT_TYPES] = {10.0, 20.0, 200.0, 10.0, 5.0};
     const double PRESENCE[TOTAL_PLANT_TYPES] = {0.8, 0.5, 0.5, 0.5, 0.5};
     settings->seed = 1;
@@ -20715,8 +23796,14 @@ void world_settings_create(WorldSettings *settings) {
     settings->medium_mol_per_litre[DISSOLVED_MAGNESIUM] = 1e-4;
     settings->medium_mol_per_litre[DISSOLVED_SULFATE] = 1e-4;
     settings->medium_mol_per_litre[DISSOLVED_CHLORIDE] = 2.1e-4;
+    settings->medium_mol_per_litre[DISSOLVED_SUGAR] = DISSOLVED_ORGANIC_SEED_MOL_PER_LITRE;
+    settings->medium_mol_per_litre[DISSOLVED_ORGANIC_ACID] = DISSOLVED_ORGANIC_SEED_MOL_PER_LITRE;
+    settings->medium_mol_per_litre[DISSOLVED_AMINO_COMPOUND] = DISSOLVED_ORGANIC_SEED_MOL_PER_LITRE;
     for(size_t i = 0; i < TOTAL_FUNCTIONAL_TYPES; i++) {
-        settings->microbe_mol_carbon_per_litre[i] = 5e-9;
+        settings->microbe_mol_carbon_per_litre[i] = HETEROTROPH_MOL_CARBON_PER_LITRE;
+        if(FUNCTIONAL_TYPE_IS_PHOTOTROPH[i] == 1) {
+            settings->microbe_mol_carbon_per_litre[i] = PHOTOTROPH_MOL_CARBON_PER_LITRE;
+        }
     }
     settings->microbe_mol_carbon_per_litre[TYPE_OXYGENIC_PHOTOTROPH] = 1.5e-5;
     for(size_t i = 0; i < TOTAL_ANIMAL_TYPES; i++) {
@@ -20736,6 +23823,9 @@ void world_settings_create(WorldSettings *settings) {
     settings->error_target = 1e-4;
     settings->absolute_tolerance_mol = 1e-15;
     settings->absolute_tolerance_fraction = 0.01;
+    settings->is_limiter_halving_on = 0;
+    settings->phototroph_seed_bank_fraction = PHOTOTROPH_SEED_BANK_FRACTION;
+    settings->cohorts_per_vertex = COHORTS_PER_VERTEX;
     physics_settings_create(&settings->physics);
     chemistry_settings_create(&settings->chemistry);
     metabolism_settings_create(&settings->metabolism);
@@ -20745,7 +23835,6 @@ void world_settings_create(WorldSettings *settings) {
     geology_settings_create(&settings->geology);
     weather_settings_create(&settings->weather);
 }
-
 
 double planet_parameter_draw(PCG *generator, double mean, double deviation, double low, double high) {
     return terrain_clamp(mean + (deviation * stream_normal(generator)), low, high);
@@ -20813,6 +23902,7 @@ typedef struct {
     double last_error;
     double inventory_scales[TOTAL_CONSERVED_COMPONENTS];
     size_t last_limited_processes;
+    uint8_t is_limiter_halving_on;
     MicrobiomeDiagnostics microbiome;
 } Simulation;
 
@@ -20827,7 +23917,9 @@ void world_fill_location(Planet *planet, const Location *location, const double 
             if(i == DISSOLVED_NITROGEN_GAS) {
                 gas = GAS_NITROGEN;
             }
-            double henry = planet->gas_henry_constants_mol_per_litre_atmosphere[gas] * exponential_double(planet->gas_henry_temperature_factors_kelvin[gas] * ((1.0 / TEMPERATURE) - (1.0 / STANDARD_TEMPERATURE_KELVIN)));
+            const double INVERSE_TEMPERATURE_GAP = (1.0 / TEMPERATURE) - (1.0 / STANDARD_TEMPERATURE_KELVIN);
+            const double TEMPERATURE_FACTOR = exponential_double(planet->gas_henry_temperature_factors_kelvin[gas] * INVERSE_TEMPERATURE_GAP);
+            double henry = planet->gas_henry_constants_mol_per_litre_atmosphere[gas] * TEMPERATURE_FACTOR;
             amount = henry * OUTSIDE_AIR_ATMOSPHERES[gas] * VOLUME;
         }
         if(location->kind == LOCATION_WATER) {
@@ -20843,8 +23935,14 @@ void world_fill_location(Planet *planet, const Location *location, const double 
 }
 
 uint8_t simulation_build_planet(Simulation *simulation, const WorldSettings *settings) {
-    return planet_build_icosphere(&simulation->planet, settings->planet_levels, settings->ocean_surface_layer_metres, settings->lake_surface_layer_metres,
-        settings->ocean_water_layers, settings->minimum_water_metres, settings->is_latitude_insolation_on, &settings->terrain);
+    const double OCEAN_SURFACE = settings->ocean_surface_layer_metres;
+    const double LAKE_SURFACE = settings->lake_surface_layer_metres;
+    const size_t OCEAN_LAYERS = settings->ocean_water_layers;
+    const double MINIMUM_WATER = settings->minimum_water_metres;
+    const uint8_t IS_LATITUDE_ON = settings->is_latitude_insolation_on;
+    const TerrainSettings *TERRAIN = &settings->terrain;
+    const size_t LEVELS = settings->planet_levels;
+    return planet_build_icosphere(&simulation->planet, LEVELS, OCEAN_SURFACE, LAKE_SURFACE, OCEAN_LAYERS, MINIMUM_WATER, IS_LATITUDE_ON, TERRAIN);
 }
 
 size_t simulation_place_cohort(Simulation *simulation, size_t type_index, const Location *location, double biomass) {
@@ -20853,8 +23951,9 @@ size_t simulation_place_cohort(Simulation *simulation, size_t type_index, const 
     cohort_initialise(&cohort, type_index, location, &simulation->metabolism);
     size_t index = planet_add_cohort(planet, &cohort);
     if(index != SIZE_MAX) {
-        planet->cohorts[index].biomass_mol_carbon = biomass;
-        planet->cohorts[index].is_stochastic = (uint8_t)((biomass / planet->cohorts[index].cell_mass_mol_carbon) < simulation->metabolism.stochastic_high_cells);
+        Cohort *placed = &planet->cohorts[index];
+        placed->biomass_mol_carbon = biomass;
+        placed->is_stochastic = (uint8_t)((biomass / placed->cell_mass_mol_carbon) < simulation->metabolism.stochastic_high_cells);
     }
     return index;
 }
@@ -20865,11 +23964,18 @@ uint8_t simulation_place_microbes(Simulation *simulation, const WorldSettings *s
     Location locations[TOTAL_LOCATIONS_PER_VERTEX];
     uint8_t status = 0;
     for(size_t v = 0; v < planet->vertices_length; v++) {
+        Location surface;
+        const uint8_t HAS_SURFACE = planet_surface_location(planet, v, &surface);
         size_t count = planet_list_locations(planet, v, locations);
         for(size_t i = 0; i < count; i++) {
             const double VOLUME = planet_location_volume_litres(planet, &locations[i]);
+            const uint8_t IS_LIT = (uint8_t)((HAS_SURFACE == 1) && (location_equals(&locations[i], &surface) == 1));
             for(size_t type_index = 0; type_index < TOTAL_FUNCTIONAL_TYPES; type_index++) {
-                const double AMOUNT = settings->microbe_mol_carbon_per_litre[type_index] * VOLUME;
+                double seeded_fraction = 1.0;
+                if((FUNCTIONAL_TYPE_IS_PHOTOTROPH[type_index] == 1) && (IS_LIT == 0)) {
+                    seeded_fraction = settings->phototroph_seed_bank_fraction;
+                }
+                const double AMOUNT = (settings->microbe_mol_carbon_per_litre[type_index] * VOLUME) * seeded_fraction;
                 if((AMOUNT > 0.0) && (type_index == TYPE_OXYGENIC_PHOTOTROPH)) {
                     for(size_t strain = 0; strain < STRAINS; strain++) {
                         size_t index = simulation_place_cohort(simulation, type_index, &locations[i], AMOUNT / (double)STRAINS);
@@ -20881,7 +23987,8 @@ uint8_t simulation_place_microbes(Simulation *simulation, const WorldSettings *s
                             cohort->genome.loci[LOCUS_CELL_SIZE] = (float)((double)strain - 1.0);
                             cohort->genome.loci[LOCUS_PIGMENT] = (float)(0.3 * (1.0 - (double)strain));
                             cohort_apply_genome(cohort, &simulation->metabolism);
-                            cohort->is_stochastic = (uint8_t)((cohort->biomass_mol_carbon / cohort->cell_mass_mol_carbon) < simulation->metabolism.stochastic_high_cells);
+                            const double CELLS = cohort->biomass_mol_carbon / cohort->cell_mass_mol_carbon;
+                            cohort->is_stochastic = (uint8_t)(CELLS < simulation->metabolism.stochastic_high_cells);
                         }
                     }
                 } else if(AMOUNT > 0.0) {
@@ -20904,18 +24011,25 @@ uint8_t simulation_place_animals(Simulation *simulation, const WorldSettings *se
     for(size_t v = 0; v < planet->vertices_length; v++) {
         for(size_t type_index = 0; type_index < TOTAL_ANIMAL_TYPES; type_index++) {
             const uint8_t IS_LAND = (uint8_t)(ANIMAL_HABITATS[type_index] == HABITAT_LAND);
-            if(((IS_LAND == 0) && (planet->vertices[v].water_layers_length == 0)) || ((IS_LAND == 1) && (planet_is_land(planet, v) == 0))) {
-                continue;
-            }
-            location_set(&location, v, (uint8_t)((IS_LAND == 1) ? LOCATION_TERRAIN : LOCATION_WATER), 0);
-            const double COUNT = settings->animal_densities[type_index] * animal_space(planet, &location, type_index);
-            if(COUNT > 0.0) {
-                size_t index = planet_add_animal_cohort(planet, type_index, &location);
-                if(index == SIZE_MAX) {
-                    status = 1;
+            const uint8_t IS_DRY_FOR_WATER = (uint8_t)((IS_LAND == 0) && (planet->vertices[v].water_layers_length == 0));
+            const uint8_t IS_SKIPPED = (uint8_t)((IS_DRY_FOR_WATER == 1) || ((IS_LAND == 1) && (planet_is_land(planet, v) == 0)));
+            if(IS_SKIPPED == 0) {
+                uint8_t kind = (uint8_t)LOCATION_WATER;
+                if(IS_LAND == 1) {
+                    kind = (uint8_t)LOCATION_TERRAIN;
                 } else {
-                    planet->animals[index].biomass_mol_carbon = COUNT * ANIMAL_INDIVIDUAL_MASSES[type_index];
-                    planet->animals[index].individual_count = COUNT;
+                    kind = (uint8_t)LOCATION_WATER;
+                }
+                location_set(&location, v, kind, 0);
+                const double COUNT = settings->animal_densities[type_index] * animal_space(planet, &location, type_index);
+                if(COUNT > 0.0) {
+                    size_t index = planet_add_animal_cohort(planet, type_index, &location);
+                    if(index == SIZE_MAX) {
+                        status = 1;
+                    } else {
+                        planet->animals[index].biomass_mol_carbon = COUNT * ANIMAL_INDIVIDUAL_MASSES[type_index];
+                        planet->animals[index].individual_count = COUNT;
+                    }
                 }
             }
         }
@@ -20925,7 +24039,12 @@ uint8_t simulation_place_animals(Simulation *simulation, const WorldSettings *se
 
 size_t planet_add_plant(Planet *planet, size_t type_index, size_t vertex_index, double biomass) {
     if(planet->plants_length == planet->plants_capacity) {
-        size_t capacity = (planet->plants_capacity == 0) ? 16 : (2 * planet->plants_capacity);
+        size_t capacity = 0;
+        if(planet->plants_capacity == 0) {
+            capacity = 16;
+        } else {
+            capacity = 2 * planet->plants_capacity;
+        }
         PlantCohort *grown = (PlantCohort *)realloc(planet->plants, capacity * sizeof(PlantCohort));
         if(grown == NULL) {
             return SIZE_MAX;
@@ -20985,8 +24104,12 @@ uint8_t planet_remove_plant(Planet *planet, size_t index) {
         status = planet_apply_transfer(planet, &transfer);
     }
     if(status == 0) {
-        for(size_t p = index; (p + 1) < planet->plants_length; p++) {
-            planet->plants[p] = planet->plants[p + 1];
+        size_t total_shifted = 0;
+        if((index + 1) < planet->plants_length) {
+            total_shifted = planet->plants_length - (index + 1);
+        }
+        for(size_t i = 0; i < total_shifted; i++) {
+            planet->plants[index + i] = planet->plants[index + i + 1];
         }
         planet->plants_length = planet->plants_length - 1;
     }
@@ -21037,36 +24160,45 @@ size_t planet_apply_plant_dispersal(Planet *planet, double dt) {
         const size_t TYPE = PLANT->plant_type_index;
         const size_t V = PLANT->vertex_index;
         const double PRODUCTION = PLANT->last_net_production_mol_carbon_per_day;
-        if((PRODUCTION <= 0.0) || (plant_can_grow_at(planet, TYPE, V) == 0)) {
-            continue;
-        }
-        double seeds = PLANT_SEED_FRACTIONS[TYPE] * PRODUCTION * dt;
-        const double LEAF = plant_organ(PLANT, PLANT_ORGAN_LEAF);
-        seeds = (seeds < (0.5 * LEAF)) ? seeds : (0.5 * LEAF);
-        size_t targets[MAXIMUM_VERTEX_NEIGHBORS];
-        size_t count = 0;
-        for(size_t k = 0; k < planet->total_neighbors[V]; k++) {
-            const size_t W = planet->neighbor_indices[(V * MAXIMUM_VERTEX_NEIGHBORS) + k];
-            if((W < planet->vertices_length) && (plant_can_grow_at(planet, TYPE, W) == 1)) {
-                targets[count] = W;
-                count = count + 1;
+        const uint8_t IS_SKIPPED = (uint8_t)((PRODUCTION <= 0.0) || (plant_can_grow_at(planet, TYPE, V) == 0));
+        if(IS_SKIPPED == 0) {
+            double seeds = PLANT_SEED_FRACTIONS[TYPE] * PRODUCTION * dt;
+            const double LEAF = plant_organ(PLANT, PLANT_ORGAN_LEAF);
+            const uint8_t IS_BELOW_HALF_LEAF = (uint8_t)(seeds < (0.5 * LEAF));
+            if(IS_BELOW_HALF_LEAF == 0) {
+                seeds = 0.5 * LEAF;
             }
-        }
-        const double SPACING = square_root_double(planet->vertices[V].area_square_metres);
-        const double LEAVING = (count > 0) ? terrain_clamp((4.0 * PLANT_SEED_DISPERSAL_METRES[TYPE]) / SPACING, 0.0, 0.9) : 0.0;
-        if(planet_move_seeds(planet, p, V, (1.0 - LEAVING) * seeds) == 0) {
-            moves = moves + 1;
-        }
-        for(size_t i = 0; i < count; i++) {
-            if(planet_move_seeds(planet, p, targets[i], (LEAVING * seeds) / (double)count) == 0) {
+            size_t targets[MAXIMUM_VERTEX_NEIGHBORS];
+            size_t count = 0;
+            for(size_t k = 0; k < planet->total_neighbors[V]; k++) {
+                const size_t W = planet->neighbor_indices[(V * MAXIMUM_VERTEX_NEIGHBORS) + k];
+                if((W < planet->vertices_length) && (plant_can_grow_at(planet, TYPE, W) == 1)) {
+                    targets[count] = W;
+                    count = count + 1;
+                }
+            }
+            const double SPACING = square_root_double(planet->vertices[V].area_square_metres);
+            double leaving = 0.0;
+            if(count > 0) {
+                leaving = terrain_clamp((4.0 * PLANT_SEED_DISPERSAL_METRES[TYPE]) / SPACING, 0.0, 0.9);
+            } else {
+                leaving = 0.0;
+            }
+            if(planet_move_seeds(planet, p, V, (1.0 - leaving) * seeds) == 0) {
                 moves = moves + 1;
+            }
+            for(size_t i = 0; i < count; i++) {
+                if(planet_move_seeds(planet, p, targets[i], (leaving * seeds) / (double)count) == 0) {
+                    moves = moves + 1;
+                }
             }
         }
     }
     for(size_t p = planet->plants_length; p-- > 0;) {
         const PlantCohort *PLANT = &planet->plants[p];
-        const uint8_t IS_DEAD = (uint8_t)(plant_biomass(PLANT) < (PLANT_EXTINCT_MOL_CARBON * planet->vertices[PLANT->vertex_index].area_square_metres));
-        const uint8_t IS_STRANDED = (uint8_t)((PLANT_IS_AQUATIC[PLANT->plant_type_index] == 1) && (planet->vertices[PLANT->vertex_index].water_layers_length == 0));
+        const Planet_Vertex *VERTEX = &planet->vertices[PLANT->vertex_index];
+        const uint8_t IS_DEAD = (uint8_t)(plant_biomass(PLANT) < (PLANT_EXTINCT_MOL_CARBON * VERTEX->area_square_metres));
+        const uint8_t IS_STRANDED = (uint8_t)((PLANT_IS_AQUATIC[PLANT->plant_type_index] == 1) && (VERTEX->water_layers_length == 0));
         if((IS_DEAD == 1) || (IS_STRANDED == 1)) {
             planet_remove_plant(planet, p);
         }
@@ -21088,8 +24220,9 @@ uint8_t simulation_place_plants(Simulation *simulation, const WorldSettings *set
             }
         }
         if(planet_is_land(planet, v) == 1) {
+            double *soil = vertex->terrain_layer_organic_particulate_amounts_mol_carbon[0];
             for(size_t k = 0; k < TOTAL_ORGANIC_PARTICULATE_CLASSES; k++) {
-                vertex->terrain_layer_organic_particulate_amounts_mol_carbon[0][k] += settings->soil_organic_mol_carbon_per_square_metre[k] * vertex->area_square_metres;
+                soil[k] = soil[k] + (settings->soil_organic_mol_carbon_per_square_metre[k] * vertex->area_square_metres);
             }
         }
     }
@@ -21119,10 +24252,14 @@ uint8_t simulation_place_pathogens(Simulation *simulation, const WorldSettings *
                 }
             }
             for(size_t type_index = 0; type_index < TOTAL_ANIMAL_TYPES; type_index++) {
-                const uint8_t IS_HABITAT = (uint8_t)(((ANIMAL_HABITATS[type_index] == HABITAT_LAND) && (locations[i].kind == LOCATION_TERRAIN) && (locations[i].layer_index == 0)
-                    && (planet_is_land(planet, v) == 1)) || ((ANIMAL_HABITATS[type_index] == HABITAT_WATER) && (locations[i].kind == LOCATION_WATER)));
-                if((settings->pathogens.parasite_mol_carbon_per_litre > 0.0) && (settings->animal_densities[type_index] > 0.0) && (ANIMAL_HAS_PARASITES[type_index] == 1)
-                    && (IS_HABITAT == 1)) {
+                uint8_t is_land_habitat = (uint8_t)((ANIMAL_HABITATS[type_index] == HABITAT_LAND) && (locations[i].kind == LOCATION_TERRAIN));
+                is_land_habitat = (uint8_t)((is_land_habitat == 1) && (locations[i].layer_index == 0) && (planet_is_land(planet, v) == 1));
+                const uint8_t IS_WATER_HABITAT = (uint8_t)((ANIMAL_HABITATS[type_index] == HABITAT_WATER) && (locations[i].kind == LOCATION_WATER));
+                const uint8_t IS_HABITAT = (uint8_t)((is_land_habitat == 1) || (IS_WATER_HABITAT == 1));
+                const double PARASITE_DENSITY = settings->pathogens.parasite_mol_carbon_per_litre;
+                uint8_t is_seeded = (uint8_t)((PARASITE_DENSITY > 0.0) && (settings->animal_densities[type_index] > 0.0));
+                is_seeded = (uint8_t)((is_seeded == 1) && (ANIMAL_HAS_PARASITES[type_index] == 1) && (IS_HABITAT == 1));
+                if(is_seeded == 1) {
                     pathogen_create(&pathogen, 1, type_index, &locations[i]);
                     pathogen.traits[PATHOGEN_TRAIT_RANGE_CENTRE] = natural_logarithm_double(ANIMAL_INDIVIDUAL_MASSES[type_index]) / LOG_OF_TEN;
                     size_t index = planet_add_pathogen(planet, &pathogen);
@@ -21151,13 +24288,20 @@ uint8_t simulation_build_world(Simulation *simulation, const WorldSettings *sett
     if(status == 0) {
         planet_update_temperature(planet, &simulation->physics, 0.0);
     }
-    for(size_t v = 0; (v < planet->vertices_length) && (status == 0); v++) {
+    for(size_t v = 0; v < planet->vertices_length; v++) {
+        if(status != 0) {
+            break;
+        }
         size_t count = planet_list_locations(planet, v, locations);
         for(size_t i = 0; i < count; i++) {
             world_fill_location(planet, &locations[i], settings->medium_mol_per_litre);
         }
     }
     if(status == 0) {
+        const size_t SCALED_MAXIMUM_COHORTS = settings->cohorts_per_vertex * planet->vertices_length;
+        if(SCALED_MAXIMUM_COHORTS > simulation->metabolism.maximum_cohorts) {
+            simulation->metabolism.maximum_cohorts = SCALED_MAXIMUM_COHORTS;
+        }
         planet_fill_lithosphere(planet);
         planet_fill_outside_air(planet);
         status = simulation_place_microbes(simulation, settings);
@@ -21166,7 +24310,7 @@ uint8_t simulation_build_world(Simulation *simulation, const WorldSettings *sett
         status = (uint8_t)(status + simulation_place_pathogens(simulation, settings));
     }
     if(status == 0) {
-        planet_update_equilibria(planet, &simulation->chemistry);
+        planet_update_equilibria(planet);
         planet_inventory(planet, simulation->inventory_scales, scale);
     }
     return (uint8_t)(status != 0);
@@ -21199,6 +24343,7 @@ size_t simulation_create(Simulation *simulation, const WorldSettings *settings) 
     simulation->has_failed = 0;
     simulation->last_error = 0.0;
     simulation->last_limited_processes = 0;
+    simulation->is_limiter_halving_on = settings->is_limiter_halving_on;
     simulation->microbiome.dispersal_moves = 0;
     simulation->microbiome.dormancy_transitions = 0;
     simulation->microbiome.gene_transfers = 0;
@@ -21212,7 +24357,7 @@ size_t simulation_create(Simulation *simulation, const WorldSettings *settings) 
     if(problems == 0) {
         planet_initialise_water_column_temperatures(&simulation->planet);
         planet_update_light(&simulation->planet, &simulation->physics, 0.0);
-        planet_update_equilibria(&simulation->planet, &simulation->chemistry);
+        planet_update_equilibria(&simulation->planet);
     }
     return problems;
 }
@@ -21228,13 +24373,213 @@ void simulation_destroy(Simulation *simulation) {
     destroy_PCG(&simulation->funnel);
 }
 
+/*
+ * climate_copy
+ * Fills destination with a deep copy of source: every array is duplicated, nothing is shared.
+ * Inputs: destination  modified, caller-owned storage for one Climate (its old contents are ignored)
+ *         source       not modified
+ * Output: 0 success, 1 an allocation failed (every array that could not be copied is NULL, so
+ *         climate_destroy can still free destination)
+ * Memory: allocates every array of destination
+ */
+uint8_t climate_copy(Climate *destination, const Climate *source) {
+    const size_t N = source->total_vertices;
+    size_t edges_capacity = source->total_edges;
+    if(edges_capacity == 0) {
+        edges_capacity = 1;
+    }
+    const size_t CELL_BYTES = N * sizeof(WeatherCell);
+    const size_t VERTEX_DOUBLE_BYTES = N * sizeof(double);
+    const size_t VERTEX_SIZE_BYTES = N * sizeof(size_t);
+    const size_t VERTEX_FLAG_BYTES = N * sizeof(uint8_t);
+    const size_t VERTEX_VECTOR_BYTES = VERTEX_DOUBLE_BYTES * TOTAL_SPATIAL_AXES;
+    const size_t NEIGHBOUR_DOUBLE_BYTES = VERTEX_DOUBLE_BYTES * MAXIMUM_VERTEX_NEIGHBORS;
+    const size_t NEIGHBOUR_VECTOR_BYTES = NEIGHBOUR_DOUBLE_BYTES * TOTAL_SPATIAL_AXES;
+    const size_t EDGE_PAIR_BYTES = (edges_capacity * 2) * sizeof(size_t);
+    const size_t EDGE_DOUBLE_BYTES = edges_capacity * sizeof(double);
+    const size_t EDGE_VECTOR_BYTES = EDGE_DOUBLE_BYTES * TOTAL_SPATIAL_AXES;
+    uint8_t status = 0;
+    bytes_copy((uint8_t *)destination, (const uint8_t *)source, sizeof(Climate));
+    destination->cells = NULL;
+    destination->latitudes = NULL;
+    destination->east = NULL;
+    destination->north = NULL;
+    destination->neighbour_distances = NULL;
+    destination->neighbour_directions = NULL;
+    destination->edges = NULL;
+    destination->edge_lengths = NULL;
+    destination->edge_directions = NULL;
+    destination->edge_flux = NULL;
+    destination->is_ocean = NULL;
+    destination->flood_ranks = NULL;
+    destination->receivers = NULL;
+    destination->depressions = NULL;
+    destination->destinations = NULL;
+    destination->depression_sinks = NULL;
+    destination->depression_outlets = NULL;
+    destination->depression_destinations = NULL;
+    destination->downhill_order = NULL;
+    destination->depression_capacities_cubic_metres = NULL;
+    destination->receiver_distances = NULL;
+    destination->mass = NULL;
+    destination->outflow = NULL;
+    destination->evaporation = NULL;
+    destination->rain = NULL;
+    destination->snow = NULL;
+    destination->precipitation = NULL;
+    destination->next_surface = NULL;
+    destination->next_air = NULL;
+    destination->cells = (WeatherCell *)bytes_duplicate((const uint8_t *)source->cells, CELL_BYTES);
+    status = (uint8_t)((status == 1) || ((source->cells != NULL) && (destination->cells == NULL)));
+    destination->latitudes = (double *)bytes_duplicate((const uint8_t *)source->latitudes, VERTEX_DOUBLE_BYTES);
+    status = (uint8_t)((status == 1) || ((source->latitudes != NULL) && (destination->latitudes == NULL)));
+    destination->east = (double (*)[TOTAL_SPATIAL_AXES])bytes_duplicate((const uint8_t *)source->east, VERTEX_VECTOR_BYTES);
+    status = (uint8_t)((status == 1) || ((source->east != NULL) && (destination->east == NULL)));
+    destination->north = (double (*)[TOTAL_SPATIAL_AXES])bytes_duplicate((const uint8_t *)source->north, VERTEX_VECTOR_BYTES);
+    status = (uint8_t)((status == 1) || ((source->north != NULL) && (destination->north == NULL)));
+    destination->neighbour_distances = (double *)bytes_duplicate((const uint8_t *)source->neighbour_distances, NEIGHBOUR_DOUBLE_BYTES);
+    status = (uint8_t)((status == 1) || ((source->neighbour_distances != NULL) && (destination->neighbour_distances == NULL)));
+    const uint8_t *SOURCE_DIRECTIONS = (const uint8_t *)source->neighbour_directions;
+    destination->neighbour_directions = (double (*)[TOTAL_SPATIAL_AXES])bytes_duplicate(SOURCE_DIRECTIONS, NEIGHBOUR_VECTOR_BYTES);
+    status = (uint8_t)((status == 1) || ((source->neighbour_directions != NULL) && (destination->neighbour_directions == NULL)));
+    destination->edges = (size_t (*)[2])bytes_duplicate((const uint8_t *)source->edges, EDGE_PAIR_BYTES);
+    status = (uint8_t)((status == 1) || ((source->edges != NULL) && (destination->edges == NULL)));
+    destination->edge_lengths = (double *)bytes_duplicate((const uint8_t *)source->edge_lengths, EDGE_DOUBLE_BYTES);
+    status = (uint8_t)((status == 1) || ((source->edge_lengths != NULL) && (destination->edge_lengths == NULL)));
+    destination->edge_directions = (double (*)[TOTAL_SPATIAL_AXES])bytes_duplicate((const uint8_t *)source->edge_directions, EDGE_VECTOR_BYTES);
+    status = (uint8_t)((status == 1) || ((source->edge_directions != NULL) && (destination->edge_directions == NULL)));
+    destination->edge_flux = (double *)bytes_duplicate((const uint8_t *)source->edge_flux, EDGE_DOUBLE_BYTES);
+    status = (uint8_t)((status == 1) || ((source->edge_flux != NULL) && (destination->edge_flux == NULL)));
+    destination->is_ocean = (uint8_t *)bytes_duplicate((const uint8_t *)source->is_ocean, VERTEX_FLAG_BYTES);
+    status = (uint8_t)((status == 1) || ((source->is_ocean != NULL) && (destination->is_ocean == NULL)));
+    destination->flood_ranks = (size_t *)bytes_duplicate((const uint8_t *)source->flood_ranks, VERTEX_SIZE_BYTES);
+    status = (uint8_t)((status == 1) || ((source->flood_ranks != NULL) && (destination->flood_ranks == NULL)));
+    destination->receivers = (size_t *)bytes_duplicate((const uint8_t *)source->receivers, VERTEX_SIZE_BYTES);
+    status = (uint8_t)((status == 1) || ((source->receivers != NULL) && (destination->receivers == NULL)));
+    destination->depressions = (size_t *)bytes_duplicate((const uint8_t *)source->depressions, VERTEX_SIZE_BYTES);
+    status = (uint8_t)((status == 1) || ((source->depressions != NULL) && (destination->depressions == NULL)));
+    destination->destinations = (size_t *)bytes_duplicate((const uint8_t *)source->destinations, VERTEX_SIZE_BYTES);
+    status = (uint8_t)((status == 1) || ((source->destinations != NULL) && (destination->destinations == NULL)));
+    destination->depression_sinks = (size_t *)bytes_duplicate((const uint8_t *)source->depression_sinks, VERTEX_SIZE_BYTES);
+    status = (uint8_t)((status == 1) || ((source->depression_sinks != NULL) && (destination->depression_sinks == NULL)));
+    destination->depression_outlets = (size_t *)bytes_duplicate((const uint8_t *)source->depression_outlets, VERTEX_SIZE_BYTES);
+    status = (uint8_t)((status == 1) || ((source->depression_outlets != NULL) && (destination->depression_outlets == NULL)));
+    destination->depression_destinations = (size_t *)bytes_duplicate((const uint8_t *)source->depression_destinations, VERTEX_SIZE_BYTES);
+    status = (uint8_t)((status == 1) || ((source->depression_destinations != NULL) && (destination->depression_destinations == NULL)));
+    destination->downhill_order = (size_t *)bytes_duplicate((const uint8_t *)source->downhill_order, VERTEX_SIZE_BYTES);
+    status = (uint8_t)((status == 1) || ((source->downhill_order != NULL) && (destination->downhill_order == NULL)));
+    const double *SOURCE_CAPACITIES = source->depression_capacities_cubic_metres;
+    destination->depression_capacities_cubic_metres = (double *)bytes_duplicate((const uint8_t *)SOURCE_CAPACITIES, VERTEX_DOUBLE_BYTES);
+    const uint8_t IS_CAPACITIES_MISSING = (uint8_t)((SOURCE_CAPACITIES != NULL) && (destination->depression_capacities_cubic_metres == NULL));
+    status = (uint8_t)((status == 1) || (IS_CAPACITIES_MISSING == 1));
+    destination->receiver_distances = (double *)bytes_duplicate((const uint8_t *)source->receiver_distances, VERTEX_DOUBLE_BYTES);
+    status = (uint8_t)((status == 1) || ((source->receiver_distances != NULL) && (destination->receiver_distances == NULL)));
+    destination->mass = (double *)bytes_duplicate((const uint8_t *)source->mass, VERTEX_DOUBLE_BYTES);
+    status = (uint8_t)((status == 1) || ((source->mass != NULL) && (destination->mass == NULL)));
+    destination->outflow = (double *)bytes_duplicate((const uint8_t *)source->outflow, VERTEX_DOUBLE_BYTES);
+    status = (uint8_t)((status == 1) || ((source->outflow != NULL) && (destination->outflow == NULL)));
+    destination->evaporation = (double *)bytes_duplicate((const uint8_t *)source->evaporation, VERTEX_DOUBLE_BYTES);
+    status = (uint8_t)((status == 1) || ((source->evaporation != NULL) && (destination->evaporation == NULL)));
+    destination->rain = (double *)bytes_duplicate((const uint8_t *)source->rain, VERTEX_DOUBLE_BYTES);
+    status = (uint8_t)((status == 1) || ((source->rain != NULL) && (destination->rain == NULL)));
+    destination->snow = (double *)bytes_duplicate((const uint8_t *)source->snow, VERTEX_DOUBLE_BYTES);
+    status = (uint8_t)((status == 1) || ((source->snow != NULL) && (destination->snow == NULL)));
+    destination->precipitation = (double *)bytes_duplicate((const uint8_t *)source->precipitation, VERTEX_DOUBLE_BYTES);
+    status = (uint8_t)((status == 1) || ((source->precipitation != NULL) && (destination->precipitation == NULL)));
+    destination->next_surface = (double *)bytes_duplicate((const uint8_t *)source->next_surface, VERTEX_DOUBLE_BYTES);
+    status = (uint8_t)((status == 1) || ((source->next_surface != NULL) && (destination->next_surface == NULL)));
+    destination->next_air = (double *)bytes_duplicate((const uint8_t *)source->next_air, VERTEX_DOUBLE_BYTES);
+    status = (uint8_t)((status == 1) || ((source->next_air != NULL) && (destination->next_air == NULL)));
+    return status;
+}
+
+/*
+ * planet_copy
+ * Fills destination with a deep copy of source, including its Climate. The cohort location index is not
+ * copied; destination starts with an empty, invalid index.
+ * Inputs: destination  modified, caller-owned storage (its old contents are ignored, not freed)
+ *         source       not modified
+ * Output: 0 success, 1 an allocation failed (destination can still be passed to planet_destroy)
+ * Memory: allocates every array of destination and its Climate
+ */
+uint8_t planet_copy(Planet *destination, const Planet *source) {
+    const size_t V = source->vertices_length;
+    uint8_t status = 0;
+    bytes_copy((uint8_t *)destination, (const uint8_t *)source, sizeof(Planet));
+    destination->vertices = NULL;
+    destination->neighbor_indices = NULL;
+    destination->total_neighbors = NULL;
+    destination->cohorts = NULL;
+    destination->animals = NULL;
+    destination->pathogens = NULL;
+    destination->plants = NULL;
+    destination->vertex_positions = NULL;
+    destination->geology_sites = NULL;
+    destination->climate = NULL;
+    destination->cohort_location_heads = NULL;
+    destination->cohort_location_heads_capacity = 0;
+    destination->cohort_location_nexts = NULL;
+    destination->cohort_location_nexts_capacity = 0;
+    planet_invalidate_cohort_location_index(destination);
+    destination->vertices = (Planet_Vertex *)bytes_duplicate((const uint8_t *)source->vertices, V * sizeof(Planet_Vertex));
+    status = (uint8_t)((source->vertices != NULL) && (destination->vertices == NULL));
+    const size_t NEIGHBOUR_BYTES = (V * MAXIMUM_VERTEX_NEIGHBORS) * sizeof(size_t);
+    destination->neighbor_indices = (size_t *)bytes_duplicate((const uint8_t *)source->neighbor_indices, NEIGHBOUR_BYTES);
+    status = (uint8_t)((status == 1) || ((source->neighbor_indices != NULL) && (destination->neighbor_indices == NULL)));
+    destination->total_neighbors = (size_t *)bytes_duplicate((const uint8_t *)source->total_neighbors, V * sizeof(size_t));
+    status = (uint8_t)((status == 1) || ((source->total_neighbors != NULL) && (destination->total_neighbors == NULL)));
+    destination->cohorts = (Cohort *)bytes_duplicate((const uint8_t *)source->cohorts, source->cohorts_capacity * sizeof(Cohort));
+    status = (uint8_t)((status == 1) || ((source->cohorts != NULL) && (destination->cohorts == NULL)));
+    destination->animals = (AnimalCohort *)bytes_duplicate((const uint8_t *)source->animals, source->animals_capacity * sizeof(AnimalCohort));
+    status = (uint8_t)((status == 1) || ((source->animals != NULL) && (destination->animals == NULL)));
+    destination->pathogens = (Pathogen *)bytes_duplicate((const uint8_t *)source->pathogens, source->pathogens_capacity * sizeof(Pathogen));
+    status = (uint8_t)((status == 1) || ((source->pathogens != NULL) && (destination->pathogens == NULL)));
+    destination->plants = (PlantCohort *)bytes_duplicate((const uint8_t *)source->plants, source->plants_capacity * sizeof(PlantCohort));
+    status = (uint8_t)((status == 1) || ((source->plants != NULL) && (destination->plants == NULL)));
+    const size_t POSITION_BYTES = (V * TOTAL_SPATIAL_AXES) * sizeof(double);
+    destination->vertex_positions = (double (*)[TOTAL_SPATIAL_AXES])bytes_duplicate((const uint8_t *)source->vertex_positions, POSITION_BYTES);
+    status = (uint8_t)((status == 1) || ((source->vertex_positions != NULL) && (destination->vertex_positions == NULL)));
+    destination->geology_sites = (GeologySite *)bytes_duplicate((const uint8_t *)source->geology_sites, V * sizeof(GeologySite));
+    status = (uint8_t)((status == 1) || ((source->geology_sites != NULL) && (destination->geology_sites == NULL)));
+    if(source->climate != NULL) {
+        destination->climate = (Climate *)malloc(sizeof(Climate));
+        if(destination->climate == NULL) {
+            status = 1;
+        } else {
+            status = (uint8_t)(status + climate_copy(destination->climate, source->climate));
+        }
+    }
+    return (uint8_t)(status != 0);
+}
+
+/*
+ * simulation_copy
+ * Fills destination with a deep copy of source so the two can be advanced independently and give identical
+ * results. Scratch buffers (candidate lists, saved step states) start empty in the copy.
+ * Inputs: destination  modified, caller-owned storage (its old contents are ignored, not freed)
+ *         source       not modified
+ * Output: 0 success, 1 an allocation failed (destination can still be passed to simulation_destroy)
+ * Memory: allocates every array of the destination planet and climate
+ */
+uint8_t simulation_copy(Simulation *destination, const Simulation *source) {
+    bytes_copy((uint8_t *)destination, (const uint8_t *)source, sizeof(Simulation));
+    candidate_list_create(&destination->start_list);
+    candidate_list_create(&destination->predicted_list);
+    planet_state_create(&destination->step_start);
+    planet_state_create(&destination->base);
+    planet_state_create(&destination->euler);
+    return planet_copy(&destination->planet, &source->planet);
+}
+
 uint8_t simulation_build_candidates(Simulation *simulation, CandidateList *list) {
     candidate_list_clear(list);
+    planet_build_cohort_location_index(&simulation->planet);
     uint8_t status = planet_add_abiotic_candidates(&simulation->planet, list, &simulation->chemistry);
     status = (uint8_t)(status + planet_add_metabolism_candidates(&simulation->planet, list, &simulation->metabolism));
     status = (uint8_t)(status + planet_add_animal_candidates(&simulation->planet, list, &simulation->animals));
     status = (uint8_t)(status + planet_add_plant_candidates(&simulation->planet, list, &simulation->animals));
     status = (uint8_t)(status + planet_add_pathogen_candidates(&simulation->planet, list, &simulation->pathogens));
+    planet_invalidate_cohort_location_index(&simulation->planet);
     return status;
 }
 
@@ -21319,13 +24664,17 @@ double simulation_step_error(const Simulation *simulation) {
         const Planet_Vertex *then = &euler->vertices[v];
         for(size_t i = 0; i < TOTAL_DISSOLVED_SPECIES; i++) {
             for(size_t layer = 0; layer < now->water_layers_length; layer++) {
-                double term = step_error_term(now->water_layer_dissolved_amounts_mol[layer][i], then->water_layer_dissolved_amounts_mol[layer][i], A + (F * scales[i]));
+                const double NOW_AMOUNT = now->water_layer_dissolved_amounts_mol[layer][i];
+                const double THEN_AMOUNT = then->water_layer_dissolved_amounts_mol[layer][i];
+                double term = step_error_term(NOW_AMOUNT, THEN_AMOUNT, A + (F * scales[i]));
                 if(term > error) {
                     error = term;
                 }
             }
             for(size_t layer = 0; layer < now->terrain_layers_length; layer++) {
-                double term = step_error_term(now->terrain_layer_porewater_dissolved_amounts_mol[layer][i], then->terrain_layer_porewater_dissolved_amounts_mol[layer][i], A + (F * scales[i]));
+                const double NOW_AMOUNT = now->terrain_layer_porewater_dissolved_amounts_mol[layer][i];
+                const double THEN_AMOUNT = then->terrain_layer_porewater_dissolved_amounts_mol[layer][i];
+                double term = step_error_term(NOW_AMOUNT, THEN_AMOUNT, A + (F * scales[i]));
                 if(term > error) {
                     error = term;
                 }
@@ -21339,13 +24688,15 @@ double simulation_step_error(const Simulation *simulation) {
         }
     }
     for(size_t a = 0; a < planet->animals_length; a++) {
-        double term = step_error_term(planet->animals[a].biomass_mol_carbon, euler->animals[a].biomass_mol_carbon, A + (F * planet->animals[a].biomass_mol_carbon));
+        const double ANIMAL_BIOMASS = planet->animals[a].biomass_mol_carbon;
+        double term = step_error_term(ANIMAL_BIOMASS, euler->animals[a].biomass_mol_carbon, A + (F * ANIMAL_BIOMASS));
         if(term > error) {
             error = term;
         }
     }
     for(size_t p = 0; p < planet->plants_length; p++) {
-        double term = step_error_term(plant_biomass(&planet->plants[p]), plant_biomass(&euler->plants[p]), A + (F * plant_biomass(&planet->plants[p])));
+        const double PLANT_BIOMASS = plant_biomass(&planet->plants[p]);
+        double term = step_error_term(PLANT_BIOMASS, plant_biomass(&euler->plants[p]), A + (F * PLANT_BIOMASS));
         if(term > error) {
             error = term;
         }
@@ -21376,11 +24727,16 @@ double hatching_cue(const Planet *planet, const Location *surface, size_t type_i
     const double TEMPERATURE = planet_location_temperature(planet, surface);
     const double VOLUME = planet_location_volume_litres(planet, surface);
     double food = 0.0;
-    for(size_t c = 0; c < planet->cohorts_length; c++) {
-        const Cohort *COHORT = &planet->cohorts[c];
-        if((cohort_is_at(COHORT, surface) == 1) && (FUNCTIONAL_TYPE_IS_PHOTOTROPH[COHORT->functional_type_index] == 1)) {
+    size_t cohort_index = planet_cohort_at_first(planet, surface);
+    for(size_t visit = 0; visit < planet->cohorts_length; visit++) {
+        if(cohort_index == COHORT_LOCATION_NONE) {
+            break;
+        }
+        const Cohort *COHORT = &planet->cohorts[cohort_index];
+        if(FUNCTIONAL_TYPE_IS_PHOTOTROPH[COHORT->functional_type_index] == 1) {
             food = food + (cohort_biomass(COHORT) / VOLUME);
         }
+        cohort_index = planet_cohort_at_next(planet, surface, cohort_index);
     }
     double cue = food / (food + HATCHING_FOOD_HALF_SATURATION);
     if((OXYGEN < (2.0 * ANIMAL_MINIMUM_OXYGEN[type_index])) || (TEMPERATURE < HATCHING_LOWEST_KELVIN) || (TEMPERATURE > HATCHING_HIGHEST_KELVIN)) {
@@ -21392,8 +24748,7 @@ double hatching_cue(const Planet *planet, const Location *surface, size_t type_i
     return cue;
 }
 
-double planet_hatch_location(Planet *planet, const Location *eggs, const Location *surface, size_t type_index, double hazard, PCG *generator,
-    double dt) {
+double planet_hatch_location(Planet *planet, const Location *eggs, const Location *surface, size_t type_index, double hazard, PCG *generator, double dt) {
     double composition[TOTAL_CONSERVED_COMPONENTS];
     const double *found = NULL;
     const size_t CLASS = ANIMAL_RESTING_CLASSES[type_index];
@@ -21411,10 +24766,15 @@ double planet_hatch_location(Planet *planet, const Location *eggs, const Locatio
         }
     }
     size_t cohort = SIZE_MAX;
-    for(size_t a = 0; (a < planet->animals_length) && (hatched >= 1.0); a++) {
+    for(size_t a = 0; a < planet->animals_length; a++) {
+        const uint8_t HAS_HATCHED = (uint8_t)(hatched >= 1.0);
+        if(HAS_HATCHED == 0) {
+            break;
+        }
         const AnimalCohort *ANIMAL = &planet->animals[a];
-        if((ANIMAL->animal_type_index == type_index) && (ANIMAL->vertex_index == surface->vertex_index) && (ANIMAL->location_kind == surface->kind)
-            && (ANIMAL->layer_index == surface->layer_index)) {
+        uint8_t is_here = (uint8_t)((ANIMAL->animal_type_index == type_index) && (ANIMAL->vertex_index == surface->vertex_index));
+        is_here = (uint8_t)((is_here == 1) && (ANIMAL->location_kind == surface->kind) && (ANIMAL->layer_index == surface->layer_index));
+        if(is_here == 1) {
             cohort = a;
         }
     }
@@ -21439,17 +24799,23 @@ double planet_hatch_resting_eggs(Planet *planet, PCG *generator, double dt) {
     Location locations[TOTAL_LOCATIONS_PER_VERTEX];
     Location surface;
     double hatched = 0.0;
+    planet_build_cohort_location_index(planet);
     for(size_t v = 0; v < planet->vertices_length; v++) {
         if(planet_surface_location(planet, v, &surface) == 1) {
             const size_t COUNT = planet_list_locations(planet, v, locations);
             for(size_t type = 0; type < TOTAL_ANIMAL_TYPES; type++) {
                 const double HAZARD = HATCHING_RATE_PER_DAY * hatching_cue(planet, &surface, type);
-                for(size_t i = 0; (i < COUNT) && (ANIMAL_MAKES_RESTING_EGGS[type] == 1) && (HAZARD > 0.0); i++) {
+                for(size_t i = 0; i < COUNT; i++) {
+                    const uint8_t IS_HATCHING = (uint8_t)((ANIMAL_MAKES_RESTING_EGGS[type] == 1) && (HAZARD > 0.0));
+                    if(IS_HATCHING == 0) {
+                        break;
+                    }
                     hatched = hatched + planet_hatch_location(planet, &locations[i], &surface, type, HAZARD, generator, dt);
                 }
             }
         }
     }
+    planet_invalidate_cohort_location_index(planet);
     return hatched;
 }
 
@@ -21457,7 +24823,7 @@ uint8_t simulation_attempt(Simulation *simulation, double dt, LimiterStatistics 
     Planet *planet = &simulation->planet;
     planet_update_light(planet, &simulation->physics, simulation->time_days + (0.5 * dt));
     planet_update_temperature(planet, &simulation->physics, dt);
-    uint8_t status = planet_update_equilibria(planet, &simulation->chemistry);
+    uint8_t status = planet_update_equilibria(planet);
     status = (uint8_t)(status + simulation_transport(simulation, 0.5 * dt));
     status = (uint8_t)(status + simulation_react(simulation, dt, statistics));
     return status;
@@ -21472,7 +24838,11 @@ uint8_t simulation_step(Simulation *simulation, double until) {
     if(limit < dt) {
         dt = limit;
     }
-    for(size_t attempt = 0; (attempt < MAXIMUM_STEP_ATTEMPTS) && (status == 0) && (dt > 0.0); attempt++) {
+    for(size_t attempt = 0; attempt < MAXIMUM_STEP_ATTEMPTS; attempt++) {
+        const uint8_t IS_RUNNING = (uint8_t)((status == 0) && (dt > 0.0));
+        if(IS_RUNNING == 0) {
+            break;
+        }
         limiter_statistics_create(&statistics);
         status = simulation_attempt(simulation, dt, &statistics);
         simulation->last_error = simulation_step_error(simulation);
@@ -21494,10 +24864,15 @@ uint8_t simulation_step(Simulation *simulation, double until) {
     planet_enforce_genotype_cap(planet, &simulation->metabolism);
     planet_apply_funnel(planet, &simulation->metabolism, &simulation->funnel, dt);
     planet_update_attachment(planet, &simulation->metabolism, dt);
-    simulation->microbiome.dormancy_transitions += planet_apply_dormancy(planet, &simulation->metabolism, &simulation->demography, dt);
-    simulation->microbiome.dispersal_moves += planet_apply_dispersal(planet, &simulation->physics, &simulation->metabolism, simulation->is_lateral_exchange_on,
-        simulation->lateral_rate, &simulation->demography, dt);
-    simulation->microbiome.gene_transfers += planet_apply_gene_transfer(planet, &simulation->metabolism, &simulation->funnel, dt);
+    const size_t TRANSITIONS = planet_apply_dormancy(planet, &simulation->metabolism, &simulation->demography, dt);
+    simulation->microbiome.dormancy_transitions = simulation->microbiome.dormancy_transitions + TRANSITIONS;
+    const uint8_t IS_LATERAL_ON = simulation->is_lateral_exchange_on;
+    const double LATERAL_RATE = simulation->lateral_rate;
+    PCG *demography = &simulation->demography;
+    const size_t MOVES = planet_apply_dispersal(planet, &simulation->physics, &simulation->metabolism, IS_LATERAL_ON, LATERAL_RATE, demography, dt);
+    simulation->microbiome.dispersal_moves = simulation->microbiome.dispersal_moves + MOVES;
+    const size_t TRANSFERS = planet_apply_gene_transfer(planet, &simulation->metabolism, &simulation->funnel, dt);
+    simulation->microbiome.gene_transfers = simulation->microbiome.gene_transfers + TRANSFERS;
     planet_apply_plant_dispersal(planet, dt);
     planet_hatch_resting_eggs(planet, &simulation->demography, dt);
     planet_apply_animal_demography(planet, dt);
@@ -21521,7 +24896,7 @@ uint8_t simulation_step(Simulation *simulation, double until) {
     if(factor > 1.2) {
         factor = 1.2;
     }
-    if(simulation->last_limited_processes > 2) {
+    if((simulation->is_limiter_halving_on == 1) && (simulation->last_limited_processes > 2)) {
         factor = 0.5;
     }
     double base = simulation->step_days;
@@ -21538,20 +24913,33 @@ uint8_t simulation_step(Simulation *simulation, double until) {
     return simulation->has_failed;
 }
 
+
+/*
+ * ToC02800 AnimalBrain
+ *
+ * Purpose:    Agent settings and the recurrent actor-critic network that animal cohorts use to choose
+ *             diet, effort, reproduction, egg laying and a target slot, built on the autograd engine.
+ * Depends:    AutomaticDifferentiationEngine, Tensor, PCG streams
+ * API:        agent_settings_create, brain_create, brain_destroy, brain_step and the brain_ graph builders
+ * Ownership:  AnimalBrain owns its engine; every parameter node is registered with the brain's optimizer.
+ * Invariants: total_parameters <= BRAIN_MAXIMUM_PARAMETERS. Head h owns logits
+ *             BRAIN_HEAD_OFFSETS[h] .. BRAIN_HEAD_OFFSETS[h] + BRAIN_HEAD_CHOICES[h] - 1.
+ * Errors:     Graph builders return node indices and do not report errors.
+ */
+
 #define STREAM_AGENTS 11
 
 #define BRAIN_SIZE_BINS 20
-#define BRAIN_SMALLEST_SIZE_DECADE -16.0
 #define BRAIN_GRID_CHANNELS 4
-#define BRAIN_GRID_INPUTS (BRAIN_SIZE_BINS * BRAIN_GRID_CHANNELS)
+#define BRAIN_GRID_INPUTS 80
 #define BRAIN_SELF_INPUTS 32
 #define BRAIN_SLOTS 8
 #define BRAIN_SLOT_INPUTS 16
 #define BRAIN_GRID_WIDTH 64
 #define BRAIN_SELF_WIDTH 64
 #define BRAIN_SLOT_WIDTH 24
-#define BRAIN_POOLED_WIDTH BRAIN_SLOT_WIDTH
-#define BRAIN_TORSO_INPUTS (BRAIN_GRID_WIDTH + BRAIN_SELF_WIDTH + BRAIN_POOLED_WIDTH)
+#define BRAIN_POOLED_WIDTH 24
+#define BRAIN_TORSO_INPUTS 152
 #define BRAIN_TORSO_WIDTH 128
 #define BRAIN_QUERY_WIDTH 16
 #define BRAIN_TOTAL_HEADS 5
@@ -21564,18 +24952,24 @@ uint8_t simulation_step(Simulation *simulation, double until) {
 #define BRAIN_EFFORT_CHOICES 4
 #define BRAIN_REPRODUCE_CHOICES 4
 #define BRAIN_EGG_CHOICES 2
-#define BRAIN_TARGET_CHOICES (BRAIN_SLOTS + 1)
-#define BRAIN_TARGET_NONE BRAIN_SLOTS
-#define BRAIN_MAXIMUM_CHOICES BRAIN_TARGET_CHOICES
-#define BRAIN_BIAS_INPUTS (BRAIN_DIET_CHOICES + BRAIN_EFFORT_CHOICES + BRAIN_REPRODUCE_CHOICES + BRAIN_EGG_CHOICES + BRAIN_TARGET_CHOICES)
+#define BRAIN_TARGET_CHOICES 9
+#define BRAIN_TARGET_NONE 8
+#define BRAIN_MAXIMUM_CHOICES 9
+#define BRAIN_BIAS_INPUTS 24
 #define BRAIN_MAXIMUM_PARAMETERS 160
 #define BRAIN_MINIBATCH_CHUNKS 32
 #define BRAIN_MAXIMUM_CHUNK_TICKS 64
 
 const float BRAIN_MASKED_LOGIT = -1e9f;
-const size_t BRAIN_HEAD_CHOICES[BRAIN_TOTAL_HEADS] = {BRAIN_DIET_CHOICES, BRAIN_EFFORT_CHOICES, BRAIN_REPRODUCE_CHOICES, BRAIN_EGG_CHOICES, BRAIN_TARGET_CHOICES};
-const size_t BRAIN_HEAD_OFFSETS[BRAIN_TOTAL_HEADS] = {0, BRAIN_DIET_CHOICES, BRAIN_DIET_CHOICES + BRAIN_EFFORT_CHOICES,
-    BRAIN_DIET_CHOICES + BRAIN_EFFORT_CHOICES + BRAIN_REPRODUCE_CHOICES, BRAIN_DIET_CHOICES + BRAIN_EFFORT_CHOICES + BRAIN_REPRODUCE_CHOICES + BRAIN_EGG_CHOICES};
+const double BRAIN_SMALLEST_SIZE_DECADE = -16.0;
+const size_t BRAIN_HEAD_CHOICES[BRAIN_TOTAL_HEADS] = {
+    BRAIN_DIET_CHOICES, BRAIN_EFFORT_CHOICES, BRAIN_REPRODUCE_CHOICES, BRAIN_EGG_CHOICES, BRAIN_TARGET_CHOICES
+};
+const size_t BRAIN_HEAD_OFFSETS[BRAIN_TOTAL_HEADS] = {
+    0, BRAIN_DIET_CHOICES, BRAIN_DIET_CHOICES + BRAIN_EFFORT_CHOICES,
+    BRAIN_DIET_CHOICES + BRAIN_EFFORT_CHOICES + BRAIN_REPRODUCE_CHOICES,
+    BRAIN_DIET_CHOICES + BRAIN_EFFORT_CHOICES + BRAIN_REPRODUCE_CHOICES + BRAIN_EGG_CHOICES
+};
 const double DIET_OFFSETS_DECADES[BRAIN_DIET_CHOICES] = {-1.0, -0.5, 0.0, 0.5, 1.0};
 const double EFFORT_LEVELS[BRAIN_EFFORT_CHOICES] = {0.0, 0.5, 1.0, 1.5};
 const double REPRODUCTION_SHARES[BRAIN_REPRODUCE_CHOICES] = {0.0, 0.02, 0.05, 0.15};
@@ -21657,8 +25051,13 @@ typedef struct {
 Tensor brain_tensor(size_t first, size_t second, size_t third, const float *data) {
     size_t dimensions[3] = {first, second, third};
     Tensor tensor = create_tensor(3, dimensions);
-    for(size_t i = 0; i < (first * second * third); i++) {
-        tensor.data[i] = (data != NULL) ? data[i] : 0.0f;
+    const size_t TOTAL_ELEMENTS = first * second * third;
+    for(size_t i = 0; i < TOTAL_ELEMENTS; i++) {
+        if(data != NULL) {
+            tensor.data[i] = data[i];
+        } else {
+            tensor.data[i] = 0.0f;
+        }
     }
     return tensor;
 }
@@ -21679,7 +25078,12 @@ size_t brain_input(AnimalBrain *brain) {
 size_t brain_parameter(AnimalBrain *brain, PCG *generator, size_t rows, size_t columns, float deviation) {
     size_t node = add_node(&brain->engine, AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_PARAMETER, NULL);
     Tensor tensor = brain_tensor(1, rows, columns, NULL);
-    for(size_t i = 0; (i < (rows * columns)) && (deviation > 0.0f); i++) {
+    const size_t TOTAL_ELEMENTS = rows * columns;
+    for(size_t i = 0; i < TOTAL_ELEMENTS; i++) {
+        const uint8_t HAS_DEVIATION = (uint8_t)(deviation > 0.0f);
+        if(HAS_DEVIATION == 0) {
+            break;
+        }
         tensor.data[i] = gaussian_float_generator(generator, 0.0f, deviation);
     }
     add_initial_recurrent_state(&brain->engine, node, tensor);
@@ -21721,7 +25125,7 @@ size_t brain_swiglu(AnimalBrain *brain, PCG *generator, size_t input, size_t fan
 
 size_t brain_concatenate(AnimalBrain *brain, size_t first, size_t second) {
     OperationConfiguration configuration;
-    memset(&configuration, 0, sizeof(configuration));
+    bytes_clear((uint8_t *)&configuration, sizeof(OperationConfiguration));
     configuration.concatenation_configuration.concatenation_dimension = 2;
     return brain_operation(brain, AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_CONCATENATE, first, second, &configuration);
 }
@@ -21733,6 +25137,7 @@ size_t brain_candidate_activation(AnimalBrain *brain, size_t input) {
 }
 
 size_t brain_gru(AnimalBrain *brain, PCG *generator, size_t input, size_t input_width, size_t width, size_t *state) {
+    const uint8_t MATRIX_MULTIPLICATION_OPERATION = AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_MATRIX_MULTIPLICATION;
     const float INPUT_DEVIATION = (float)square_root_double(1.0 / (double)input_width);
     const float DEVIATION = (float)square_root_double(1.0 / (double)width);
     const float CANDIDATE = 2.0f * DEVIATION;
@@ -21741,7 +25146,7 @@ size_t brain_gru(AnimalBrain *brain, PCG *generator, size_t input, size_t input_
     for(size_t g = 0; g < 2; g++) {
         size_t from_input = brain_dense(brain, generator, input, input_width, width, INPUT_DEVIATION);
         size_t recurrent = brain_parameter(brain, generator, width, width, DEVIATION);
-        size_t from_state = brain_operation(brain, AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_MATRIX_MULTIPLICATION, previous, recurrent, NULL);
+        size_t from_state = brain_operation(brain, MATRIX_MULTIPLICATION_OPERATION, previous, recurrent, NULL);
         size_t total = brain_operation(brain, AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_ADDITION, from_input, from_state, NULL);
         gates[g] = brain_operation(brain, AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_SIGMOID, total, SIZE_MAX, NULL);
     }
@@ -21761,17 +25166,19 @@ size_t brain_gru(AnimalBrain *brain, PCG *generator, size_t input, size_t input_
 }
 
 size_t brain_pointer_logits(AnimalBrain *brain, size_t query, size_t keys) {
+    const uint8_t MATRIX_MULTIPLICATION_OPERATION = AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_MATRIX_MULTIPLICATION;
     size_t products = brain_operation(brain, AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_MULTIPLICATION, keys, query, NULL);
-    size_t column = brain_operation(brain, AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_MATRIX_MULTIPLICATION, products, brain->pointer_sum, NULL);
+    size_t column = brain_operation(brain, MATRIX_MULTIPLICATION_OPERATION, products, brain->pointer_sum, NULL);
     size_t diagonal = brain_operation(brain, AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_MULTIPLICATION, column, brain->identity, NULL);
     return brain_operation(brain, AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_MATRIX_MULTIPLICATION, brain->ones_row, diagonal, NULL);
 }
 
 void brain_tower(AnimalBrain *brain, PCG *generator, BrainTower *tower) {
+    const uint8_t MATRIX_MULTIPLICATION_OPERATION = AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_MATRIX_MULTIPLICATION;
     size_t grid = brain_swiglu(brain, generator, brain->grid, BRAIN_GRID_INPUTS, BRAIN_GRID_WIDTH);
     size_t self = brain_swiglu(brain, generator, brain->self, BRAIN_SELF_INPUTS, BRAIN_SELF_WIDTH);
     size_t slots = brain_swiglu(brain, generator, brain->slots, BRAIN_SLOT_INPUTS, BRAIN_SLOT_WIDTH);
-    size_t pooled = brain_operation(brain, AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_MATRIX_MULTIPLICATION, brain->slot_weights, slots, NULL);
+    size_t pooled = brain_operation(brain, MATRIX_MULTIPLICATION_OPERATION, brain->slot_weights, slots, NULL);
     size_t joined = brain_concatenate(brain, grid, self);
     joined = brain_concatenate(brain, joined, pooled);
     size_t torso = brain_swiglu(brain, generator, joined, BRAIN_TORSO_INPUTS, BRAIN_TORSO_WIDTH);
@@ -21789,15 +25196,20 @@ void brain_create(AnimalBrain *brain, const AgentSettings *settings, uint64_t se
     const float HEAD_DEVIATION = 0.01f * (float)square_root_double(1.0 / (double)BRAIN_TORSO_WIDTH);
     const float KEY_DEVIATION = (float)square_root_double(1.0 / (double)BRAIN_SLOT_WIDTH);
     const float VALUE_DEVIATION = (float)square_root_double(1.0 / (double)BRAIN_TORSO_WIDTH);
+    const uint8_t ADDITION_OPERATION = AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_ADDITION;
+    const uint8_t MULTIPLICATION_OPERATION = AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_MULTIPLICATION;
+    const uint8_t SOFTMAX_OPERATION = AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_SOFTMAX;
+    const uint8_t CROSS_ENTROPY_OPERATION = AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_CATEGORICAL_CROSS_ENTROPY;
+    const uint8_t MEAN_SQUARE_ERROR_OPERATION = AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_MEAN_SQUARE_ERROR;
     OptimizerConfiguration optimizer;
     OperationConfiguration softmax_configuration;
     OperationConfiguration loss_configuration;
     BrainTower actor;
     BrainTower critic;
     PCG generator = create_PCG(seed, (2 * seed) + 1);
-    memset(&optimizer, 0, sizeof(optimizer));
-    memset(&softmax_configuration, 0, sizeof(softmax_configuration));
-    memset(&loss_configuration, 0, sizeof(loss_configuration));
+    bytes_clear((uint8_t *)&optimizer, sizeof(OptimizerConfiguration));
+    bytes_clear((uint8_t *)&softmax_configuration, sizeof(OperationConfiguration));
+    bytes_clear((uint8_t *)&loss_configuration, sizeof(OperationConfiguration));
     softmax_configuration.softmax_configuration.batch_dimension = 2;
     loss_configuration.loss_function_configuration.reduction_type = 1;
     optimizer.optimizer_type = AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPTIMIZER_TYPE_ADAM;
@@ -21838,20 +25250,16 @@ void brain_create(AnimalBrain *brain, const AgentSettings *settings, uint64_t se
     size_t pointer = brain_pointer_logits(brain, query, keys);
     size_t none = brain_dense(brain, &generator, actor.core, BRAIN_TORSO_WIDTH, 1, HEAD_DEVIATION);
     size_t target = brain_concatenate(brain, pointer, none);
-    brain->logits[BRAIN_HEAD_TARGET] = brain_operation(brain, AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_ADDITION, target,
-        brain->biases[BRAIN_HEAD_TARGET], NULL);
+    brain->logits[BRAIN_HEAD_TARGET] = brain_operation(brain, ADDITION_OPERATION, target, brain->biases[BRAIN_HEAD_TARGET], NULL);
     for(size_t h = 0; h < BRAIN_TOTAL_HEADS; h++) {
-        brain->probabilities[h] = brain_operation(brain, AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_SOFTMAX, brain->logits[h], SIZE_MAX,
-            &softmax_configuration);
-        brain->policy_losses[h] = brain_operation(brain, AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_CATEGORICAL_CROSS_ENTROPY, brain->logits[h],
-            brain->policy_targets[h], &loss_configuration);
+        brain->probabilities[h] = brain_operation(brain, SOFTMAX_OPERATION, brain->logits[h], SIZE_MAX, &softmax_configuration);
+        brain->policy_losses[h] = brain_operation(brain, CROSS_ENTROPY_OPERATION, brain->logits[h], brain->policy_targets[h], &loss_configuration);
     }
     brain_tower(brain, &generator, &critic);
     brain->critic_state = critic.state;
     brain->value = brain_dense(brain, &generator, critic.core, BRAIN_TORSO_WIDTH, 1, VALUE_DEVIATION);
-    size_t masked = brain_operation(brain, AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_MULTIPLICATION, brain->value, brain->value_mask, NULL);
-    brain->value_loss = brain_operation(brain, AUTOMATIC_DIFFERENTIATION_GRAPH_ENGINE_OPERATION_TYPE_MEAN_SQUARE_ERROR, masked, brain->value_target,
-        &loss_configuration);
+    size_t masked = brain_operation(brain, MULTIPLICATION_OPERATION, brain->value, brain->value_mask, NULL);
+    brain->value_loss = brain_operation(brain, MEAN_SQUARE_ERROR_OPERATION, masked, brain->value_target, &loss_configuration);
     destroy_PCG(&generator);
 }
 
@@ -21894,15 +25302,41 @@ typedef struct {
 
 uint8_t brain_batch_create(BrainBatch *batch, size_t rows) {
     batch->rows = rows;
-    batch->grid = (float *)calloc(rows * BRAIN_GRID_INPUTS, sizeof(float));
-    batch->self = (float *)calloc(rows * BRAIN_SELF_INPUTS, sizeof(float));
-    batch->slots = (float *)calloc(rows * BRAIN_SLOTS * BRAIN_SLOT_INPUTS, sizeof(float));
-    batch->slot_weights = (float *)calloc(rows * BRAIN_SLOTS, sizeof(float));
-    batch->biases = (float *)calloc(rows * BRAIN_BIAS_INPUTS, sizeof(float));
-    batch->actor_states = (float *)calloc(rows * BRAIN_TORSO_WIDTH, sizeof(float));
-    batch->critic_states = (float *)calloc(rows * BRAIN_TORSO_WIDTH, sizeof(float));
-    return (uint8_t)((batch->grid == NULL) || (batch->self == NULL) || (batch->slots == NULL) || (batch->slot_weights == NULL)
-        || (batch->biases == NULL) || (batch->actor_states == NULL) || (batch->critic_states == NULL));
+    batch->grid = (float *)malloc((rows * BRAIN_GRID_INPUTS) * sizeof(float));
+    if(batch->grid != NULL) {
+        bytes_clear((uint8_t *)batch->grid, (rows * BRAIN_GRID_INPUTS) * sizeof(float));
+    }
+    batch->self = (float *)malloc((rows * BRAIN_SELF_INPUTS) * sizeof(float));
+    if(batch->self != NULL) {
+        bytes_clear((uint8_t *)batch->self, (rows * BRAIN_SELF_INPUTS) * sizeof(float));
+    }
+    batch->slots = (float *)malloc((rows * BRAIN_SLOTS * BRAIN_SLOT_INPUTS) * sizeof(float));
+    if(batch->slots != NULL) {
+        bytes_clear((uint8_t *)batch->slots, (rows * BRAIN_SLOTS * BRAIN_SLOT_INPUTS) * sizeof(float));
+    }
+    batch->slot_weights = (float *)malloc((rows * BRAIN_SLOTS) * sizeof(float));
+    if(batch->slot_weights != NULL) {
+        bytes_clear((uint8_t *)batch->slot_weights, (rows * BRAIN_SLOTS) * sizeof(float));
+    }
+    batch->biases = (float *)malloc((rows * BRAIN_BIAS_INPUTS) * sizeof(float));
+    if(batch->biases != NULL) {
+        bytes_clear((uint8_t *)batch->biases, (rows * BRAIN_BIAS_INPUTS) * sizeof(float));
+    }
+    batch->actor_states = (float *)malloc((rows * BRAIN_TORSO_WIDTH) * sizeof(float));
+    if(batch->actor_states != NULL) {
+        bytes_clear((uint8_t *)batch->actor_states, (rows * BRAIN_TORSO_WIDTH) * sizeof(float));
+    }
+    batch->critic_states = (float *)malloc((rows * BRAIN_TORSO_WIDTH) * sizeof(float));
+    if(batch->critic_states != NULL) {
+        bytes_clear((uint8_t *)batch->critic_states, (rows * BRAIN_TORSO_WIDTH) * sizeof(float));
+    }
+    uint8_t is_missing = (uint8_t)((batch->grid == NULL) || (batch->self == NULL));
+    is_missing = (uint8_t)((is_missing == 1) || (batch->slots == NULL));
+    is_missing = (uint8_t)((is_missing == 1) || (batch->slot_weights == NULL));
+    is_missing = (uint8_t)((is_missing == 1) || (batch->biases == NULL));
+    is_missing = (uint8_t)((is_missing == 1) || (batch->actor_states == NULL));
+    is_missing = (uint8_t)((is_missing == 1) || (batch->critic_states == NULL));
+    return is_missing;
 }
 
 void brain_batch_destroy(BrainBatch *batch) {
@@ -21939,6 +25373,22 @@ void brain_step(AnimalBrain *brain, const BrainBatch *batch) {
     }
     forward(&brain->engine);
 }
+
+
+/*
+ * ToC02900 AnimalWorld
+ *
+ * Purpose:    Agent bookkeeping for one planet: an AnimalBody per animal cohort, per-type experience buffers of
+ *             steps and chunks, the shared AnimalMinds (one brain per animal type) and the AnimalWorld wrapper.
+ * Depends:    AnimalBrain, Simulation, PCG streams
+ * API:        animal_world_create, animal_world_destroy, minds_create, minds_destroy, world_add_body,
+ *             agent_experience_add_step, agent_experience_add_chunk, agent_experience_clear, agent_clamp
+ * Ownership:  AnimalWorld owns its bodies array, experience buffers, simulation and generator; animal_world_destroy
+ *             frees them. AnimalMinds owns one AnimalBrain per animal type; minds_destroy frees them.
+ * Invariants: AgentChunk.previous is SIZE_MAX or the index of an earlier chunk of the same body.
+ * Errors:     world_add_body and the experience appenders return SIZE_MAX when growth fails;
+ *             animal_world_create returns 1 when the simulation cannot be built.
+ */
 
 typedef struct {
     uint8_t is_alive;
@@ -22027,7 +25477,15 @@ typedef struct {
 } AnimalWorld;
 
 double agent_clamp(double value, double low, double high) {
-    return (value < low) ? low : ((value > high) ? high : value);
+    double clamped = value;
+    if(value < low) {
+        clamped = low;
+    } else if(value > high) {
+        clamped = high;
+    } else {
+        clamped = value;
+    }
+    return clamped;
 }
 
 double agent_log10(double value) {
@@ -22040,7 +25498,12 @@ float agent_log_scale(double value, double floor, double offset, double scale) {
 
 size_t world_add_body(AnimalWorld *world, size_t cohort, size_t parent) {
     if(world->bodies_length == world->bodies_capacity) {
-        size_t capacity = (world->bodies_capacity == 0) ? 64 : (2 * world->bodies_capacity);
+        size_t capacity = 0;
+        if(world->bodies_capacity == 0) {
+            capacity = 64;
+        } else {
+            capacity = 2 * world->bodies_capacity;
+        }
         AnimalBody *grown = (AnimalBody *)realloc(world->bodies, capacity * sizeof(AnimalBody));
         if(grown == NULL) {
             return SIZE_MAX;
@@ -22051,7 +25514,7 @@ size_t world_add_body(AnimalWorld *world, size_t cohort, size_t parent) {
     const size_t INDEX = world->bodies_length;
     AnimalBody *body = &world->bodies[INDEX];
     AnimalCohort *animal = &world->simulation.planet.animals[cohort];
-    memset(body, 0, sizeof(AnimalBody));
+    bytes_clear((uint8_t *)body, sizeof(AnimalBody));
     body->is_alive = 1;
     body->is_seen = 1;
     body->type = animal->animal_type_index;
@@ -22062,7 +25525,11 @@ size_t world_add_body(AnimalWorld *world, size_t cohort, size_t parent) {
     body->step = SIZE_MAX;
     body->chunk = SIZE_MAX;
     body->last_chunk = SIZE_MAX;
-    body->founding_count = (animal->individual_count > 1.0) ? animal->individual_count : 1.0;
+    if(animal->individual_count > 1.0) {
+        body->founding_count = animal->individual_count;
+    } else {
+        body->founding_count = 1.0;
+    }
     body->actions[BRAIN_HEAD_DIET] = 2;
     body->actions[BRAIN_HEAD_EFFORT] = 2;
     body->actions[BRAIN_HEAD_REPRODUCE] = 0;
@@ -22095,7 +25562,12 @@ void agent_experience_destroy(AgentExperience *experience) {
 
 size_t agent_experience_add_step(AgentExperience *experience) {
     if(experience->steps_length == experience->steps_capacity) {
-        size_t capacity = (experience->steps_capacity == 0) ? 256 : (2 * experience->steps_capacity);
+        size_t capacity = 0;
+        if(experience->steps_capacity == 0) {
+            capacity = 256;
+        } else {
+            capacity = 2 * experience->steps_capacity;
+        }
         AgentStep *grown = (AgentStep *)realloc(experience->steps, capacity * sizeof(AgentStep));
         if(grown == NULL) {
             return SIZE_MAX;
@@ -22103,14 +25575,19 @@ size_t agent_experience_add_step(AgentExperience *experience) {
         experience->steps = grown;
         experience->steps_capacity = capacity;
     }
-    memset(&experience->steps[experience->steps_length], 0, sizeof(AgentStep));
+    bytes_clear((uint8_t *)&experience->steps[experience->steps_length], sizeof(AgentStep));
     experience->steps_length = experience->steps_length + 1;
     return experience->steps_length - 1;
 }
 
 size_t agent_experience_add_chunk(AgentExperience *experience) {
     if(experience->chunks_length == experience->chunks_capacity) {
-        size_t capacity = (experience->chunks_capacity == 0) ? 64 : (2 * experience->chunks_capacity);
+        size_t capacity = 0;
+        if(experience->chunks_capacity == 0) {
+            capacity = 64;
+        } else {
+            capacity = 2 * experience->chunks_capacity;
+        }
         AgentChunk *grown = (AgentChunk *)realloc(experience->chunks, capacity * sizeof(AgentChunk));
         if(grown == NULL) {
             return SIZE_MAX;
@@ -22118,7 +25595,7 @@ size_t agent_experience_add_chunk(AgentExperience *experience) {
         experience->chunks = grown;
         experience->chunks_capacity = capacity;
     }
-    memset(&experience->chunks[experience->chunks_length], 0, sizeof(AgentChunk));
+    bytes_clear((uint8_t *)&experience->chunks[experience->chunks_length], sizeof(AgentChunk));
     experience->chunks[experience->chunks_length].previous = SIZE_MAX;
     experience->chunks_length = experience->chunks_length + 1;
     return experience->chunks_length - 1;
@@ -22196,6 +25673,20 @@ void animal_world_destroy(AnimalWorld *world) {
     world->is_live = 0;
 }
 
+
+/*
+ * ToC03000 AgentEnvironment
+ *
+ * Purpose:    Summarises every water layer and land surface into a PlaceSummary, turns it into the grid, self,
+ *             slot and bias inputs of an AgentStep, and applies a body's chosen actions back to the planet.
+ * Depends:    AnimalWorld, Planet, Simulation, PoolTransfers, animal ecology tables
+ * API:        place_table_build, place_table_destroy, agent_observe, agent_slots, agent_apply_actions
+ * Ownership:  PlaceTable owns places, offsets and land; place_table_destroy frees them.
+ * Invariants: places[offsets[v] + l] is water layer l of vertex v; land[v] is SIZE_MAX or the land place
+ *             of vertex v. Slots 0 and 1 are the layers above and below; slots 2 and up are neighbours.
+ * Errors:     place_table_build returns 1 when an allocation fails; agent_place_individuals returns SIZE_MAX.
+ */
+
 typedef struct {
     uint8_t is_land;
     double space;
@@ -22248,19 +25739,37 @@ void place_fill(PlaceSummary *place, const Simulation *simulation, const Locatio
     AnimalCohort probe;
     const Planet_Vertex *VERTEX = &planet->vertices[location->vertex_index];
     place->is_land = (uint8_t)(location->kind == LOCATION_TERRAIN);
-    place->space = (place->is_land == 1) ? VERTEX->area_square_metres : planet_location_volume_litres(planet, location);
+    if(place->is_land == 1) {
+        place->space = VERTEX->area_square_metres;
+    } else {
+        place->space = planet_location_volume_litres(planet, location);
+    }
     place->ph = planet_location_ph(planet, location);
     double h = power_of_ten(-place->ph);
     planet_location_totals(planet, location, &totals, &constants);
     place->oxygen = planet_location_concentration(planet, location, DISSOLVED_OXYGEN);
     place->sulfide = totals.sulfide * (h / (h + constants.values[ACID_KS]));
     place->ammonia = totals.ammonia * (constants.values[ACID_KN] / (h + constants.values[ACID_KN]));
-    place->temperature = (place->is_land == 1) ? VERTEX->local_air_temperature_kelvin : planet_location_temperature(planet, location);
-    place->light = (place->is_land == 1) ? VERTEX->surface_light_watts_per_square_metre : VERTEX->water_layer_light_at_top_watts_per_square_metre[location->layer_index];
-    for(size_t k = 0; (k < TOTAL_ORGANIC_PARTICULATE_CLASSES) && (place->space > 0.0); k++) {
+    if(place->is_land == 1) {
+        place->temperature = VERTEX->local_air_temperature_kelvin;
+    } else {
+        place->temperature = planet_location_temperature(planet, location);
+    }
+    if(place->is_land == 1) {
+        place->light = VERTEX->surface_light_watts_per_square_metre;
+    } else {
+        place->light = VERTEX->water_layer_light_at_top_watts_per_square_metre[location->layer_index];
+    }
+    for(size_t k = 0; k < TOTAL_ORGANIC_PARTICULATE_CLASSES; k++) {
+        const uint8_t HAS_SPACE = (uint8_t)(place->space > 0.0);
+        if(HAS_SPACE == 0) {
+            break;
+        }
         const double *found = NULL;
         if(DETRITUS_PARTICLE_MASSES_MOL_CARBON[k] > 0.0) {
-            place->detritus[agent_size_bin(DETRITUS_PARTICLE_MASSES_MOL_CARBON[k])] += planet_location_organic(planet, location, k, &found) / place->space;
+            const size_t BIN = agent_size_bin(DETRITUS_PARTICLE_MASSES_MOL_CARBON[k]);
+            const double ORGANIC = planet_location_organic(planet, location, k, &found);
+            place->detritus[BIN] = place->detritus[BIN] + (ORGANIC / place->space);
         }
     }
     for(size_t t = 0; t < TOTAL_ANIMAL_TYPES; t++) {
@@ -22293,10 +25802,17 @@ uint8_t place_table_build(PlaceTable *table, const Simulation *simulation) {
             table->length = table->length + 1;
         }
     }
-    table->places = (PlaceSummary *)calloc((table->length > 0) ? table->length : 1, sizeof(PlaceSummary));
+    size_t total_places = 0;
+    if(table->length > 0) {
+        total_places = table->length;
+    } else {
+        total_places = 1;
+    }
+    table->places = (PlaceSummary *)malloc(total_places * sizeof(PlaceSummary));
     if(table->places == NULL) {
         return 1;
     }
+    bytes_clear((uint8_t *)table->places, total_places * sizeof(PlaceSummary));
     for(size_t v = 0; v < planet->vertices_length; v++) {
         for(size_t layer = 0; layer < planet->vertices[v].water_layers_length; layer++) {
             location_set(&location, v, (uint8_t)LOCATION_WATER, layer);
@@ -22316,7 +25832,8 @@ uint8_t place_table_build(PlaceTable *table, const Simulation *simulation) {
             place = &table->places[table->land[COHORT->vertex_index]];
         }
         if((place != NULL) && (place->space > 0.0)) {
-            place->microbes[agent_size_bin(COHORT->cell_mass_mol_carbon)] += cohort_grazeable_biomass(COHORT) / place->space;
+            const size_t BIN = agent_size_bin(COHORT->cell_mass_mol_carbon);
+            place->microbes[BIN] = place->microbes[BIN] + (cohort_grazeable_biomass(COHORT) / place->space);
         }
     }
     for(size_t p = 0; p < planet->plants_length; p++) {
@@ -22328,13 +25845,20 @@ uint8_t place_table_build(PlaceTable *table, const Simulation *simulation) {
                 place = &table->places[table->land[PLANT->vertex_index]];
             }
         } else if(VERTEX->water_layers_length > 0) {
-            const size_t LAYER = (PLANT->plant_type_index == PLANT_KELP) ? 0 : (VERTEX->water_layers_length - 1);
-            place = &table->places[table->offsets[PLANT->vertex_index] + LAYER];
+            size_t layer = 0;
+            if(PLANT->plant_type_index == PLANT_KELP) {
+                layer = 0;
+            } else {
+                layer = VERTEX->water_layers_length - 1;
+            }
+            place = &table->places[table->offsets[PLANT->vertex_index] + layer];
         }
         if((place != NULL) && (place->space > 0.0)) {
             const double LEAF = plant_organ(PLANT, PLANT_ORGAN_LEAF);
-            place->plants[PLANT->plant_type_index] += LEAF / place->space;
-            place->microbes[agent_size_bin(PLANT_NOMINAL_MASSES_MOL_CARBON[PLANT->plant_type_index])] += LEAF / place->space;
+            const size_t TYPE = PLANT->plant_type_index;
+            const size_t BIN = agent_size_bin(PLANT_NOMINAL_MASSES_MOL_CARBON[TYPE]);
+            place->plants[TYPE] = place->plants[TYPE] + (LEAF / place->space);
+            place->microbes[BIN] = place->microbes[BIN] + (LEAF / place->space);
         }
     }
     for(size_t a = 0; a < planet->animals_length; a++) {
@@ -22346,8 +25870,10 @@ uint8_t place_table_build(PlaceTable *table, const Simulation *simulation) {
             place = &table->places[table->land[ANIMAL->vertex_index]];
         }
         if((place != NULL) && (place->space > 0.0)) {
-            place->animals[agent_size_bin(ANIMAL->individual_mass_mol_carbon)] += animal_biomass(ANIMAL) / place->space;
-            place->animal_types[ANIMAL->animal_type_index] += animal_biomass(ANIMAL) / place->space;
+            const size_t BIN = agent_size_bin(ANIMAL->individual_mass_mol_carbon);
+            const size_t TYPE = ANIMAL->animal_type_index;
+            place->animals[BIN] = place->animals[BIN] + (animal_biomass(ANIMAL) / place->space);
+            place->animal_types[TYPE] = place->animal_types[TYPE] + (animal_biomass(ANIMAL) / place->space);
         }
     }
     return 0;
@@ -22369,10 +25895,26 @@ double place_food(const PlaceSummary *place, size_t type, double centre_decade, 
         double animals = place->animals[i];
         if(i == own_bin) {
             animals = animals - own_bin_biomass;
-            animals = (animals > 0.0) ? animals : 0.0;
+            const uint8_t IS_POSITIVE = (uint8_t)(animals > 0.0);
+            if(IS_POSITIVE == 0) {
+                animals = 0.0;
+            }
         }
-        food = food + (KERNEL * ((ANIMAL_MICROBE_PREFERENCES[type] * ((place->is_land == 1) ? 0.0 : place->microbes[i])) + (ANIMAL_ANIMAL_PREFERENCES[type] * animals)));
-        food = food + (place->detritus[i] * ((place->is_land == 1) ? ANIMAL_DETRITUS_PREFERENCES[type] : KERNEL));
+        double microbes = 0.0;
+        if(place->is_land == 1) {
+            microbes = 0.0;
+        } else {
+            microbes = place->microbes[i];
+        }
+        const double PREY = (ANIMAL_MICROBE_PREFERENCES[type] * microbes) + (ANIMAL_ANIMAL_PREFERENCES[type] * animals);
+        food = food + (KERNEL * PREY);
+        double detritus_weight = 0.0;
+        if(place->is_land == 1) {
+            detritus_weight = ANIMAL_DETRITUS_PREFERENCES[type];
+        } else {
+            detritus_weight = KERNEL;
+        }
+        food = food + (place->detritus[i] * detritus_weight);
     }
     for(size_t p = 0; p < TOTAL_PLANT_TYPES; p++) {
         food = food + (ANIMAL_PLANT_PREFERENCES[type][p] * ANIMAL_PLANT_REACH[type][p] * place->plants[p]);
@@ -22393,8 +25935,7 @@ double place_predators(const PlaceSummary *place, size_t type) {
     return pressure;
 }
 
-void agent_slots(const Simulation *simulation, const AnimalCohort *animal, const AgentSettings *settings, uint8_t *valid, size_t *vertices,
-    size_t *layers, double *rates) {
+void agent_slots(const Simulation *simulation, const AnimalCohort *animal, const AgentSettings *settings, uint8_t *valid, size_t *vertices, size_t *layers, double *rates) {
     const Planet *planet = &simulation->planet;
     const size_t V = animal->vertex_index;
     const size_t L = animal->layer_index;
@@ -22421,27 +25962,36 @@ void agent_slots(const Simulation *simulation, const AnimalCohort *animal, const
         for(size_t s = 0; s < 2; s++) {
             if(valid[s] == 1) {
                 double there = VERTEX->water_layer_thickness_metres[layers[s]];
-                there = (there < settings->vertical_reach_metres) ? there : settings->vertical_reach_metres;
+                const uint8_t IS_WITHIN_REACH = (uint8_t)(there < settings->vertical_reach_metres);
+                if(IS_WITHIN_REACH == 0) {
+                    there = settings->vertical_reach_metres;
+                }
                 rates[s] = agent_clamp(REACH / ((0.5 * HERE) + (0.5 * there)), 0.0, 1.0);
             }
         }
     }
-    for(size_t k = 0; (k < planet->total_neighbors[V]) && ((k + 2) < BRAIN_SLOTS); k++) {
+    for(size_t k = 0; k < planet->total_neighbors[V]; k++) {
+        if((k + 2) >= BRAIN_SLOTS) {
+            break;
+        }
         const size_t W = planet->neighbor_indices[(V * MAXIMUM_VERTEX_NEIGHBORS) + k];
-        if(W >= planet->vertices_length) {
-            continue;
-        }
-        if((IS_LAND == 1) && (planet_is_land(planet, W) == 1)) {
-            valid[k + 2] = 1;
-            vertices[k + 2] = W;
-            layers[k + 2] = 0;
-        } else if((IS_LAND == 0) && (planet->vertices[W].water_layers_length > 0)) {
-            valid[k + 2] = 1;
-            vertices[k + 2] = W;
-            layers[k + 2] = (L < planet->vertices[W].water_layers_length) ? L : (planet->vertices[W].water_layers_length - 1);
-        }
-        if(valid[k + 2] == 1) {
-            rates[k + 2] = agent_clamp(REACH / square_root_double(VERTEX->area_square_metres), 0.0, 1.0);
+        if(W < planet->vertices_length) {
+            if((IS_LAND == 1) && (planet_is_land(planet, W) == 1)) {
+                valid[k + 2] = 1;
+                vertices[k + 2] = W;
+                layers[k + 2] = 0;
+            } else if((IS_LAND == 0) && (planet->vertices[W].water_layers_length > 0)) {
+                valid[k + 2] = 1;
+                vertices[k + 2] = W;
+                if(L < planet->vertices[W].water_layers_length) {
+                    layers[k + 2] = L;
+                } else {
+                    layers[k + 2] = planet->vertices[W].water_layers_length - 1;
+                }
+            }
+            if(valid[k + 2] == 1) {
+                rates[k + 2] = agent_clamp(REACH / square_root_double(VERTEX->area_square_metres), 0.0, 1.0);
+            }
         }
     }
 }
@@ -22481,16 +26031,43 @@ void agent_observe(const AnimalWorld *world, const PlaceTable *table, AnimalBody
     const Planet *planet = &simulation->planet;
     const AnimalCohort *animal = &planet->animals[body->cohort];
     const size_t T = body->type;
-    const uint8_t KIND = (uint8_t)((ANIMAL_HABITATS[T] == HABITAT_LAND) ? LOCATION_TERRAIN : LOCATION_WATER);
+    uint8_t kind = 0;
+    if(ANIMAL_HABITATS[T] == HABITAT_LAND) {
+        kind = (uint8_t)LOCATION_TERRAIN;
+    } else {
+        kind = (uint8_t)LOCATION_WATER;
+    }
+    const uint8_t KIND = kind;
     const PlaceSummary *place = place_find(table, animal->vertex_index, KIND, animal->layer_index);
-    const double FLOOR = (place->is_land == 1) ? 1e-9 : 1e-12;
-    const double OFFSET = (place->is_land == 1) ? 0.0 : 6.0;
+    double log_floor = 0.0;
+    double log_offset = 0.0;
+    if(place->is_land == 1) {
+        log_floor = 1e-9;
+        log_offset = 0.0;
+    } else {
+        log_floor = 1e-12;
+        log_offset = 6.0;
+    }
+    const double FLOOR = log_floor;
+    const double OFFSET = log_offset;
     const double WIDTH = ANIMAL_FEEDING_WIDTHS[T];
     const double CENTRE = animal->feeding_centre_log10_mol_carbon;
     const double BIOMASS = animal_biomass(animal);
     const size_t OWN_BIN = agent_size_bin(animal->individual_mass_mol_carbon);
-    const double OWN = (place->space > 0.0) ? (BIOMASS / place->space) : 0.0;
-    const double MAXIMUM = ANIMAL_MAXIMUM_INGESTIONS[T] * ((BIOMASS > 0.0) ? BIOMASS : 1.0);
+    double own_density = 0.0;
+    if(place->space > 0.0) {
+        own_density = BIOMASS / place->space;
+    } else {
+        own_density = 0.0;
+    }
+    const double OWN = own_density;
+    double ingestion_scale = 0.0;
+    if(BIOMASS > 0.0) {
+        ingestion_scale = BIOMASS;
+    } else {
+        ingestion_scale = 1.0;
+    }
+    const double MAXIMUM = ANIMAL_MAXIMUM_INGESTIONS[T] * ingestion_scale;
     const Planet_Vertex *VERTEX = &planet->vertices[animal->vertex_index];
     const uint8_t IS_ADULT = animal_is_adult(animal);
     uint8_t valid[BRAIN_SLOTS];
@@ -22499,13 +26076,28 @@ void agent_observe(const AnimalWorld *world, const PlaceTable *table, AnimalBody
     double rates[BRAIN_SLOTS];
     float clock[4];
     double depth = 0.0;
-    for(size_t l = 0; (l < animal->layer_index) && (KIND == LOCATION_WATER); l++) {
+    for(size_t l = 0; l < animal->layer_index; l++) {
+        if(KIND != LOCATION_WATER) {
+            break;
+        }
         depth = depth + VERTEX->water_layer_thickness_metres[l];
     }
     for(size_t i = 0; i < BRAIN_SIZE_BINS; i++) {
-        double animals = place->animals[i] - ((i == OWN_BIN) ? OWN : 0.0);
+        double own_share = 0.0;
+        if(i == OWN_BIN) {
+            own_share = OWN;
+        } else {
+            own_share = 0.0;
+        }
+        double animals = place->animals[i] - own_share;
         step->grid[(i * BRAIN_GRID_CHANNELS) + 0] = agent_log_scale(place->microbes[i], FLOOR, OFFSET, 3.0);
-        step->grid[(i * BRAIN_GRID_CHANNELS) + 1] = agent_log_scale((animals > 0.0) ? animals : 0.0, FLOOR, OFFSET, 3.0);
+        double positive_animals = 0.0;
+        if(animals > 0.0) {
+            positive_animals = animals;
+        } else {
+            positive_animals = 0.0;
+        }
+        step->grid[(i * BRAIN_GRID_CHANNELS) + 1] = agent_log_scale(positive_animals, FLOOR, OFFSET, 3.0);
         step->grid[(i * BRAIN_GRID_CHANNELS) + 2] = agent_log_scale(place->detritus[i], FLOOR, OFFSET, 3.0);
         step->grid[(i * BRAIN_GRID_CHANNELS) + 3] = (float)agent_kernel(CENTRE, WIDTH, agent_bin_centre_decade(i));
     }
@@ -22516,7 +26108,19 @@ void agent_observe(const AnimalWorld *world, const PlaceTable *table, AnimalBody
     for(size_t i = 0; i < BRAIN_SELF_INPUTS; i++) {
         self[i] = 0.0f;
     }
-    self[0] = agent_log_scale((place->space > 0.0) ? (animal->individual_count / place->space) : 0.0, 1e-9, (place->is_land == 1) ? 3.0 : 0.0, 3.0);
+    double count_density = 0.0;
+    if(place->space > 0.0) {
+        count_density = animal->individual_count / place->space;
+    } else {
+        count_density = 0.0;
+    }
+    double count_offset = 0.0;
+    if(place->is_land == 1) {
+        count_offset = 3.0;
+    } else {
+        count_offset = 0.0;
+    }
+    self[0] = agent_log_scale(count_density, 1e-9, count_offset, 3.0);
     self[1] = agent_log_scale(OWN, FLOOR, OFFSET, 3.0);
     self[2] = (float)agent_clamp(animal->last_net_production_mol_carbon_per_day / MAXIMUM, -3.0, 3.0);
     self[3] = (float)agent_clamp(animal->food_shortage_days / 3.0, 0.0, 4.0);
@@ -22529,7 +26133,11 @@ void agent_observe(const AnimalWorld *world, const PlaceTable *table, AnimalBody
     self[10] = agent_log_scale(place->light, 1.0, 0.0, 3.0);
     self[11] = agent_log_scale(place->hazards[T], 1e-3, 1.0, 2.0);
     self[12] = agent_log_scale(depth, 1.0, 0.0, 3.0);
-    self[13] = (KIND == LOCATION_WATER) ? agent_log_scale(VERTEX->water_layer_thickness_metres[animal->layer_index], 1.0, 0.0, 3.0) : 0.0f;
+    if(KIND == LOCATION_WATER) {
+        self[13] = agent_log_scale(VERTEX->water_layer_thickness_metres[animal->layer_index], 1.0, 0.0, 3.0);
+    } else {
+        self[13] = 0.0f;
+    }
     self[14] = (float)(animal->layer_index == 0);
     self[15] = (float)((KIND == LOCATION_WATER) && ((animal->layer_index + 1) == VERTEX->water_layers_length));
     self[16] = clock[0];
@@ -22552,11 +26160,20 @@ void agent_observe(const AnimalWorld *world, const PlaceTable *table, AnimalBody
             const PlaceSummary *THERE = place_find(table, vertices[s], KIND, layers[s]);
             const Planet_Vertex *OTHER = &planet->vertices[vertices[s]];
             double there_depth = 0.0;
-            for(size_t l = 0; (l < layers[s]) && (KIND == LOCATION_WATER); l++) {
+            for(size_t l = 0; l < layers[s]; l++) {
+                if(KIND != LOCATION_WATER) {
+                    break;
+                }
                 there_depth = there_depth + OTHER->water_layer_thickness_metres[l];
             }
             slot[0] = (float)(s < 2);
-            slot[1] = (s == 0) ? 1.0f : ((s == 1) ? -1.0f : 0.0f);
+            if(s == 0) {
+                slot[1] = 1.0f;
+            } else if(s == 1) {
+                slot[1] = -1.0f;
+            } else {
+                slot[1] = 0.0f;
+            }
             slot[2] = (float)(agent_log10(rates[s] + 1e-6) / 6.0) + 1.0f;
             slot[3] = (float)agent_clamp((THERE->ph - place->ph) / 2.0, -4.0, 4.0);
             slot[4] = agent_log_scale(THERE->oxygen / ANIMAL_MINIMUM_OXYGEN[T], 1e-3, 0.0, 2.0);
@@ -22575,14 +26192,23 @@ void agent_observe(const AnimalWorld *world, const PlaceTable *table, AnimalBody
         }
     }
     for(size_t s = 0; s < BRAIN_SLOTS; s++) {
-        step->slot_weights[s] = (valid[s] == 1) ? (float)(1.0 / count) : 0.0f;
+        if(valid[s] == 1) {
+            step->slot_weights[s] = (float)(1.0 / count);
+        } else {
+            step->slot_weights[s] = 0.0f;
+        }
     }
     float *bias = step->biases;
     for(size_t i = 0; i < BRAIN_BIAS_INPUTS; i++) {
         bias[i] = 0.0f;
     }
-    for(size_t r = 1; (r < BRAIN_REPRODUCE_CHOICES) && (IS_ADULT == 0); r++) {
-        bias[BRAIN_HEAD_OFFSETS[BRAIN_HEAD_REPRODUCE] + r] = BRAIN_MASKED_LOGIT;
+    for(size_t r = 0; r < BRAIN_REPRODUCE_CHOICES; r++) {
+        if(IS_ADULT != 0) {
+            break;
+        }
+        if(r > 0) {
+            bias[BRAIN_HEAD_OFFSETS[BRAIN_HEAD_REPRODUCE] + r] = BRAIN_MASKED_LOGIT;
+        }
     }
     if((ANIMAL_MAKES_RESTING_EGGS[T] == 0) || (IS_ADULT == 0)) {
         bias[BRAIN_HEAD_OFFSETS[BRAIN_HEAD_EGGS] + 1] = BRAIN_MASKED_LOGIT;
@@ -22606,8 +26232,7 @@ uint8_t agent_lay_eggs(Simulation *simulation, size_t cohort, double amount) {
     return (uint8_t)(planet_apply_transfer(planet, &transfer) != TRANSFER_APPLIED);
 }
 
-size_t agent_place_individuals(AnimalWorld *world, const AgentSettings *settings, size_t index, const Location *location, double individuals,
-    double carbon, double respired, double structure, uint8_t is_offspring) {
+size_t agent_place_individuals(AnimalWorld *world, const AgentSettings *settings, size_t index, const Location *location, double individuals, double carbon, double respired, double structure, uint8_t is_offspring) {
     Planet *planet = &world->simulation.planet;
     const size_t PARENT = world->bodies[index].cohort;
     const size_t T = planet->animals[PARENT].animal_type_index;
@@ -22622,11 +26247,19 @@ size_t agent_place_individuals(AnimalWorld *world, const AgentSettings *settings
     }
     for(size_t a = 0; a < planet->animals_length; a++) {
         const AnimalCohort *OTHER = &planet->animals[a];
-        if((a != PARENT) && (OTHER->animal_type_index == T) && (OTHER->vertex_index == location->vertex_index) && (OTHER->location_kind == location->kind)
-            && (OTHER->layer_index == location->layer_index)) {
+        uint8_t is_match = (uint8_t)((a != PARENT) && (OTHER->animal_type_index == T));
+        is_match = (uint8_t)((is_match == 1) && (OTHER->vertex_index == location->vertex_index));
+        is_match = (uint8_t)((is_match == 1) && (OTHER->location_kind == location->kind));
+        is_match = (uint8_t)((is_match == 1) && (OTHER->layer_index == location->layer_index));
+        if(is_match == 1) {
             here = here + 1;
-            if((join == SIZE_MAX) || ((is_offspring == 1) && (OTHER->structural_mass_mol_carbon < planet->animals[join].structural_mass_mol_carbon))
-                || ((is_offspring == 0) && (OTHER->individual_count > planet->animals[join].individual_count))) {
+            uint8_t is_better = (uint8_t)(join == SIZE_MAX);
+            if(is_better == 0) {
+                const AnimalCohort *JOINED = &planet->animals[join];
+                is_better = (uint8_t)((is_offspring == 1) && (OTHER->structural_mass_mol_carbon < JOINED->structural_mass_mol_carbon));
+                is_better = (uint8_t)((is_better == 1) || ((is_offspring == 0) && (OTHER->individual_count > JOINED->individual_count)));
+            }
+            if(is_better == 1) {
                 join = a;
             }
         }
@@ -22644,12 +26277,21 @@ size_t agent_place_individuals(AnimalWorld *world, const AgentSettings *settings
     Location from;
     Transfer transfer;
     location_set(&from, planet->animals[PARENT].vertex_index, planet->animals[PARENT].location_kind, planet->animals[PARENT].layer_index);
-    transfer_create(&transfer, (is_offspring == 1) ? PROCESS_HATCHING : PROCESS_ANIMAL_LOSSES);
+    size_t process = 0;
+    if(is_offspring == 1) {
+        process = PROCESS_HATCHING;
+    } else {
+        process = PROCESS_ANIMAL_LOSSES;
+    }
+    transfer_create(&transfer, process);
     transfer_add_animal(&transfer, PARENT, -(carbon + respired), NULL);
     transfer_add_animal(&transfer, join, carbon, composition);
     if(respired > 0.0) {
-        transfer_add_animal_oxidation(&transfer, &from, T, respired, respired * composition[COMPONENT_NITROGEN], respired * composition[COMPONENT_PHOSPHORUS],
-            respired * composition[COMPONENT_SULFUR], respired * composition[COMPONENT_ELECTRON]);
+        const double NITROGEN = respired * composition[COMPONENT_NITROGEN];
+        const double PHOSPHORUS = respired * composition[COMPONENT_PHOSPHORUS];
+        const double SULFUR = respired * composition[COMPONENT_SULFUR];
+        const double ELECTRONS = respired * composition[COMPONENT_ELECTRON];
+        transfer_add_animal_oxidation(&transfer, &from, T, respired, NITROGEN, PHOSPHORUS, SULFUR, ELECTRONS);
     }
     if(planet_apply_transfer(planet, &transfer) != TRANSFER_APPLIED) {
         if(is_new == 1) {
@@ -22712,15 +26354,20 @@ void agent_apply_actions(AnimalWorld *world, const AgentSettings *settings, size
     agent_slots(&world->simulation, animal, settings, valid, vertices, layers, rates);
     world->bodies[index].is_move_effective = 0;
     if((TARGET < BRAIN_SLOTS) && (valid[TARGET] == 1) && (rates[TARGET] > 0.0)) {
-        const uint8_t KIND = (uint8_t)((ANIMAL_HABITATS[T] == HABITAT_LAND) ? LOCATION_TERRAIN : LOCATION_WATER);
+        uint8_t kind = 0;
+        if(ANIMAL_HABITATS[T] == HABITAT_LAND) {
+            kind = (uint8_t)LOCATION_TERRAIN;
+        } else {
+            kind = (uint8_t)LOCATION_WATER;
+        }
         world->bodies[index].is_move_effective = 1;
         if(rates[TARGET] >= 0.999) {
             animal->vertex_index = vertices[TARGET];
-            animal->location_kind = KIND;
+            animal->location_kind = kind;
             animal->layer_index = layers[TARGET];
         } else {
             Location there;
-            location_set(&there, vertices[TARGET], KIND, layers[TARGET]);
+            location_set(&there, vertices[TARGET], kind, layers[TARGET]);
             const double MOVERS = rates[TARGET] * animal->individual_count;
             const double CARBON = rates[TARGET] * animal_biomass(animal);
             const double STRUCTURE = animal->structural_mass_mol_carbon;
@@ -22732,16 +26379,41 @@ void agent_apply_actions(AnimalWorld *world, const AgentSettings *settings, size
         }
     }
     animal = &planet->animals[COHORT];
-    animal->respiration_multiplier = settings->basal_respiration_share + ((1.0 - settings->basal_respiration_share) * EFFORT)
-        + ((world->bodies[index].is_move_effective == 1) ? settings->moving_respiration_extra : 0.0);
+    double moving_extra = 0.0;
+    if(world->bodies[index].is_move_effective == 1) {
+        moving_extra = settings->moving_respiration_extra;
+    } else {
+        moving_extra = 0.0;
+    }
+    animal->respiration_multiplier = settings->basal_respiration_share + ((1.0 - settings->basal_respiration_share) * EFFORT) + moving_extra;
 }
+
+
+/*
+ * ToC03100 AgentActing
+ *
+ * Purpose:    Samples actions for every live body from its type's brain, records steps into chunks,
+ *             reconciles bodies with surviving cohorts and advances the simulation by one agent tick.
+ * Depends:    AgentEnvironment, AnimalWorld, AnimalBrain, Simulation
+ * API:        animal_world_evaluate, animal_world_settle, animal_world_advance, animal_world_tick, agent_sample
+ * Ownership:  animal_world_evaluate allocates and frees its member, step and batch arrays within the call.
+ * Invariants: After animal_world_settle every live body is attached to exactly one animal cohort.
+ * Errors:     uint8_t status, 0 success; non-zero when an allocation or the simulation step fails.
+ */
 
 #define AGENT_MODE_ACT 0
 #define AGENT_MODE_BOOTSTRAP 1
 
 size_t agent_sample(const float *probabilities, size_t choices, double draw) {
     size_t choice = choices - 1;
-    while((choice > 0) && (probabilities[choice] <= 0.0f)) {
+    for(size_t i = 0; i < choices; i++) {
+        if(choice == 0) {
+            break;
+        }
+        const uint8_t IS_EMPTY = (uint8_t)(probabilities[choice] <= 0.0f);
+        if(IS_EMPTY == 0) {
+            break;
+        }
         choice = choice - 1;
     }
     for(size_t k = 0; k < choices; k++) {
@@ -22757,96 +26429,115 @@ uint8_t animal_world_evaluate(AnimalWorld *world, AnimalMinds *minds, uint8_t mo
     const AgentSettings *S = &minds->settings;
     PlaceTable table;
     uint8_t status = place_table_build(&table, &world->simulation);
-    for(size_t t = 0; (t < TOTAL_ANIMAL_TYPES) && (status == 0); t++) {
+    for(size_t t = 0; t < TOTAL_ANIMAL_TYPES; t++) {
+        if(status != 0) {
+            break;
+        }
         AnimalBrain *brain = &minds->brains[t];
         AgentExperience *experience = &world->experience[t];
         size_t rows = 0;
         for(size_t b = 0; b < world->bodies_length; b++) {
             rows = rows + (size_t)((world->bodies[b].is_alive == 1) && (world->bodies[b].type == t));
         }
-        if(rows == 0) {
-            continue;
-        }
-        size_t *members = (size_t *)malloc(rows * sizeof(size_t));
-        AgentStep *steps = (AgentStep *)calloc(rows, sizeof(AgentStep));
-        BrainBatch batch;
-        status = (uint8_t)((members == NULL) || (steps == NULL) || (brain_batch_create(&batch, rows) != 0));
-        size_t r = 0;
-        for(size_t b = 0; (b < world->bodies_length) && (status == 0); b++) {
-            AnimalBody *body = &world->bodies[b];
-            if((body->is_alive == 1) && (body->type == t)) {
-                members[r] = b;
-                agent_observe(world, &table, body, S, &steps[r]);
-                memcpy(&batch.grid[r * BRAIN_GRID_INPUTS], steps[r].grid, sizeof(steps[r].grid));
-                memcpy(&batch.self[r * BRAIN_SELF_INPUTS], steps[r].self, sizeof(steps[r].self));
-                memcpy(&batch.slots[r * BRAIN_SLOTS * BRAIN_SLOT_INPUTS], steps[r].slots, sizeof(steps[r].slots));
-                memcpy(&batch.slot_weights[r * BRAIN_SLOTS], steps[r].slot_weights, sizeof(steps[r].slot_weights));
-                memcpy(&batch.biases[r * BRAIN_BIAS_INPUTS], steps[r].biases, sizeof(steps[r].biases));
-                memcpy(&batch.actor_states[r * BRAIN_TORSO_WIDTH], body->actor_state, sizeof(body->actor_state));
-                memcpy(&batch.critic_states[r * BRAIN_TORSO_WIDTH], body->critic_state, sizeof(body->critic_state));
-                r = r + 1;
+        if(rows != 0) {
+            size_t *members = (size_t *)malloc(rows * sizeof(size_t));
+            AgentStep *steps = (AgentStep *)malloc(rows * sizeof(AgentStep));
+            if(steps != NULL) {
+                bytes_clear((uint8_t *)steps, rows * sizeof(AgentStep));
             }
-        }
-        if(status == 0) {
-            brain_set_states(brain, &batch);
-            brain_step(brain, &batch);
-            const Tensor *VALUES = brain_output(brain, brain->value);
-            const Tensor *ACTOR_STATES = brain_output(brain, brain->actor_state);
-            const Tensor *CRITIC_STATES = brain_output(brain, brain->critic_state);
-            for(r = 0; r < rows; r++) {
-                if(mode == AGENT_MODE_BOOTSTRAP) {
-                    AnimalBody *body = &world->bodies[members[r]];
-                    if(body->chunk != SIZE_MAX) {
-                        experience->chunks[body->chunk].bootstrap = VALUES->data[r];
-                        experience->chunks[body->chunk].has_bootstrap = 1;
-                    }
-                    continue;
+            BrainBatch batch;
+            status = (uint8_t)((members == NULL) || (steps == NULL) || (brain_batch_create(&batch, rows) != 0));
+            size_t row = 0;
+            for(size_t b = 0; b < world->bodies_length; b++) {
+                if(status != 0) {
+                    break;
                 }
-                for(size_t h = 0; h < BRAIN_TOTAL_HEADS; h++) {
-                    const size_t K = BRAIN_HEAD_CHOICES[h];
-                    steps[r].actions[h] = (uint8_t)agent_sample(&brain_output(brain, brain->probabilities[h])->data[r * K], K, stream_uniform(&world->generator));
+                AnimalBody *body = &world->bodies[b];
+                if((body->is_alive == 1) && (body->type == t)) {
+                    members[row] = b;
+                    agent_observe(world, &table, body, S, &steps[row]);
+                    bytes_copy((uint8_t *)&batch.grid[row * BRAIN_GRID_INPUTS], (const uint8_t *)steps[row].grid, BRAIN_GRID_INPUTS * sizeof(float));
+                    bytes_copy((uint8_t *)&batch.self[row * BRAIN_SELF_INPUTS], (const uint8_t *)steps[row].self, BRAIN_SELF_INPUTS * sizeof(float));
+                    float *slots = &batch.slots[row * BRAIN_SLOTS * BRAIN_SLOT_INPUTS];
+                    bytes_copy((uint8_t *)slots, (const uint8_t *)steps[row].slots, (BRAIN_SLOTS * BRAIN_SLOT_INPUTS) * sizeof(float));
+                    float *slot_weights = &batch.slot_weights[row * BRAIN_SLOTS];
+                    bytes_copy((uint8_t *)slot_weights, (const uint8_t *)steps[row].slot_weights, BRAIN_SLOTS * sizeof(float));
+                    float *biases = &batch.biases[row * BRAIN_BIAS_INPUTS];
+                    bytes_copy((uint8_t *)biases, (const uint8_t *)steps[row].biases, BRAIN_BIAS_INPUTS * sizeof(float));
+                    float *actor_states = &batch.actor_states[row * BRAIN_TORSO_WIDTH];
+                    bytes_copy((uint8_t *)actor_states, (const uint8_t *)body->actor_state, BRAIN_TORSO_WIDTH * sizeof(float));
+                    float *critic_states = &batch.critic_states[row * BRAIN_TORSO_WIDTH];
+                    bytes_copy((uint8_t *)critic_states, (const uint8_t *)body->critic_state, BRAIN_TORSO_WIDTH * sizeof(float));
+                    row = row + 1;
                 }
-                steps[r].value = VALUES->data[r];
-                steps[r].body = members[r];
-                AnimalBody *body = &world->bodies[members[r]];
-                if(S->is_learning == 1) {
-                    size_t index = agent_experience_add_step(experience);
-                    uint8_t opens = (uint8_t)((body->chunk == SIZE_MAX) || ((world->tick % S->chunk_ticks) == 0));
-                    if((opens == 0) && (experience->chunks[body->chunk].length >= S->chunk_ticks)) {
-                        opens = 1;
-                    }
-                    if(opens == 1) {
-                        size_t chunk = agent_experience_add_chunk(experience);
-                        if(chunk != SIZE_MAX) {
-                            experience->chunks[chunk].body = members[r];
-                            experience->chunks[chunk].previous = body->last_chunk;
-                            memcpy(experience->chunks[chunk].actor_state, body->actor_state, sizeof(body->actor_state));
-                            memcpy(experience->chunks[chunk].critic_state, body->critic_state, sizeof(body->critic_state));
-                            body->chunk = chunk;
-                            body->last_chunk = chunk;
+            }
+            if(status == 0) {
+                brain_set_states(brain, &batch);
+                brain_step(brain, &batch);
+                const Tensor *VALUES = brain_output(brain, brain->value);
+                const Tensor *ACTOR_STATES = brain_output(brain, brain->actor_state);
+                const Tensor *CRITIC_STATES = brain_output(brain, brain->critic_state);
+                for(size_t r = 0; r < rows; r++) {
+                    if(mode == AGENT_MODE_BOOTSTRAP) {
+                        AnimalBody *body = &world->bodies[members[r]];
+                        if(body->chunk != SIZE_MAX) {
+                            experience->chunks[body->chunk].bootstrap = VALUES->data[r];
+                            experience->chunks[body->chunk].has_bootstrap = 1;
                         }
-                    }
-                    if((index != SIZE_MAX) && (body->chunk != SIZE_MAX)) {
-                        AgentChunk *chunk = &experience->chunks[body->chunk];
-                        experience->steps[index] = steps[r];
-                        chunk->steps[chunk->length] = index;
-                        chunk->length = chunk->length + 1;
-                        body->step = index;
-                        body->has_step = 1;
+                    } else {
+                        for(size_t h = 0; h < BRAIN_TOTAL_HEADS; h++) {
+                            const size_t K = BRAIN_HEAD_CHOICES[h];
+                            const Tensor *PROBABILITIES = brain_output(brain, brain->probabilities[h]);
+                            const double DRAW = stream_uniform(&world->generator);
+                            steps[r].actions[h] = (uint8_t)agent_sample(&PROBABILITIES->data[r * K], K, DRAW);
+                        }
+                        steps[r].value = VALUES->data[r];
+                        steps[r].body = members[r];
+                        AnimalBody *body = &world->bodies[members[r]];
+                        if(S->is_learning == 1) {
+                            size_t index = agent_experience_add_step(experience);
+                            uint8_t opens = (uint8_t)((body->chunk == SIZE_MAX) || ((world->tick % S->chunk_ticks) == 0));
+                            if((opens == 0) && (experience->chunks[body->chunk].length >= S->chunk_ticks)) {
+                                opens = 1;
+                            }
+                            if(opens == 1) {
+                                size_t chunk = agent_experience_add_chunk(experience);
+                                if(chunk != SIZE_MAX) {
+                                    AgentChunk *opened = &experience->chunks[chunk];
+                                    opened->body = members[r];
+                                    opened->previous = body->last_chunk;
+                                    const size_t STATE_BYTES = BRAIN_TORSO_WIDTH * sizeof(float);
+                                    bytes_copy((uint8_t *)opened->actor_state, (const uint8_t *)body->actor_state, STATE_BYTES);
+                                    bytes_copy((uint8_t *)opened->critic_state, (const uint8_t *)body->critic_state, STATE_BYTES);
+                                    body->chunk = chunk;
+                                    body->last_chunk = chunk;
+                                }
+                            }
+                            if((index != SIZE_MAX) && (body->chunk != SIZE_MAX)) {
+                                AgentChunk *chunk = &experience->chunks[body->chunk];
+                                experience->steps[index] = steps[r];
+                                chunk->steps[chunk->length] = index;
+                                chunk->length = chunk->length + 1;
+                                body->step = index;
+                                body->has_step = 1;
+                            }
+                        }
+                        for(size_t h = 0; h < BRAIN_TOTAL_HEADS; h++) {
+                            body->actions[h] = steps[r].actions[h];
+                        }
+                        const float *ACTOR_STATE = &ACTOR_STATES->data[r * BRAIN_TORSO_WIDTH];
+                        bytes_copy((uint8_t *)body->actor_state, (const uint8_t *)ACTOR_STATE, BRAIN_TORSO_WIDTH * sizeof(float));
+                        const float *CRITIC_STATE = &CRITIC_STATES->data[r * BRAIN_TORSO_WIDTH];
+                        bytes_copy((uint8_t *)body->critic_state, (const uint8_t *)CRITIC_STATE, BRAIN_TORSO_WIDTH * sizeof(float));
+                        agent_apply_actions(world, S, members[r]);
                     }
                 }
-                for(size_t h = 0; h < BRAIN_TOTAL_HEADS; h++) {
-                    body->actions[h] = steps[r].actions[h];
-                }
-                memcpy(body->actor_state, &ACTOR_STATES->data[r * BRAIN_TORSO_WIDTH], sizeof(body->actor_state));
-                memcpy(body->critic_state, &CRITIC_STATES->data[r * BRAIN_TORSO_WIDTH], sizeof(body->critic_state));
-                agent_apply_actions(world, S, members[r]);
+                clear_memory(&brain->engine);
+                brain_batch_destroy(&batch);
             }
-            clear_memory(&brain->engine);
-            brain_batch_destroy(&batch);
+            free(members);
+            free(steps);
         }
-        free(members);
-        free(steps);
     }
     place_table_destroy(&table);
     return status;
@@ -22855,7 +26546,13 @@ uint8_t animal_world_evaluate(AnimalWorld *world, AnimalMinds *minds, uint8_t mo
 void agent_finish_step(AnimalWorld *world, size_t index, uint8_t is_done) {
     AnimalBody *body = &world->bodies[index];
     AgentStep *step = &world->experience[body->type].steps[body->step];
-    const double REWARD = body->offspring / ((body->founding_count > 1.0) ? body->founding_count : 1.0);
+    double founders = 0.0;
+    if(body->founding_count > 1.0) {
+        founders = body->founding_count;
+    } else {
+        founders = 1.0;
+    }
+    const double REWARD = body->offspring / founders;
     step->reward = (float)REWARD;
     step->done = is_done;
     world->reward_sum[body->type] = world->reward_sum[body->type] + REWARD;
@@ -22874,8 +26571,10 @@ void animal_world_settle(AnimalWorld *world, AnimalMinds *minds) {
     }
     for(size_t a = 0; a < planet->animals_length; a++) {
         const size_t B = planet->animals[a].body_index;
-        if((B < EXISTING) && (world->bodies[B].is_alive == 1) && (world->bodies[B].type == planet->animals[a].animal_type_index)
-            && (world->bodies[B].is_seen == 0)) {
+        uint8_t is_known = (uint8_t)((B < EXISTING) && (world->bodies[B].is_alive == 1));
+        is_known = (uint8_t)((is_known == 1) && (world->bodies[B].type == planet->animals[a].animal_type_index));
+        is_known = (uint8_t)((is_known == 1) && (world->bodies[B].is_seen == 0));
+        if(is_known == 1) {
             world->bodies[B].cohort = a;
             world->bodies[B].is_seen = 1;
         } else {
@@ -22883,25 +26582,33 @@ void animal_world_settle(AnimalWorld *world, AnimalMinds *minds) {
         }
     }
     for(size_t b = 0; b < EXISTING; b++) {
-        if(world->bodies[b].is_alive == 0) {
-            continue;
-        }
-        if(world->bodies[b].has_step == 1) {
-            agent_finish_step(world, b, (uint8_t)(world->bodies[b].is_seen == 0));
-        }
-        if(world->bodies[b].is_seen == 0) {
-            world->bodies[b].is_alive = 0;
-            world->bodies[b].chunk = SIZE_MAX;
-            world->deaths = world->deaths + 1;
+        if(world->bodies[b].is_alive != 0) {
+            if(world->bodies[b].has_step == 1) {
+                agent_finish_step(world, b, (uint8_t)(world->bodies[b].is_seen == 0));
+            }
+            if(world->bodies[b].is_seen == 0) {
+                world->bodies[b].is_alive = 0;
+                world->bodies[b].chunk = SIZE_MAX;
+                world->deaths = world->deaths + 1;
+            }
         }
     }
     world->needs_settle = 0;
 }
 
+#define ANIMAL_WORLD_MAXIMUM_ADVANCE_STEPS 1000000000000
+
 uint8_t animal_world_advance(AnimalWorld *world, const AgentSettings *settings) {
     Simulation *simulation = &world->simulation;
     const double TARGET = (double)(world->ticks_total + 1) * settings->tick_days;
-    while((simulation->time_days < (TARGET - 1e-9)) && (simulation->has_failed == 0)) {
+    for(uint64_t step_index = 0; step_index < ANIMAL_WORLD_MAXIMUM_ADVANCE_STEPS; step_index++) {
+        const uint8_t IS_BEFORE_TARGET = (uint8_t)(simulation->time_days < (TARGET - 1e-9));
+        if(IS_BEFORE_TARGET == 0) {
+            break;
+        }
+        if(simulation->has_failed != 0) {
+            break;
+        }
         simulation_step(simulation, TARGET);
     }
     world->ticks_total = world->ticks_total + 1;
@@ -22920,17 +26627,30 @@ uint8_t animal_world_tick(AnimalWorld *world, AnimalMinds *minds) {
     return status;
 }
 
+
+/*
+ * ToC03200 AgentTraining
+ *
+ * Purpose:    Computes generalised advantages along each body's chunk chain, runs shuffled minibatch
+ *             actor-critic updates per animal type, resets extinct or old worlds and saves or loads weights.
+ * Depends:    AgentActing, AnimalWorld, AnimalBrain, AutomaticDifferentiationEngine
+ * API:        agents_finish_iteration, agent_report_create, minds_save, minds_load
+ * Ownership:  agent_update_group and agents_finish_iteration free the reference arrays they allocate.
+ * Invariants: The weight file holds the magic number, then per type the parameter count and every weight tensor.
+ * Errors:     uint8_t status, 0 success; minds_save and minds_load return 1 on any file error or size mismatch.
+ */
+
 double planet_resting_eggs(const Planet *planet) {
     double total = 0.0;
     for(size_t v = 0; v < planet->vertices_length; v++) {
         const Planet_Vertex *VERTEX = &planet->vertices[v];
         for(size_t layer = 0; layer < VERTEX->water_layers_length; layer++) {
-            total = total + VERTEX->water_layer_organic_particulate_amounts_mol_carbon[layer][ORGANIC_PARTICULATE_RESTING_STAGES]
-                + VERTEX->water_layer_organic_particulate_amounts_mol_carbon[layer][ORGANIC_PARTICULATE_RESTING_STAGES_SMALL];
+            const double *AMOUNTS = VERTEX->water_layer_organic_particulate_amounts_mol_carbon[layer];
+            total = total + AMOUNTS[ORGANIC_PARTICULATE_RESTING_STAGES] + AMOUNTS[ORGANIC_PARTICULATE_RESTING_STAGES_SMALL];
         }
         for(size_t layer = 0; layer < VERTEX->terrain_layers_length; layer++) {
-            total = total + VERTEX->terrain_layer_organic_particulate_amounts_mol_carbon[layer][ORGANIC_PARTICULATE_RESTING_STAGES]
-                + VERTEX->terrain_layer_organic_particulate_amounts_mol_carbon[layer][ORGANIC_PARTICULATE_RESTING_STAGES_SMALL];
+            const double *AMOUNTS = VERTEX->terrain_layer_organic_particulate_amounts_mol_carbon[layer];
+            total = total + AMOUNTS[ORGANIC_PARTICULATE_RESTING_STAGES] + AMOUNTS[ORGANIC_PARTICULATE_RESTING_STAGES_SMALL];
         }
     }
     return total;
@@ -22945,22 +26665,37 @@ void agent_advantages(AnimalWorld *world, AnimalMinds *minds) {
         double next_value = 0.0;
         double next_advantage = 0.0;
         uint8_t is_last = 1;
-        for(size_t c = BODY->last_chunk; c != SIZE_MAX; c = experience->chunks[c].previous) {
+        const size_t MAXIMUM_LINKS = experience->chunks_length + 1;
+        size_t c = BODY->last_chunk;
+        for(size_t link_index = 0; link_index < MAXIMUM_LINKS; link_index++) {
+            if(c == SIZE_MAX) {
+                break;
+            }
             const AgentChunk *CHUNK = &experience->chunks[c];
             if(is_last == 1) {
-                next_value = (CHUNK->has_bootstrap == 1) ? (double)CHUNK->bootstrap : 0.0;
+                if(CHUNK->has_bootstrap == 1) {
+                    next_value = (double)CHUNK->bootstrap;
+                } else {
+                    next_value = 0.0;
+                }
                 is_last = 0;
             }
             for(size_t i = CHUNK->length; i-- > 0;) {
                 AgentStep *step = &experience->steps[CHUNK->steps[i]];
-                const double CARRY = (step->done == 1) ? 0.0 : 1.0;
-                const double DELTA = (double)step->reward + (GAMMA * next_value * CARRY) - (double)step->value;
-                const double ADVANTAGE = DELTA + (GAMMA * LAMBDA * CARRY * next_advantage);
+                double carry = 0.0;
+                if(step->done == 1) {
+                    carry = 0.0;
+                } else {
+                    carry = 1.0;
+                }
+                const double DELTA = (double)step->reward + (GAMMA * next_value * carry) - (double)step->value;
+                const double ADVANTAGE = DELTA + (GAMMA * LAMBDA * carry * next_advantage);
                 step->advantage = (float)ADVANTAGE;
                 step->target_return = (float)(ADVANTAGE + (double)step->value);
                 next_value = (double)step->value;
                 next_advantage = ADVANTAGE;
             }
+            c = experience->chunks[c].previous;
         }
     }
 }
@@ -22978,7 +26713,7 @@ typedef struct {
 } AgentReport;
 
 void agent_report_create(AgentReport *report) {
-    memset(report, 0, sizeof(AgentReport));
+    bytes_clear((uint8_t *)report, sizeof(AgentReport));
 }
 
 typedef struct {
@@ -22986,8 +26721,7 @@ typedef struct {
     size_t chunk;
 } ChunkReference;
 
-void agent_minibatch(AnimalBrain *brain, const ChunkReference *references, size_t rows, const AgentSettings *settings, double mean, double deviation,
-    double samples, AgentReport *report) {
+void agent_minibatch(AnimalBrain *brain, const ChunkReference *references, size_t rows, const AgentSettings *settings, double mean, double deviation, double samples, AgentReport *report) {
     BrainBatch batch;
     size_t longest = 0;
     if(brain_batch_create(&batch, rows) != 0) {
@@ -22996,9 +26730,11 @@ void agent_minibatch(AnimalBrain *brain, const ChunkReference *references, size_
     }
     for(size_t r = 0; r < rows; r++) {
         const AgentChunk *CHUNK = &references[r].experience->chunks[references[r].chunk];
-        memcpy(&batch.actor_states[r * BRAIN_TORSO_WIDTH], CHUNK->actor_state, sizeof(CHUNK->actor_state));
-        memcpy(&batch.critic_states[r * BRAIN_TORSO_WIDTH], CHUNK->critic_state, sizeof(CHUNK->critic_state));
-        longest = (CHUNK->length > longest) ? CHUNK->length : longest;
+        bytes_copy((uint8_t *)&batch.actor_states[r * BRAIN_TORSO_WIDTH], (const uint8_t *)CHUNK->actor_state, BRAIN_TORSO_WIDTH * sizeof(float));
+        bytes_copy((uint8_t *)&batch.critic_states[r * BRAIN_TORSO_WIDTH], (const uint8_t *)CHUNK->critic_state, BRAIN_TORSO_WIDTH * sizeof(float));
+        if(CHUNK->length > longest) {
+            longest = CHUNK->length;
+        }
     }
     brain_set_states(brain, &batch);
     for(size_t t = 0; t < longest; t++) {
@@ -23010,23 +26746,35 @@ void agent_minibatch(AnimalBrain *brain, const ChunkReference *references, size_
         }
         for(size_t r = 0; r < rows; r++) {
             const AgentChunk *CHUNK = &references[r].experience->chunks[references[r].chunk];
+            float *slots = &batch.slots[r * BRAIN_SLOTS * BRAIN_SLOT_INPUTS];
             if(t < CHUNK->length) {
                 const AgentStep *STEP = &references[r].experience->steps[CHUNK->steps[t]];
                 const double ADVANTAGE = ((double)STEP->advantage - mean) / deviation;
-                memcpy(&batch.grid[r * BRAIN_GRID_INPUTS], STEP->grid, sizeof(STEP->grid));
-                memcpy(&batch.self[r * BRAIN_SELF_INPUTS], STEP->self, sizeof(STEP->self));
-                memcpy(&batch.slots[r * BRAIN_SLOTS * BRAIN_SLOT_INPUTS], STEP->slots, sizeof(STEP->slots));
-                memcpy(&batch.slot_weights[r * BRAIN_SLOTS], STEP->slot_weights, sizeof(STEP->slot_weights));
-                memcpy(&batch.biases[r * BRAIN_BIAS_INPUTS], STEP->biases, sizeof(STEP->biases));
+                bytes_copy((uint8_t *)&batch.grid[r * BRAIN_GRID_INPUTS], (const uint8_t *)STEP->grid, BRAIN_GRID_INPUTS * sizeof(float));
+                bytes_copy((uint8_t *)&batch.self[r * BRAIN_SELF_INPUTS], (const uint8_t *)STEP->self, BRAIN_SELF_INPUTS * sizeof(float));
+                bytes_copy((uint8_t *)slots, (const uint8_t *)STEP->slots, (BRAIN_SLOTS * BRAIN_SLOT_INPUTS) * sizeof(float));
+                bytes_copy((uint8_t *)&batch.slot_weights[r * BRAIN_SLOTS], (const uint8_t *)STEP->slot_weights, BRAIN_SLOTS * sizeof(float));
+                bytes_copy((uint8_t *)&batch.biases[r * BRAIN_BIAS_INPUTS], (const uint8_t *)STEP->biases, BRAIN_BIAS_INPUTS * sizeof(float));
                 for(size_t h = 0; h < BRAIN_TOTAL_HEADS; h++) {
                     const size_t K = BRAIN_HEAD_CHOICES[h];
                     double valid = 0.0;
                     for(size_t k = 0; k < K; k++) {
-                        valid = valid + ((STEP->biases[BRAIN_HEAD_OFFSETS[h] + k] > (0.5f * BRAIN_MASKED_LOGIT)) ? 1.0 : 0.0);
+                        double is_valid_amount = 0.0;
+                        if(STEP->biases[BRAIN_HEAD_OFFSETS[h] + k] > (0.5f * BRAIN_MASKED_LOGIT)) {
+                            is_valid_amount = 1.0;
+                        } else {
+                            is_valid_amount = 0.0;
+                        }
+                        valid = valid + is_valid_amount;
                     }
                     for(size_t k = 0; k < K; k++) {
                         const uint8_t IS_VALID = (uint8_t)(STEP->biases[BRAIN_HEAD_OFFSETS[h] + k] > (0.5f * BRAIN_MASKED_LOGIT));
-                        double target = (IS_VALID == 1) ? (settings->entropy_coefficient / valid) : 0.0;
+                        double target = 0.0;
+                        if(IS_VALID == 1) {
+                            target = settings->entropy_coefficient / valid;
+                        } else {
+                            target = 0.0;
+                        }
                         if(k == STEP->actions[h]) {
                             target = target + ADVANTAGE;
                         }
@@ -23036,11 +26784,11 @@ void agent_minibatch(AnimalBrain *brain, const ChunkReference *references, size_
                 value_target.data[r] = STEP->target_return;
                 value_mask.data[r] = 1.0f;
             } else {
-                memset(&batch.grid[r * BRAIN_GRID_INPUTS], 0, BRAIN_GRID_INPUTS * sizeof(float));
-                memset(&batch.self[r * BRAIN_SELF_INPUTS], 0, BRAIN_SELF_INPUTS * sizeof(float));
-                memset(&batch.slots[r * BRAIN_SLOTS * BRAIN_SLOT_INPUTS], 0, BRAIN_SLOTS * BRAIN_SLOT_INPUTS * sizeof(float));
-                memset(&batch.slot_weights[r * BRAIN_SLOTS], 0, BRAIN_SLOTS * sizeof(float));
-                memset(&batch.biases[r * BRAIN_BIAS_INPUTS], 0, BRAIN_BIAS_INPUTS * sizeof(float));
+                bytes_clear((uint8_t *)&batch.grid[r * BRAIN_GRID_INPUTS], BRAIN_GRID_INPUTS * sizeof(float));
+                bytes_clear((uint8_t *)&batch.self[r * BRAIN_SELF_INPUTS], BRAIN_SELF_INPUTS * sizeof(float));
+                bytes_clear((uint8_t *)slots, BRAIN_SLOTS * BRAIN_SLOT_INPUTS * sizeof(float));
+                bytes_clear((uint8_t *)&batch.slot_weights[r * BRAIN_SLOTS], BRAIN_SLOTS * sizeof(float));
+                bytes_clear((uint8_t *)&batch.biases[r * BRAIN_BIAS_INPUTS], BRAIN_BIAS_INPUTS * sizeof(float));
             }
         }
         for(size_t h = 0; h < BRAIN_TOTAL_HEADS; h++) {
@@ -23053,10 +26801,22 @@ void agent_minibatch(AnimalBrain *brain, const ChunkReference *references, size_
             const Tensor *LOSS = brain_output(brain, brain->policy_losses[h]);
             const Tensor *P = brain_output(brain, brain->probabilities[h]);
             const size_t K = BRAIN_HEAD_CHOICES[h];
-            report->policy_loss = report->policy_loss + ((LOSS != NULL) ? (double)LOSS->data[0] : 0.0);
-            for(size_t r = 0; (r < rows) && (P != NULL); r++) {
+            double policy_loss = 0.0;
+            if(LOSS != NULL) {
+                policy_loss = (double)LOSS->data[0];
+            } else {
+                policy_loss = 0.0;
+            }
+            report->policy_loss = report->policy_loss + policy_loss;
+            for(size_t r = 0; r < rows; r++) {
+                if(P == NULL) {
+                    break;
+                }
                 const AgentChunk *CHUNK = &references[r].experience->chunks[references[r].chunk];
-                for(size_t k = 0; (k < K) && (t < CHUNK->length); k++) {
+                for(size_t k = 0; k < K; k++) {
+                    if(t >= CHUNK->length) {
+                        break;
+                    }
                     const double PROBABILITY = (double)P->data[(r * K) + k];
                     if(PROBABILITY > 0.0) {
                         report->entropy = report->entropy - ((PROBABILITY * natural_logarithm_double(PROBABILITY)) / samples);
@@ -23065,7 +26825,13 @@ void agent_minibatch(AnimalBrain *brain, const ChunkReference *references, size_
             }
         }
         const Tensor *VALUE_LOSS = brain_output(brain, brain->value_loss);
-        report->value_loss = report->value_loss + ((VALUE_LOSS != NULL) ? ((double)VALUE_LOSS->data[0] / samples) : 0.0);
+        double value_loss = 0.0;
+        if(VALUE_LOSS != NULL) {
+            value_loss = (double)VALUE_LOSS->data[0] / samples;
+        } else {
+            value_loss = 0.0;
+        }
+        report->value_loss = report->value_loss + value_loss;
     }
     backward(&brain->engine);
     optimize_weights(&brain->engine);
@@ -23074,8 +26840,7 @@ void agent_minibatch(AnimalBrain *brain, const ChunkReference *references, size_
     brain_batch_destroy(&batch);
 }
 
-void agent_update_group(AnimalBrain *brain, AgentExperience *const *experiences, size_t total_experiences, const AgentSettings *settings,
-    PCG *generator, AgentReport *report) {
+void agent_update_group(AnimalBrain *brain, AgentExperience *const *experiences, size_t total_experiences, const AgentSettings *settings, PCG *generator, AgentReport *report) {
     size_t total = 0;
     for(size_t e = 0; e < total_experiences; e++) {
         total = total + experiences[e]->chunks_length;
@@ -23097,35 +26862,54 @@ void agent_update_group(AnimalBrain *brain, AgentExperience *const *experiences,
         }
     }
     report->chunks = report->chunks + total;
+    const size_t TOTAL_MINIBATCHES = (total + (BRAIN_MINIBATCH_CHUNKS - 1)) / BRAIN_MINIBATCH_CHUNKS;
     for(size_t epoch = 0; epoch < settings->epochs; epoch++) {
-        for(size_t i = total; i-- > 1;) {
+        for(size_t i = total; i-- > 0;) {
+            if(i == 0) {
+                break;
+            }
             size_t j = (size_t)(stream_uniform(generator) * (double)(i + 1));
-            j = (j > i) ? i : j;
+            if(j > i) {
+                j = i;
+            }
             ChunkReference swap = references[i];
             references[i] = references[j];
             references[j] = swap;
         }
-        for(size_t start = 0; start < total; start = start + BRAIN_MINIBATCH_CHUNKS) {
-            const size_t ROWS = ((total - start) < BRAIN_MINIBATCH_CHUNKS) ? (total - start) : BRAIN_MINIBATCH_CHUNKS;
+        for(size_t minibatch_index = 0; minibatch_index < TOTAL_MINIBATCHES; minibatch_index++) {
+            const size_t START = minibatch_index * BRAIN_MINIBATCH_CHUNKS;
+            size_t rows = 0;
+            if((total - START) < BRAIN_MINIBATCH_CHUNKS) {
+                rows = total - START;
+            } else {
+                rows = BRAIN_MINIBATCH_CHUNKS;
+            }
             double count = 0.0;
             double sum = 0.0;
             double square = 0.0;
-            for(size_t i = start; i < (start + ROWS); i++) {
-                const AgentChunk *CHUNK = &references[i].experience->chunks[references[i].chunk];
+            for(size_t row_index = 0; row_index < rows; row_index++) {
+                const ChunkReference *REFERENCE = &references[START + row_index];
+                const AgentChunk *CHUNK = &REFERENCE->experience->chunks[REFERENCE->chunk];
                 for(size_t s = 0; s < CHUNK->length; s++) {
-                    const double A = (double)references[i].experience->steps[CHUNK->steps[s]].advantage;
+                    const double A = (double)REFERENCE->experience->steps[CHUNK->steps[s]].advantage;
                     count = count + 1.0;
                     sum = sum + A;
                     square = square + (A * A);
                 }
             }
-            if(count < 1.0) {
-                continue;
+            const uint8_t IS_EMPTY = (uint8_t)(count < 1.0);
+            if(IS_EMPTY == 0) {
+                const double MEAN = sum / count;
+                const double VARIANCE = (square / count) - (MEAN * MEAN);
+                double clipped_variance = 0.0;
+                if(VARIANCE > 0.0) {
+                    clipped_variance = VARIANCE;
+                } else {
+                    clipped_variance = 0.0;
+                }
+                const double DEVIATION = square_root_double(clipped_variance) + 1e-8;
+                agent_minibatch(brain, &references[START], rows, settings, MEAN, DEVIATION, count, report);
             }
-            const double MEAN = sum / count;
-            const double VARIANCE = (square / count) - (MEAN * MEAN);
-            const double DEVIATION = square_root_double((VARIANCE > 0.0) ? VARIANCE : 0.0) + 1e-8;
-            agent_minibatch(brain, &references[start], ROWS, settings, MEAN, DEVIATION, count, report);
         }
     }
     free(references);
@@ -23196,7 +26980,13 @@ uint8_t agents_finish_iteration(AnimalMinds *minds, AnimalWorld *worlds, size_t 
             reports[t].reward = reports[t].reward / rewards;
         }
     }
-    for(size_t t = 0; (t < TOTAL_ANIMAL_TYPES) && (minds->settings.is_learning == 1) && (experiences != NULL); t++) {
+    for(size_t t = 0; t < TOTAL_ANIMAL_TYPES; t++) {
+        if(minds->settings.is_learning != 1) {
+            break;
+        }
+        if(experiences == NULL) {
+            break;
+        }
         for(size_t w = 0; w < total_worlds; w++) {
             experiences[w] = &worlds[w].experience[t];
         }
@@ -23214,12 +27004,18 @@ uint8_t minds_save(AnimalMinds *minds, const char *path) {
     const uint64_t MAGIC = UINT64_C(0x33534C414D494E41);
     FILE *file = fopen(path, "wb");
     uint8_t status = (uint8_t)(file == NULL);
-    status = (uint8_t)(status + ((status == 0) && (fwrite(&MAGIC, sizeof(MAGIC), 1, file) != 1)));
-    for(size_t t = 0; (t < TOTAL_ANIMAL_TYPES) && (status == 0); t++) {
+    status = (uint8_t)(status + ((status == 0) && (fwrite(&MAGIC, sizeof(uint64_t), 1, file) != 1)));
+    for(size_t t = 0; t < TOTAL_ANIMAL_TYPES; t++) {
+        if(status != 0) {
+            break;
+        }
         AnimalBrain *brain = &minds->brains[t];
         const uint64_t COUNT = (uint64_t)brain->total_parameters;
-        status = (uint8_t)(fwrite(&COUNT, sizeof(COUNT), 1, file) != 1);
-        for(size_t p = 0; (p < brain->total_parameters) && (status == 0); p++) {
+        status = (uint8_t)(fwrite(&COUNT, sizeof(uint64_t), 1, file) != 1);
+        for(size_t p = 0; p < brain->total_parameters; p++) {
+            if(status != 0) {
+                break;
+            }
             const size_t SIZE = brain_weight_count(brain, p);
             status = (uint8_t)(fwrite(brain_weights(brain, p)->data, sizeof(float), SIZE, file) != SIZE);
         }
@@ -23235,12 +27031,18 @@ uint8_t minds_load(AnimalMinds *minds, const char *path) {
     uint64_t magic = 0;
     FILE *file = fopen(path, "rb");
     uint8_t status = (uint8_t)(file == NULL);
-    status = (uint8_t)(status + ((status == 0) && ((fread(&magic, sizeof(magic), 1, file) != 1) || (magic != MAGIC))));
-    for(size_t t = 0; (t < TOTAL_ANIMAL_TYPES) && (status == 0); t++) {
+    status = (uint8_t)(status + ((status == 0) && ((fread(&magic, sizeof(uint64_t), 1, file) != 1) || (magic != MAGIC))));
+    for(size_t t = 0; t < TOTAL_ANIMAL_TYPES; t++) {
+        if(status != 0) {
+            break;
+        }
         AnimalBrain *brain = &minds->brains[t];
         uint64_t count = 0;
-        status = (uint8_t)((fread(&count, sizeof(count), 1, file) != 1) || (count != (uint64_t)brain->total_parameters));
-        for(size_t p = 0; (p < brain->total_parameters) && (status == 0); p++) {
+        status = (uint8_t)((fread(&count, sizeof(uint64_t), 1, file) != 1) || (count != (uint64_t)brain->total_parameters));
+        for(size_t p = 0; p < brain->total_parameters; p++) {
+            if(status != 0) {
+                break;
+            }
             const size_t SIZE = brain_weight_count(brain, p);
             status = (uint8_t)(fread(brain_weights(brain, p)->data, sizeof(float), SIZE, file) != SIZE);
         }
@@ -23251,18 +27053,38 @@ uint8_t minds_load(AnimalMinds *minds, const char *path) {
     return (uint8_t)(status != 0);
 }
 
+
+/*
+ * ToC03300 AgentRunner
+ *
+ * Purpose:    Prints the daily planet summary and per-iteration training reports, and runs one animal world
+ *             either for a number of training iterations or for a number of days.
+ * Depends:    AgentTraining, AgentActing, Simulation
+ * API:        agents_run, simulation_print_header, simulation_print_day, agents_print_iteration
+ * Ownership:  agents_run creates and destroys its own minds and world.
+ * Invariants: simulation_print_day prints one value per column of simulation_print_header.
+ * Errors:     agents_run returns 0 on success, 1 when the planet cannot be built, else the summed tick status.
+ */
+
 #define PROGRAM_TOTAL_DAYS 30
 
 void agents_print_iteration(const AnimalMinds *minds, const AnimalWorld *world, const AgentReport *reports, const char *prefix) {
     for(size_t t = 0; t < TOTAL_ANIMAL_TYPES; t++) {
         const AgentReport *R = &reports[t];
-        const double UPDATES = (R->updates > 0) ? (double)R->updates : 1.0;
-        if(R->bodies == 0) {
-            continue;
+        double updates = 0.0;
+        if(R->updates > 0) {
+            updates = (double)R->updates;
+        } else {
+            updates = 1.0;
         }
-        printf("%siteration %4zu day %8.3f type %zu: bodies %4zu reward %+.5f offspring %.4g | policy %+.4f value %.4f entropy %.3f\n",
-            prefix, minds->iterations, world->simulation.time_days, t, R->bodies, R->reward, R->offspring, R->policy_loss / UPDATES, R->value_loss / UPDATES,
-            R->entropy / UPDATES);
+        if(R->bodies != 0) {
+            const double POLICY_LOSS = R->policy_loss / updates;
+            const double VALUE_LOSS = R->value_loss / updates;
+            const double ENTROPY = R->entropy / updates;
+            printf("%siteration %4lu day %8.3f ", prefix, (unsigned long)minds->iterations, world->simulation.time_days);
+            printf("type %lu: bodies %4lu ", (unsigned long)t, (unsigned long)R->bodies);
+            printf("reward %+.5f offspring %.4g | policy %+.4f value %.4f entropy %.3f\n", R->reward, R->offspring, POLICY_LOSS, VALUE_LOSS, ENTROPY);
+        }
     }
     fflush(stdout);
 }
@@ -23278,6 +27100,7 @@ void simulation_print_day(const Simulation *simulation) {
     double microbes = 0.0;
     double animals = 0.0;
     double land_animals = 0.0;
+    double animal_net_change = 0.0;
     double plants = 0.0;
     double dormant = 0.0;
     Location surface;
@@ -23314,24 +27137,29 @@ void simulation_print_day(const Simulation *simulation) {
         }
     }
     for(size_t a = 0; a < planet->animals_length; a++) {
+        animal_net_change = animal_net_change + animal_net_change_mol_carbon_per_day(&planet->animals[a]);
         if(ANIMAL_HABITATS[planet->animals[a].animal_type_index] == HABITAT_LAND) {
             land_animals = land_animals + planet->animals[a].individual_count;
         } else {
             animals = animals + planet->animals[a].individual_count;
         }
     }
-    printf("%10.3f %10.4g %10.4g %10.4g %10.4g %10.4g %10.4g %10.4g %10.4g %10.4g %10.4g %10.4g %10.4g %12.4g %8zu %8zu\n", simulation->time_days, ph,
-        amounts[0], amounts[1], amounts[2], amounts[3], amounts[4], temperature, phototrophs, microbes, plants, animals, land_animals, dormant, planet->cohorts_length,
-        planet->animals_length);
+    printf("%10.3f %10.4g %10.4g %10.4g ", simulation->time_days, ph, amounts[0], amounts[1]);
+    printf("%10.4g %10.4g %10.4g ", amounts[2], amounts[3], amounts[4]);
+    printf("%10.4g %10.4g %10.4g %10.4g %10.4g %10.4g %12.4g ", temperature, phototrophs, microbes, plants, animals, land_animals, dormant);
+    printf("%12.4g %8lu %8lu\n", animal_net_change, (unsigned long)planet->cohorts_length, (unsigned long)planet->animals_length);
     fflush(stdout);
 }
 
 void simulation_print_header(void) {
-    printf("%10s %10s %10s %10s %10s %10s %10s %10s %10s %10s %10s %10s %10s %12s %8s %8s\n", "t_d", "pH", "O2_mM", "DIC_mM", "NH4_mM", "NO3_mM", "PO4_mM",
-        "T_C", "photo_molC", "micro_molC", "plant_molC", "water_anim", "land_anim", "dormant_C", "cohorts", "bodies");
+    printf("%10s %10s %10s %10s %10s %10s %10s ", "t_d", "pH", "O2_mM", "DIC_mM", "NH4_mM", "NO3_mM", "PO4_mM");
+    printf("%10s %10s %10s %10s ", "T_C", "photo_molC", "micro_molC", "plant_molC");
+    printf("%10s %10s %12s %12s %8s %8s\n", "water_anim", "land_anim", "dormant_C", "anim_net_C/d", "cohorts", "bodies");
 }
 
-int agents_run(double days, const char *path, size_t levels, uint8_t is_training, size_t iterations, double tick_hours) {
+#define AGENTS_RUN_MAXIMUM_TICKS 1000000000000
+
+uint8_t agents_run(double days, const char *path, size_t levels, uint8_t is_training, size_t iterations, double tick_hours) {
     AgentSettings settings;
     WorldSettings world_settings;
     AnimalMinds minds;
@@ -23348,7 +27176,13 @@ int agents_run(double days, const char *path, size_t levels, uint8_t is_training
         FILE *probe = fopen(path, "rb");
         if(probe != NULL) {
             fclose(probe);
-            printf("%s %s\n", (minds_load(&minds, path) == 0) ? "loaded" : "could NOT load", path);
+            const char *outcome = NULL;
+            if(minds_load(&minds, path) == 0) {
+                outcome = "loaded";
+            } else {
+                outcome = "could NOT load";
+            }
+            printf("%s %s\n", outcome, path);
         }
     }
     if(animal_world_create(&world, &minds, &world_settings, world_settings.seed) != 0) {
@@ -23363,7 +27197,15 @@ int agents_run(double days, const char *path, size_t levels, uint8_t is_training
     }
     double next_day = 1.0;
     size_t iteration = 0;
-    while((status == 0) && (((is_training == 1) && (iteration < iterations)) || ((is_training == 0) && (world.simulation.time_days < (days - 1e-9))))) {
+    for(uint64_t tick_index = 0; tick_index < AGENTS_RUN_MAXIMUM_TICKS; tick_index++) {
+        if(status != 0) {
+            break;
+        }
+        uint8_t is_running = (uint8_t)((is_training == 1) && (iteration < iterations));
+        is_running = (uint8_t)((is_running == 1) || ((is_training == 0) && (world.simulation.time_days < (days - 1e-9))));
+        if(is_running == 0) {
+            break;
+        }
         status = animal_world_tick(&world, &minds);
         if(world.tick >= settings.iteration_ticks) {
             for(size_t t = 0; t < TOTAL_ANIMAL_TYPES; t++) {
@@ -23372,12 +27214,18 @@ int agents_run(double days, const char *path, size_t levels, uint8_t is_training
             const double DAY = world.simulation.time_days;
             status = (uint8_t)(status + agents_finish_iteration(&minds, &world, 1, reports));
             iteration = iteration + 1;
-            agents_print_iteration(&minds, &world, reports, (is_training == 1) ? "" : "# ");
+            const char *prefix = NULL;
+            if(is_training == 1) {
+                prefix = "";
+            } else {
+                prefix = "# ";
+            }
+            agents_print_iteration(&minds, &world, reports, prefix);
             if((path != NULL) && (minds_save(&minds, path) != 0)) {
                 printf("could NOT save %s\n", path);
             }
             if(world.simulation.time_days < DAY) {
-                printf("%sworld reset (reset %zu, seed %llu)\n", (is_training == 1) ? "" : "# ", world.resets, (unsigned long long)world.seed);
+                printf("%sworld reset (reset %lu, seed %lu)\n", prefix, (unsigned long)world.resets, (unsigned long)world.seed);
                 next_day = 1.0;
             }
         }
@@ -23388,15 +27236,23 @@ int agents_run(double days, const char *path, size_t levels, uint8_t is_training
     }
     animal_world_destroy(&world);
     minds_destroy(&minds);
-    return (int)status;
+    return status;
 }
 
-int main(int argc, char **argv) {
-    if((argc > 1) && (strcmp(argv[1], "--train") == 0)) {
-        size_t iterations = (argc > 2) ? (size_t)strtoul(argv[2], NULL, 10) : 20;
-        double tick_hours = (argc > 3) ? strtod(argv[3], NULL) : 1.0;
-        size_t levels = (argc > 5) ? (size_t)strtoul(argv[5], NULL, 10) : SIZE_MAX;
-        return agents_run(0.0, (argc > 4) ? argv[4] : NULL, levels, 1, iterations, tick_hours);
-    }
-    return agents_run((double)PROGRAM_TOTAL_DAYS, NULL, SIZE_MAX, 0, 0, 1.0);
+
+
+/*
+ * ToC03400 Main
+ *
+ * Purpose:    Program entry point: builds the default planet and runs the ecosystem (with the animal brains
+ *             choosing actions) for PROGRAM_TOTAL_DAYS days, printing one summary row per simulated day.
+ * Depends:    AgentRunner
+ * API:        main
+ * Ownership:  agents_run owns everything it creates.
+ * Invariants: One header line, then one row per simulated day.
+ * Errors:     Returns the status of agents_run (0 on success).
+ */
+
+int main(void) {
+    return (int)agents_run((double)PROGRAM_TOTAL_DAYS, NULL, SIZE_MAX, 0, 0, 1.0);
 }
