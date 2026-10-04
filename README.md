@@ -6,9 +6,9 @@ A self-contained simulation of a living planet, from plate tectonics and weather
 
 ## How the Earth works
 
-Two rules organise every ecosystem. **Energy passes through once**: the Earth absorbs about 240 W/m² of sunlight and radiates the same amount back to space as infrared heat. **Matter stays**: the same atoms of carbon, nitrogen, phosphorus and sulfur are used again and again. An ecosystem is what you get when that one-way flow of energy drives matter round in loops.
+Two rules which shape the way our planet is. **Energy passes through once**: the Earth absorbs about 240 W/m² of sunlight and radiates the same amount back to space as infrared heat. **Matter is conserved**: the same atoms of carbon, nitrogen, phosphorus and sulfur are used again and again. An ecosystem is what you get when that one-way flow of energy drives matter round in loops.
 
-Sunlight arrives as energetic photons and leaves as many weak ones. A visible photon carries roughly the energy of a chemical bond, so light can do what warmth cannot: move electrons from one molecule to another. All life runs on that trick. Organisms take electrons from a donor (water, hydrogen, sugar, sulfide, ferrous iron), pass them to an acceptor (oxygen, nitrate, sulfate, CO₂) and use the energy released to build more of themselves. Photosynthesis and respiration are the main loop; a small set of microbial enzymes cycles nitrogen, sulfur and iron around it.
+Sunlight arrives as energetic photons and leaves as many weak ones. A visible photon carries roughly the energy of a chemical bond, so light can move electrons from one molecule to another while heat usually can not.  This creates chemical bonds that store energy from the sun. Then organisms take electrons from a donor (water, hydrogen, sugar, sulfide, ferrous iron), pass them to an acceptor (oxygen, nitrate, sulfate, CO₂) and use the energy released to build more of themselves. Photosynthesis and respiration are the main loop; a small set of microbial enzymes cycles nitrogen, sulfur and iron around it.
 
 Ecosystems divide this work into **producers**, **consumers** and **decomposers**. Only around a tenth of the energy at one trophic level reaches the next, which is why plants outweigh animals by a wide margin. Growth is capped by the scarcest nutrient, and each element moves between reservoirs at its own pace: water in days, living carbon in years, rock over millions of years. Fast loops decide what happens this season; slow loops set the totals the fast ones have to work with. Behind it all, the planet's climate, terrain, rivers and lakes decide where any of this can happen.
 
@@ -16,7 +16,7 @@ Ecosystems divide this work into **producers**, **consumers** and **decomposers*
 
 ## Existing ecosystem simulations and their limits
 
-Ecosystem models tend to excel at one scale and simplify the others.
+Existing ecosystem models tend to excel at one scale and simplify the others.
 
 | Family | Examples | What they do well | What they usually leave out |
 |---|---|---|---|
@@ -26,7 +26,7 @@ Ecosystem models tend to excel at one scale and simplify the others.
 | Agent-based teaching models | NetLogo Wolf-Sheep, many game simulators | Visual predator-prey dynamics | Energy is created from nothing; no element cycles; populations persist only by tuning |
 | Reinforcement learning environments | Neural MMO, grid-world foraging | Learned behaviour in multi-agent settings | The world has no ecology: resources respawn rather than cycle |
 
-The recurring gaps are the same three. Matter is not strictly conserved, so a model can quietly create or destroy carbon and still look healthy. Metabolism is not tied to thermodynamics, so organisms grow on reactions that would yield no energy. And evolution, behaviour and biogeochemistry live in separate codebases, so none can feed back on the others.
+There are three recurring gaps in these models. Matter is not strictly conserved, so a model can quietly create or destroy carbon and still look healthy. Metabolism is not tied to thermodynamics, so organisms grow on reactions that would yield no energy. And evolution, behaviour and biogeochemistry live in separate codebases, so none can feed back on the others.
 
 ---
 
@@ -36,13 +36,13 @@ The recurring gaps are the same three. Matter is not strictly conserved, so a mo
 All state changes are expressed as `Transfer`s between pools. Each species, mineral, organic class, organism and gas carries a composition vector over **11 conserved elements** (C, N, P, S, Fe, Ca, Na, K, Mg, Cl and electrons). A transfer is rejected unless it balances every component, including electrons, to 1 part in 10¹² and leaves no pool negative. Pool totals use compensated summation, and a positivity limiter scales competing demands on the same pool so that no process can draw more than exists.
 
 ### The planet
-- **Geometry**: an icosahedral sphere subdivided up to four times (12 to 2,562 cells), each with water layers, soil or sediment layers, and a lithosphere reservoir.
+- **Geometry**: an icosphere subdivided up to four times (12 to 2,562 cells), each with water layers, soil or sediment layers, and a lithosphere reservoir.
 - **Tectonics and terrain**: random plates with rotation vectors give convergence, divergence and shear at boundaries. Simplex-noise terrain is blended from eight landform shapers (ridges, plains, terraces, cliffs and others) by a learned-style weighting of uplift, wetness, slope and hardness, then carved by stream-power erosion with sediment deposition and hillslope creep.
 - **Hydrosphere**: oceans and lakes are found by a depression-filling solver that spills water from basin to basin; soils are typed by sediment, wetness and slope.
 - **Geology**: earthquakes (Gutenberg–Richter magnitudes, subduction depths) and eruptions (VEI from arc, ridge and hotspot sources) are generated deterministically by hashing, so any epoch can be queried without replaying history.
 
 ### Climate and hydrology
-An energy-balance atmosphere with a diurnal and seasonal Sun, linearised outgoing longwave radiation, lapse rates, clouds from humidity, snow and sea-ice albedo. Winds combine Hadley, Ferrel and polar cells, a thermal-wind correction and drifting simplex eddies. Water vapour is advected and diffused between cells, condenses into rain or snow, infiltrates and drains through soil, runs off towards basins, creates lakes, overflows to the sea and changes ocean depth. The climate spins up for a model year before life starts.
+An energy-balance atmosphere with a diurnal and seasonal Sun, linearised outgoing longwave radiation, lapse rates, clouds from humidity, snow and sea-ice albedo. Winds combine Hadley, Ferrel and polar cells, a thermal-wind correction and drifting simplex eddies. Water vapour is advected and diffused between cells, condenses into rain or snow, infiltrates and drains through soil, runs off towards basins, creates lakes, overflows to the sea and changes ocean depth. The climate is simulated for a year before adding in organisms.
 
 ### Chemistry
 22 dissolved species, 7 gases, 8 minerals and 6 classes of particulate organic matter. pH is solved from charge balance with temperature-dependent carbonate, ammonia, sulfide, borate, phosphate and acetate equilibria. Gases exchange with the atmosphere through Henry's law. Phosphate sorbs onto iron hydroxide and calcite. Sulfide and ferrous iron oxidise, calcite and iron sulfide precipitate and dissolve, all scaled by their Gibbs energy so reactions stop at equilibrium. Detritus hydrolyses, refractory matter photodegrades, and sediments are buried and slowly returned.
